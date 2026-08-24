@@ -1,11 +1,4 @@
-"""
-Main Training Pipeline - HRL VGAE Remaster
-Phases:
-0. Pretrain VGAE (khóa vĩnh viễn)
-1. Pretrain Lower Agent (khóa vĩnh viễn)
-2. Pretrain Upper Agent (Lower đã khóa)
-3. Main Training (online, cả 2 agent)
-"""
+
 import sys
 import numpy as np
 import torch
@@ -141,18 +134,18 @@ def main():
     print("STEP 1: Initialize Physical Network")
     print("="*60)
     
-    num_p_nodes = config.PHYSICAL_NETWORK['num_nodes']
-    topology = config.PHYSICAL_NETWORK['topology']
+    num_p_nodes = config['PHYSICAL_NETWORK']['num_nodes']
+    topology = config['PHYSICAL_NETWORK']['topology']
     
     print(f"Generating physical network: {num_p_nodes} nodes, topology: {topology}")
     p_net = NetworkGenerator.generate_physical_network(
         num_p_nodes, topology,
-        config.PHYSICAL_NETWORK['cpu_capacity'],
-        config.PHYSICAL_NETWORK['ram_capacity'],
-        config.PHYSICAL_NETWORK['storage_capacity'],
-        config.PHYSICAL_NETWORK['bandwidth_capacity']
+        config['PHYSICAL_NETWORK']['cpu_capacity'],
+        config['PHYSICAL_NETWORK']['ram_capacity'],
+        config['PHYSICAL_NETWORK']['storage_capacity'],
+        config['PHYSICAL_NETWORK']['bandwidth_capacity']
     )
-    print(f"✓ Physical network created with {p_net.number_of_nodes()} nodes\n")
+    print(f"✓ Physical network created with {p_net.num_nodes} nodes\n")
     
     # ============================================================================
     # STEP 2: VGAE Pretraining (Phase 0)
@@ -165,24 +158,24 @@ def main():
         num_p_nodes,
         input_dim=4,
         hidden_dim=32,
-        latent_dim=config.VGAE['embedding_dim'],
+        latent_dim=config['VGAE']['embedding_dim'],
         device=device
     )
     
     # Tạo pretraining dataset
-    num_pretrain_nets = config.VGAE.get('num_pretrain_nets', 5)
+    num_pretrain_nets = config['VGAE'].get('num_pretrain_nets', 5)
     pretrain_nets = [p_net.copy() for _ in range(num_pretrain_nets)]
     
     # Initialize HRLStrategy với VGAE
     strategy = HRLStrategy(
         p_net=p_net,
         vgae_model=vgae_model,
-        latent_dim=config.VGAE['embedding_dim'],
-        max_dcs=config.PHYSICAL_NETWORK['num_nodes'],
-        top_k_candidates=config.HRL.get('top_k_candidates', 8),
-        k_routes=config.HRL.get('k_routes', 3),
-        upper_hidden_dim=config.HRL.get('upper_hidden_dim', 128),
-        lower_hidden_dim=config.HRL.get('lower_hidden_dim', 64),
+        latent_dim=config['VGAE']['embedding_dim'],
+        max_dcs=config['PHYSICAL_NETWORK']['num_nodes'],
+        top_k_candidates=config['HRL'].get('top_k_candidates', 8),
+        k_routes=config['HRL'].get('k_routes', 3),
+        upper_hidden_dim=config['HRL'].get('upper_hidden_dim', 128),
+        lower_hidden_dim=config['HRL'].get('lower_hidden_dim', 64),
         device=device
     )
     
@@ -190,7 +183,7 @@ def main():
     trainer = HRLTrainer(strategy, config, device=device)
     
     # Phase 0: Pretrain VGAE
-    trainer.pretrain_vgae(pretrain_nets, num_epochs=config.VGAE.get('num_epochs', 100))
+    trainer.pretrain_vgae(pretrain_nets, num_epochs=config['VGAE'].get('num_epochs', 100))
     
     # ============================================================================
     # STEP 3: Environment Setup
@@ -202,11 +195,11 @@ def main():
     env = VNEEnvironment(p_net)
     
     sfc_generator = SFCRequestGenerator(
-        cpu_range=config.SFC['cpu_requirement'],
-        ram_range=config.SFC['ram_requirement'],
-        storage_range=config.SFC['storage_requirement'],
-        bw_range=config.SFC['bandwidth_requirement'],
-        vnf_count_range=(config.SFC['num_vnfs_min'], config.SFC['num_vnfs_max'])
+        cpu_range=config['SFC']['cpu_requirement'],
+        ram_range=config['SFC']['ram_requirement'],
+        storage_range=config['SFC']['storage_requirement'],
+        bw_range=config['SFC']['bandwidth_requirement'],
+        vnf_count_range=(config['SFC']['num_vnfs_min'], config['SFC']['num_vnfs_max'])
     )
     print(f"✓ Environment and SFC generator initialized\n")
     
@@ -217,7 +210,7 @@ def main():
     print("STEP 4: Lower Agent Pretraining (Phase 1)")
     print("="*60)
     
-    num_lower_episodes = config.TRAINING.get('num_lower_pretrain_episodes', 500)
+    num_lower_episodes = config['TRAINING'].get('num_lower_pretrain_episodes', 500)
     trainer.pretrain_lower(env, num_episodes=num_lower_episodes)
     
     # ============================================================================
@@ -227,7 +220,7 @@ def main():
     print("STEP 5: Upper Agent Pretraining (Phase 2)")
     print("="*60)
     
-    num_upper_episodes = config.TRAINING.get('num_upper_pretrain_episodes', 1000)
+    num_upper_episodes = config['TRAINING'].get('num_upper_pretrain_episodes', 1000)
     trainer.pretrain_upper(env, sfc_generator, num_episodes=num_upper_episodes)
     
     # ============================================================================
@@ -237,7 +230,7 @@ def main():
     print("STEP 6: Main Training Loop (Phase 3)")
     print("="*60)
     
-    num_main_episodes = config.TRAINING.get('num_episodes', 2000)
+    num_main_episodes = config['TRAINING'].get('num_episodes', 2000)
     trainer.train_main(env, sfc_generator, num_episodes=num_main_episodes)
     
     # ============================================================================
@@ -247,7 +240,7 @@ def main():
     print("STEP 7: Final Evaluation")
     print("="*60)
     
-    num_eval_requests = config.EVALUATION.get('num_test_requests', 100)
+    num_eval_requests = config['EVALUATION'].get('num_test_requests', 100)
     eval_results = evaluate_strategy(strategy, p_net, sfc_generator, 
                                      num_test_requests=num_eval_requests, 
                                      device=device)
