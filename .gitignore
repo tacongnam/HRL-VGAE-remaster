@@ -7,6 +7,5 @@ checkpoints/
 results/
 logs/
 *.log
-data/
 .env
 runs/*
