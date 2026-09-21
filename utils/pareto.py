@@ -17,9 +17,7 @@ def pareto_rank(candidates: np.ndarray) -> np.ndarray:
     ranks = np.zeros(n, dtype=np.int32)
     for i in range(n):
         for j in range(n):
-            if i == j:
-                continue
-            if dominates(candidates[j], candidates[i]):
+            if i != j and dominates(candidates[j], candidates[i]):
                 ranks[i] += 1
     return ranks
 
@@ -28,16 +26,21 @@ def non_dominated_indices(points: np.ndarray) -> List[int]:
     n = len(points)
     keep = []
     for i in range(n):
-        dominated = False
-        for j in range(n):
-            if i == j:
-                continue
-            if dominates(points[j], points[i]):
-                dominated = True
-                break
+        dominated = any(
+            j != i and dominates(points[j], points[i])
+            for j in range(n)
+        )
         if not dominated:
             keep.append(i)
     return keep
+
+
+def non_dominated(vectors: List[np.ndarray]) -> List[np.ndarray]:
+    if not vectors:
+        return []
+    pts = np.array(vectors, dtype=np.float64)
+    idx = non_dominated_indices(pts)
+    return [vectors[i] for i in idx]
 
 
 def compute_hypervolume(points: np.ndarray, reference_point: np.ndarray) -> float:
@@ -59,8 +62,7 @@ def compute_hypervolume(points: np.ndarray, reference_point: np.ndarray) -> floa
 
 def _hv_2d(points: np.ndarray, ref: np.ndarray) -> float:
     pts = points[np.argsort(points[:, 0])[::-1]]
-    hv = 0.0
-    prev_y = ref[1]
+    hv, prev_y = 0.0, ref[1]
     for p in pts:
         if p[1] > prev_y:
             hv += (p[0] - ref[0]) * (p[1] - prev_y)
@@ -80,14 +82,9 @@ def _hv_wfg(points: np.ndarray, ref: np.ndarray) -> float:
     order = np.argsort(points[:, 0])[::-1]
     points = points[order]
     hv = 0.0
-    n = len(points)
-    for i in range(n):
-        lower_x = points[i + 1][0] if i + 1 < n else ref[0]
-        x_width = points[i][0] - lower_x
-        if x_width <= 0.0:
-            continue
-        sub_pts = points[:i + 1, 1:]
-        hv += x_width * _hv_wfg(sub_pts, ref[1:])
+    for i, p in enumerate(points):
+        x_width = p[0] - (points[i - 1][0] if i > 0 else ref[0])
+        hv += abs(x_width) * _hv_wfg(points[:i + 1][:, 1:], ref[1:])
     return float(hv)
 
 
@@ -105,14 +102,14 @@ def prune_by_hypervolume(vectors: List[np.ndarray], max_size: int,
                           reference_point: np.ndarray) -> List[np.ndarray]:
     if max_size <= 0:
         raise ValueError("max_size must be > 0")
-    nd_idx = non_dominated_indices(np.array(vectors))
-    vectors = [vectors[i] for i in nd_idx]
+    if not vectors:
+        return []
+    vectors = non_dominated(vectors)
     while len(vectors) > max_size:
-        pts = np.array(vectors)
+        pts = np.array(vectors, dtype=np.float64)
         contribs = [hypervolume_contribution(pts, i, reference_point)
                     for i in range(len(vectors))]
-        remove_idx = int(np.argmin(contribs))
-        vectors.pop(remove_idx)
+        vectors.pop(int(np.argmin(contribs)))
     return vectors
 
 
@@ -129,7 +126,7 @@ def hv_score_for_action(q_vectors: List[np.ndarray],
 def select_by_hypervolume(q_sets: List[List[np.ndarray]],
                            valid_mask: np.ndarray,
                            reference_point: np.ndarray,
-                           rng: Optional[random.Random] = None) -> int:
+                           tie_break_rng: Optional[random.Random] = None) -> int:
     valid_indices = [i for i in range(len(q_sets)) if valid_mask[i]]
     if not valid_indices:
         raise ValueError("No valid action available")
@@ -142,12 +139,14 @@ def select_by_hypervolume(q_sets: List[List[np.ndarray]],
     ], dtype=np.float64)
 
     best_hv = np.max(hv_scores)
-    tied = [valid_indices[j] for j, s in enumerate(hv_scores) if s >= best_hv - 1e-12]
+    tied = [valid_indices[j] for j, s in enumerate(hv_scores)
+            if s >= best_hv - 1e-12]
     if len(tied) == 1:
         return tied[0]
 
+    # Tie-break 1: lower normalized cost (higher cost objective = index 0)
     best_cost = None
-    best_idx = tied[0]
+    best_tied = tied[0]
     for idx in tied:
         qs = q_sets[idx]
         if not qs:
@@ -155,38 +154,51 @@ def select_by_hypervolume(q_sets: List[List[np.ndarray]],
         mean_cost_obj = float(np.mean([v[0] for v in qs]))
         if best_cost is None or mean_cost_obj > best_cost:
             best_cost = mean_cost_obj
-            best_idx = idx
+            best_tied = idx
 
-    return best_idx
+    # Check if cost tie-break resolved it
+    cost_winners = []
+    if best_cost is not None:
+        for idx in tied:
+            qs = q_sets[idx]
+            if qs:
+                mco = float(np.mean([v[0] for v in qs]))
+                if abs(mco - best_cost) < 1e-12:
+                    cost_winners.append(idx)
+    if not cost_winners:
+        cost_winners = tied
+
+    if len(cost_winners) == 1:
+        return cost_winners[0]
+
+    # Tie-break 2: seeded random
+    rng = tie_break_rng if tie_break_rng is not None else random.Random(42)
+    return rng.choice(cost_winners)
 
 
-def select_by_pareto_dominance(q_vectors: np.ndarray,
-                                valid_mask: np.ndarray,
-                                pareto_w: Optional[np.ndarray] = None,
-                                epsilon_decomp: float = 0.0) -> int:
-    n = len(q_vectors)
-    valid_indices = [i for i in range(n) if valid_mask[i]]
-    if not valid_indices:
-        raise ValueError("No valid action available")
-    if len(valid_indices) == 1:
-        return valid_indices[0]
+def build_target_q_set(reward_vec: np.ndarray,
+                        next_q_sets: List[List[np.ndarray]],
+                        gamma: float,
+                        max_size: int,
+                        reference_point: np.ndarray,
+                        done: bool = False) -> List[np.ndarray]:
+    r = np.asarray(reward_vec, dtype=np.float64)
+    if done or not next_q_sets or all(len(qs) == 0 for qs in next_q_sets):
+        return [r.copy()]
 
-    valid_qs = np.array([q_vectors[i] for i in valid_indices])
-    nd_local = non_dominated_indices(valid_qs)
-    nd_global = [valid_indices[i] for i in nd_local]
+    all_next: List[np.ndarray] = []
+    for qs in next_q_sets:
+        all_next.extend(qs)
 
-    if len(nd_global) == 1:
-        return nd_global[0]
+    if not all_next:
+        return [r.copy()]
 
-    nd_qs = np.array([q_vectors[i] for i in nd_global])
-    if pareto_w is not None:
-        w = np.asarray(pareto_w, dtype=np.float64)
-        scores = nd_qs @ w
-        best_local = int(np.argmax(scores))
-    else:
-        best_local = random.randint(0, len(nd_global) - 1)
-
-    return nd_global[best_local]
+    nd_next = non_dominated(all_next)
+    targets = [r + gamma * np.asarray(q, dtype=np.float64) for q in nd_next]
+    targets = non_dominated(targets)
+    if len(targets) > max_size:
+        targets = prune_by_hypervolume(targets, max_size, reference_point)
+    return targets
 
 
 class ParetoArchive:
@@ -256,8 +268,8 @@ class ParetoArchive:
             return "ParetoArchive(empty)"
         objs = self.get_obj_matrix()
         return (f"ParetoArchive(size={len(self._entries)}, "
-                f"obj0=[{objs[:,0].min():.3f}, {objs[:,0].max():.3f}], "
-                f"obj1=[{objs[:,1].min():.3f}, {objs[:,1].max():.3f}])")
+                f"obj0=[{objs[:,0].min():.3f},{objs[:,0].max():.3f}], "
+                f"obj1=[{objs[:,1].min():.3f},{objs[:,1].max():.3f}])")
 
 
 class ParetoScalarizer:
@@ -325,3 +337,25 @@ def pareto_front(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]
     pts = np.array(points, dtype=np.float64)
     nd = non_dominated_indices(pts)
     return [tuple(pts[i]) for i in nd]
+
+# Backward-compat alias
+def select_by_pareto_dominance(q_vectors, valid_mask, pareto_w=None, epsilon_decomp=0.0):
+    n = len(q_vectors)
+    valid_indices = [i for i in range(n) if valid_mask[i]]
+    if not valid_indices:
+        raise ValueError("No valid action available")
+    if len(valid_indices) == 1:
+        return valid_indices[0]
+    valid_qs = np.array([q_vectors[i] for i in valid_indices])
+    nd_local = non_dominated_indices(valid_qs)
+    nd_global = [valid_indices[i] for i in nd_local]
+    if len(nd_global) == 1:
+        return nd_global[0]
+    nd_qs = np.array([q_vectors[i] for i in nd_global])
+    if pareto_w is not None:
+        w = np.asarray(pareto_w, dtype=np.float64)
+        scores = nd_qs @ w
+        best_local = int(np.argmax(scores))
+    else:
+        best_local = random.randint(0, len(nd_global) - 1)
+    return nd_global[best_local]

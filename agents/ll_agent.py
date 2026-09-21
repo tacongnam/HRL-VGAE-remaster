@@ -4,10 +4,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import deque
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from config import Config
-from models.ll_dqn import LLNodeScorer, N_OBJ
-from utils.pareto import select_by_hypervolume
+from ll_dqn import LLNodeScorer, N_OBJ
+from pareto import (
+    non_dominated, select_by_hypervolume,
+    prune_by_hypervolume, hv_score_for_action, build_target_q_set
+)
 
 
 class LLReplayBuffer:
@@ -32,6 +35,7 @@ class LLAgent:
         self.train_steps = 0
         self._ref_point = cfg.pareto.hv_reference_point()
         self._max_q_vecs = cfg.qnet.max_q_vectors_per_action
+        self._tie_rng = random.Random(cfg.train.seed + 1)
         self.q_net = LLNodeScorer(cfg).to(device)
         self.target_net = LLNodeScorer(cfg).to(device)
         self.target_net.load_state_dict(self.q_net.state_dict())
@@ -43,7 +47,8 @@ class LLAgent:
                     z_global, z_prev_node, z_nodes,
                     vnf_features, sfc_features,
                     cpu_mask: np.ndarray,
-                    pareto_w: torch.Tensor
+                    pareto_w: torch.Tensor,
+                    verbose: bool = False
                     ) -> Optional[int]:
         valid_nodes = np.where(cpu_mask)[0]
         if len(valid_nodes) == 0:
@@ -64,9 +69,26 @@ class LLAgent:
         self.q_net.train()
 
         q_np = q_vecs.cpu().numpy()
-        q_sets = [[q_np[i]] for i in range(num_nodes)]
+        q_sets: List[List[np.ndarray]] = []
+        for i in range(num_nodes):
+            if cpu_mask[i]:
+                nd_set = non_dominated([q_np[i]])
+                nd_set = prune_by_hypervolume(nd_set, self._max_q_vecs, self._ref_point)
+                q_sets.append(nd_set)
+            else:
+                q_sets.append([])
 
-        chosen = select_by_hypervolume(q_sets, cpu_mask, self._ref_point)
+        chosen = select_by_hypervolume(q_sets, cpu_mask, self._ref_point,
+                                       tie_break_rng=self._tie_rng)
+
+        if verbose:
+            hv_scores = [hv_score_for_action(q_sets[i], self._ref_point)
+                         if cpu_mask[i] else 0.0 for i in range(num_nodes)]
+            top5 = sorted(enumerate(hv_scores), key=lambda x: -x[1])[:5]
+            print(f"  [LL-HV] ref={self._ref_point} | "
+                  f"top5={([(n, f'{s:.4f}') for n, s in top5])} | "
+                  f"chosen={chosen} q_set_size={len(q_sets[chosen])}")
+
         return int(chosen)
 
     def store_transition(self,
@@ -76,7 +98,7 @@ class LLAgent:
                          done: float):
         self.buffer.push(state_tuple, next_state_tuple, reward_vec, done)
 
-    def train_step(self, pareto_w: torch.Tensor = None) -> Optional[float]:
+    def train_step(self, pareto_w: torch.Tensor) -> Optional[float]:
         min_buf = min(self.cfg.qnet.batch_size,
                       self.cfg.qnet.ll_buffer_size // 10)
         if len(self.buffer) < min_buf:
@@ -93,18 +115,16 @@ class LLAgent:
         sf_t = torch.stack(sf_l).to(self.device)
         pw_t = torch.stack(pw_l).to(self.device)
 
-        rewards_t = torch.tensor(
-            np.array(reward_vecs), dtype=torch.float32, device=self.device
-        )
-        dones_t = torch.tensor(dones, dtype=torch.float32, device=self.device)
-
         current_q = self.q_net(zg_t, zp_t, zc_t, vf_t, sf_t, pw_t)
 
         with torch.no_grad():
-            next_q_vecs = []
+            target_q_vecs = []
             for i, ns in enumerate(next_states):
-                if ns is None:
-                    next_q_vecs.append(torch.zeros(N_OBJ, device=self.device))
+                r_vec = np.asarray(reward_vecs[i], dtype=np.float64)
+                is_done = bool(dones[i] > 0.5)
+
+                if ns is None or is_done:
+                    target_sets = [r_vec.copy()]
                 else:
                     nzg, nzp, n_all_z, nvf, nsf, n_mask, npw = ns
                     n_all_z = n_all_z.to(self.device)
@@ -116,26 +136,34 @@ class LLAgent:
                     npw_exp = npw.unsqueeze(0).expand(num_nodes, -1).to(self.device)
 
                     cand_q = self.target_net(
-                        nzg_exp, nzp_exp, n_all_z, nvf_exp, nsf_exp, npw_exp
-                    )
+                        nzg_exp, nzp_exp, n_all_z, nvf_exp, nsf_exp, npw_exp)
+                    cand_np = cand_q.cpu().numpy()
 
                     mask_np = np.asarray(n_mask, dtype=bool)
-                    if not mask_np.any():
-                        next_q_vecs.append(torch.zeros(N_OBJ, device=self.device))
-                    else:
-                        cand_np = cand_q.cpu().numpy()
-                        q_sets_next = [[cand_np[j]] for j in range(num_nodes)]
-                        best_idx = select_by_hypervolume(
-                            q_sets_next, mask_np, self._ref_point)
-                        next_q_vecs.append(cand_q[best_idx])
+                    next_q_sets = [
+                        [cand_np[j]] if (j < len(mask_np) and mask_np[j]) else []
+                        for j in range(num_nodes)
+                    ]
+                    next_q_sets_valid = [qs for qs in next_q_sets if qs]
 
-            next_q_t = torch.stack(next_q_vecs)
+                    target_sets = build_target_q_set(
+                        r_vec, next_q_sets_valid,
+                        self.cfg.qnet.gamma,
+                        self._max_q_vecs,
+                        self._ref_point,
+                        done=is_done,
+                    )
 
-        target_q = (rewards_t
-                    + self.cfg.qnet.gamma * next_q_t
-                    * (1.0 - dones_t.unsqueeze(-1)))
+                if target_sets:
+                    rep = np.mean(target_sets, axis=0).astype(np.float32)
+                else:
+                    rep = r_vec.astype(np.float32)
+                target_q_vecs.append(rep)
 
-        loss = nn.MSELoss()(current_q, target_q)
+        target_t = torch.tensor(
+            np.stack(target_q_vecs), dtype=torch.float32, device=self.device)
+
+        loss = nn.MSELoss()(current_q, target_t)
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)

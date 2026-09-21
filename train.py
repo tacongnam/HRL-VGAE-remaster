@@ -9,16 +9,16 @@ import torch
 import torch.optim as optim
 from typing import Optional, List
 from config import Config
-from env.nfv_env import NFVEnvironment
-from models.vgae import MNVGAE
-from agents.hl_agent import HLAgent
-from agents.ll_agent import LLAgent
-from utils.dijkstra import custom_dijkstra, compute_path_cost_delay
-from utils.deploy_cost import total_deploy_cost
-from utils.pareto import ParetoScalarizer, ParetoArchive
-from models.ll_dqn import N_OBJ
-from utils.metrics import MetricsTracker
-from utils.logger import TrainingLogger
+from nfv_env import NFVEnvironment
+from vgae import MNVGAE
+from hl_agent import HLAgent
+from ll_agent import LLAgent
+from dijkstra import custom_dijkstra, compute_path_cost_delay
+from deploy_cost import total_deploy_cost
+from pareto import ParetoScalarizer, ParetoArchive
+from ll_dqn import N_OBJ
+from metrics import MetricsTracker
+from logger import TrainingLogger
 
 
 def set_seeds(seed: int):
@@ -44,50 +44,17 @@ def build_vnf_feature(vnf, cfg, device):
 
 
 def _compute_recon_loss_sampled(z_nodes, edge_index, num_nodes, neg_ratio, device):
+    import torch.nn.functional as F
     num_pos = edge_index.shape[1]
     if num_pos == 0:
         return torch.tensor(0.0, device=device)
-    pos_src = z_nodes[edge_index[0]]
-    pos_dst = z_nodes[edge_index[1]]
-    pos_score = (pos_src * pos_dst).sum(dim=-1)
+    pos_score = (z_nodes[edge_index[0]] * z_nodes[edge_index[1]]).sum(dim=-1)
     num_neg = max(1, int(num_pos * neg_ratio))
     neg_src = torch.randint(0, num_nodes, (num_neg,), device=device)
     neg_dst = torch.randint(0, num_nodes, (num_neg,), device=device)
     neg_score = (z_nodes[neg_src] * z_nodes[neg_dst]).sum(dim=-1)
-    pos_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-        pos_score, torch.ones_like(pos_score))
-    neg_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-        neg_score, torch.zeros_like(neg_score))
-    return pos_loss + neg_loss
-
-
-class StepTimer:
-    def __init__(self, log_every=500):
-        self.log_every = log_every
-        self.counts = {}
-        self.totals = {}
-        self.sfc_count = 0
-        self._t = {}
-
-    def start(self, key):
-        self._t[key] = time.perf_counter()
-
-    def end(self, key):
-        elapsed = time.perf_counter() - self._t.get(key, time.perf_counter())
-        self.totals[key] = self.totals.get(key, 0.0) + elapsed
-        self.counts[key] = self.counts.get(key, 0) + 1
-
-    def tick_sfc(self):
-        self.sfc_count += 1
-        if self.sfc_count % self.log_every == 0:
-            self.report()
-
-    def report(self):
-        parts = []
-        for k in self.totals:
-            avg_ms = self.totals[k] / max(1, self.counts[k]) * 1000
-            parts.append(f"{k}={avg_ms:.2f}ms(x{self.counts[k]})")
-        print(f"  [TIMER] SFC#{self.sfc_count} | " + " | ".join(parts), flush=True)
+    return (F.binary_cross_entropy_with_logits(pos_score, torch.ones_like(pos_score))
+            + F.binary_cross_entropy_with_logits(neg_score, torch.zeros_like(neg_score)))
 
 
 def _build_reward_vec_4obj(r_cost: float, r_delay: float,
@@ -108,9 +75,9 @@ def run_episode(env: NFVEnvironment,
                 train: bool = True,
                 verbose: bool = False,
                 fixed_weight=None) -> dict:
+
     episode_hl_reward = 0.0
     episode_ll_reward = 0.0
-    episode_revenue = 0.0
     episode_r_accept = 0.0
     episode_r_cost = 0.0
     vgae_loss_acc = 0.0
@@ -121,9 +88,9 @@ def run_episode(env: NFVEnvironment,
     ll_updates = 0
     sfc_processed_since_vgae_train = 0
     done = False
-    timer = StepTimer(log_every=500) if verbose else None
     blocked_until: dict = {}
     failure_vec = cfg.pareto.failure_penalty_vector()
+    ref_point = cfg.pareto.hv_reference_point()
 
     if fixed_weight is not None:
         w_accept, w_cost = fixed_weight
@@ -147,7 +114,6 @@ def run_episode(env: NFVEnvironment,
 
         if (train and vgae_optimizer is not None
                 and sfc_processed_since_vgae_train >= cfg.vgae.train_every_steps):
-            x, ei = env.get_node_features_tensor(device)
             vgae_optimizer.zero_grad()
             vgae.train()
             z_nodes_tr, _, mu_tr, logvar_tr = vgae(
@@ -167,9 +133,9 @@ def run_episode(env: NFVEnvironment,
             z_nodes = z_nodes.detach()
             z_global = z_global.detach()
             sfc_processed_since_vgae_train = 0
-            graph_dirty = False
 
-        hl_result = hl_agent.select_sfc(z_global, env.queue, env.t, pareto_w, blocked_until)
+        hl_result = hl_agent.select_sfc(
+            z_global, env.queue, env.t, pareto_w, blocked_until, verbose=verbose)
         if hl_result is None:
             done = env.step_time()
             if not done and graph_dirty:
@@ -182,7 +148,6 @@ def run_episode(env: NFVEnvironment,
             selected_sfc.to_feature_vector(env.t),
             dtype=torch.float32, device=device)
 
-        prev_z_global = z_global.clone()
         ll_records = []
         partial_allocations = []
         embedding_failed = False
@@ -195,7 +160,8 @@ def run_episode(env: NFVEnvironment,
             vnf_feat = build_vnf_feature(vnf, cfg, device)
 
             chosen_node = ll_agent.select_node(
-                z_global, z_prev, z_nodes, vnf_feat, sfc_feat, cpu_mask, pareto_w)
+                z_global, z_prev, z_nodes, vnf_feat, sfc_feat,
+                cpu_mask, pareto_w, verbose=verbose)
             if chosen_node is None:
                 embedding_failed = True
                 break
@@ -248,7 +214,7 @@ def run_episode(env: NFVEnvironment,
         if embedding_failed:
             env._rollback_resources(partial_allocations)
             hl_reward_vec = failure_vec.copy()
-            r_H = scalarizer.scalarize(failure_vec[0], failure_vec[1], w_accept, w_cost)
+            r_H = scalarizer.scalarize(-cfg.reward.r_fail, 0.0, w_accept, w_cost)
 
             env.remove_sfc_from_queue(selected_sfc)
             if not selected_sfc.is_expired(env.t + 1):
@@ -270,6 +236,10 @@ def run_episode(env: NFVEnvironment,
                         ll_loss_acc += loss
                         ll_updates += 1
 
+            if verbose:
+                print(f"  [FAIL] sfc={selected_sfc.sfc_id} "
+                      f"reward_vec={hl_reward_vec} r_H={r_H:.4f}")
+
         else:
             deploy_cost = total_deploy_cost(env.G, partial_allocations, cfg)
             env.commit_sfc(selected_sfc, partial_allocations, deploy_cost=deploy_cost)
@@ -281,10 +251,9 @@ def run_episode(env: NFVEnvironment,
             n_steps = selected_sfc.F_k + 1
 
             for rec in ll_records:
-                r_quality = -(cfg.reward.alpha * rec['path_cost']
-                              + cfg.reward.beta * rec['path_delay']
-                              + cfg.reward.gamma_load * load_std)
-                rec['r_quality'] = r_quality
+                rec['r_quality'] = -(cfg.reward.alpha * rec['path_cost']
+                                     + cfg.reward.beta * rec['path_delay']
+                                     + cfg.reward.gamma_load * load_std)
             r_quality_dest = -(cfg.reward.alpha * dest_cost
                                + cfg.reward.beta * dest_delay
                                + cfg.reward.gamma_load * load_std)
@@ -293,7 +262,6 @@ def run_episode(env: NFVEnvironment,
             r_bar_quality = total_r_quality / n_steps
 
             revenue = env.norm_revenue(selected_sfc)
-            episode_revenue += revenue
             r_accept_component = (revenue
                                   + cfg.reward.theta * selected_sfc.urgency(env.t)
                                   + cfg.reward.lambda_L * r_bar_quality)
@@ -302,14 +270,22 @@ def run_episode(env: NFVEnvironment,
             r_success_component = 1.0
 
             hl_reward_vec = _build_reward_vec_4obj(
-                r_cost_component, r_bar_quality, r_balance_component, r_success_component)
+                r_cost_component, r_bar_quality,
+                r_balance_component, r_success_component)
 
-            r_H = scalarizer.scalarize(r_accept_component, r_cost_component, w_accept, w_cost)
+            r_H = scalarizer.scalarize(r_accept_component, r_cost_component,
+                                       w_accept, w_cost)
             scalarizer.update_utopia(r_accept_component, r_cost_component)
 
             episode_r_accept += r_accept_component
             episode_r_cost += r_cost_component
             episode_ll_reward += r_bar_quality
+
+            if verbose:
+                print(f"  [OK] sfc={selected_sfc.sfc_id} "
+                      f"cost={deploy_cost:.2f} "
+                      f"reward_vec={np.round(hl_reward_vec, 4)} "
+                      f"r_H={r_H:.4f} ref={ref_point}")
 
             if tracker is not None:
                 tracker.record_sfc_success(selected_sfc.F_k + 1, revenue)
@@ -344,8 +320,6 @@ def run_episode(env: NFVEnvironment,
                         ll_loss_acc += loss
                         ll_updates += 1
 
-            z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device, update_temporal=False)
-
         episode_hl_reward += r_H
 
         if env._dataset_mode:
@@ -358,26 +332,25 @@ def run_episode(env: NFVEnvironment,
                              dtype=torch.float32, device=device)
                 for q in next_valid_sfcs
             ]
+            next_valid_mask = np.ones(len(next_sfc_feats), dtype=bool)
             hl_done = (not env.queue
                        and (not hasattr(env, '_req_cursor')
                             or env._req_cursor >= len(env._all_requests)))
 
             hl_agent.store_transition(
-                prev_z_global.cpu(), sfc_feat.cpu(), pareto_w.cpu(),
+                z_global.cpu(), sfc_feat.cpu(), pareto_w.cpu(),
                 sfc_idx,
                 hl_reward_vec,
                 z_global.cpu(),
                 [f.cpu() for f in next_sfc_feats],
                 pareto_w.cpu(),
-                float(hl_done)
+                float(hl_done),
+                valid_action_mask=next_valid_mask,
             )
             hl_loss = hl_agent.train_step()
             if hl_loss is not None:
                 hl_loss_acc += hl_loss
                 hl_updates += 1
-
-        if verbose and timer:
-            timer.tick_sfc()
 
         if env.queue:
             continue
@@ -390,14 +363,12 @@ def run_episode(env: NFVEnvironment,
     if pareto_archive is not None and env.accepted > 0:
         avg_r_accept = episode_r_accept / max(1, env.accepted)
         avg_r_cost = episode_r_cost / max(1, env.accepted)
-        obj_vec = np.array([avg_r_accept, avg_r_cost], dtype=np.float64)
         pareto_archive.add(
-            obj_vec,
+            np.array([avg_r_accept, avg_r_cost], dtype=np.float64),
             episode=getattr(env, '_episode_id', 0),
-            w_accept=w_accept,
-            w_cost=w_cost,
+            w_accept=w_accept, w_cost=w_cost,
             acceptance_ratio=env.acceptance_ratio(),
-            total_deploy_cost=env.total_deploy_cost
+            total_deploy_cost=env.total_deploy_cost,
         )
 
     if train and not fixed_weight:
@@ -410,7 +381,6 @@ def run_episode(env: NFVEnvironment,
     return {
         'hl_reward': episode_hl_reward,
         'll_reward': episode_ll_reward,
-        'total_revenue': episode_revenue,
         'r_accept': episode_r_accept,
         'r_cost': episode_r_cost,
         'acceptance_ratio': env.acceptance_ratio(),
@@ -425,6 +395,7 @@ def run_episode(env: NFVEnvironment,
         'w_accept': w_accept,
         'w_cost': w_cost,
         'pareto_archive_size': len(pareto_archive) if pareto_archive else 0,
+        'hv_ref_point': ref_point.tolist(),
     }
 
 
@@ -464,7 +435,7 @@ def main():
         test_paths = []
 
     if not train_paths:
-        raise FileNotFoundError(f"Không tìm thấy episode: {args.train_dir}")
+        raise FileNotFoundError(f"No episodes found: {args.train_dir}")
 
     env = NFVEnvironment(cfg)
     vgae, hl_agent, ll_agent, vgae_optimizer, scalarizer = _build_env_and_agents(cfg, device)
@@ -477,6 +448,12 @@ def main():
     decay_episodes = int((total_train_episodes - warmup_episodes) * 0.75)
     eps_decay_per_ep = (cfg.qnet.eps_end / cfg.qnet.eps_start) ** (
         1.0 / max(1, decay_episodes))
+
+    ref_point_str = str(cfg.pareto.hv_reference_point().tolist())
+    print(f"HV reference_point = {ref_point_str}")
+    print(f"Objectives: [r_cost, r_delay, r_balance, r_success] — all maximize")
+    print(f"Placement: Pareto Q-set + Hypervolume action selection")
+    print(f"Admission: Scalar scalarizer (Chebyshev) — unchanged")
 
     with TrainingLogger(log_dir=args.log_dir, csv_path=args.csv) as logger:
         for epoch in range(1, args.epochs + 1):
@@ -497,7 +474,7 @@ def main():
                     env._episode_id = global_ep
 
                     ep_start = time.perf_counter()
-                    verbose_this = args.verbose and global_ep == 1
+                    verbose_this = args.verbose and (global_ep <= 2)
 
                     stats = run_episode(
                         env, vgae, hl_agent, ll_agent, vgae_optimizer,
@@ -507,8 +484,10 @@ def main():
 
                     ep_time = time.perf_counter() - ep_start
                     if not is_warmup:
-                        hl_agent.epsilon = max(cfg.qnet.eps_end, hl_agent.epsilon * eps_decay_per_ep)
-                        ll_agent.epsilon = max(cfg.qnet.eps_end, ll_agent.epsilon * eps_decay_per_ep)
+                        hl_agent.epsilon = max(cfg.qnet.eps_end,
+                                               hl_agent.epsilon * eps_decay_per_ep)
+                        ll_agent.epsilon = max(cfg.qnet.eps_end,
+                                               ll_agent.epsilon * eps_decay_per_ep)
 
                     stats['epsilon_hl'] = hl_agent.epsilon
                     stats['epsilon_ll'] = ll_agent.epsilon
@@ -536,12 +515,14 @@ def main():
         'll_eps': ll_agent.epsilon,
         'w_accept': scalarizer.w_accept,
         'w_cost': scalarizer.w_cost,
+        'hv_ref_point': cfg.pareto.hv_reference_point().tolist(),
         'pareto_archive': [
-            {'obj': e['obj'].tolist(), **{k: v for k, v in e.items() if k != 'obj'}}
+            {'obj': e['obj'].tolist(),
+             **{k: v for k, v in e.items() if k != 'obj'}}
             for e in pareto_archive.get_front()
-        ]
+        ],
     }, args.checkpoint)
-    print(f"\nCheckpoint saved: {args.checkpoint}")
+    print(f"\nCheckpoint: {args.checkpoint}")
     print(f"Final {pareto_archive.summary()}")
 
 
