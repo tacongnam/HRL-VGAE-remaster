@@ -51,6 +51,7 @@ def build_substrate_network(cfg: Config, rng: random.Random = None) -> nx.Graph:
         G.nodes[u]['cost_cpu'] = rng.uniform(0.5, 1.5)
         G.nodes[u]['cost_ram'] = rng.uniform(0.5, 1.5)
         G.nodes[u]['cost_stor'] = rng.uniform(0.5, 1.5)
+        G.nodes[u]['proc_delay'] = rng.uniform(0.5, 2.0) if u in fn_nodes else 0.0
     for u, v in G.edges():
         bw = rng.uniform(nc.bw_min_mbps, nc.bw_max_mbps)
         delay = rng.uniform(nc.delay_min_ms, nc.delay_max_ms)
@@ -88,12 +89,15 @@ def get_node_features(G: nx.Graph, cfg: Config) -> np.ndarray:
             for v in neighbors:
                 e = G[u][v]
                 utils.append(1.0 - e['bw_free'] / e['bw_total'])
-            avg_bw_util = np.mean(utils)
-        degree_norm = G.degree(u) / (nc.num_nodes - 1)
+            avg_bw_util = float(np.mean(utils))
+        degree_norm = G.degree(u) / max(1, nc.num_nodes - 1)
         cpu_free_norm = G.nodes[u]['cpu_free'] / nc.cpu_capacity_mips
         cpu_total_norm = G.nodes[u]['cpu_total'] / nc.cpu_capacity_mips
-        feat = [cpu_util, cpu_free_norm, cpu_total_norm, is_fn, avg_bw_util, degree_norm]
+        proc_delay_norm = G.nodes[u].get('proc_delay', 0.0) / 5.0
+        cost_cpu_norm = G.nodes[u].get('cost_cpu', 1.0) / 2.0
+        feat = [cpu_util, cpu_free_norm, cpu_total_norm, is_fn, avg_bw_util, degree_norm, proc_delay_norm, cost_cpu_norm]
         pad = cfg.vgae.d_in - len(feat)
-        feat.extend([0.0] * pad)
+        if pad > 0:
+            feat.extend([0.0] * pad)
         feats.append(feat[:cfg.vgae.d_in])
     return np.array(feats, dtype=np.float32)

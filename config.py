@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Optional
+import numpy as np
 
 @dataclass
 class NetworkConfig:
@@ -48,6 +49,7 @@ class QNetConfig:
     hl_buffer_size: int = 15_000
     ll_buffer_size: int = 72_000
     batch_size: int = 64
+    max_q_vectors_per_action: int = 10
 
 @dataclass
 class DeployCostConfig:
@@ -70,6 +72,30 @@ class ParetoConfig:
     weight_adapt_rate: float = 0.01
     utopia_momentum: float = 0.98
     front_log_every: int = 25
+    hv_ref_cost: float = -1.0
+    hv_ref_delay: float = -1.0
+    hv_ref_balance: float = -1.0
+    hv_ref_success: float = -1.0
+    failure_penalty_cost: float = 10.0
+    failure_penalty_delay: float = 10.0
+    failure_penalty_balance: float = 10.0
+    failure_penalty_success: float = 10.0
+
+    def hv_reference_point(self) -> np.ndarray:
+        return np.array([
+            self.hv_ref_cost,
+            self.hv_ref_delay,
+            self.hv_ref_balance,
+            self.hv_ref_success,
+        ], dtype=np.float64)
+
+    def failure_penalty_vector(self) -> np.ndarray:
+        return np.array([
+            -self.failure_penalty_cost,
+            -self.failure_penalty_delay,
+            -self.failure_penalty_balance,
+            -self.failure_penalty_success,
+        ], dtype=np.float32)
 
 @dataclass
 class RewardConfig:

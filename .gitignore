@@ -9,3 +9,4 @@ logs/
 *.log
 .env
 runs/*
+.venv/*

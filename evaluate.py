@@ -89,7 +89,7 @@ def main():
             G, reqs, _, topo_id = parse_episode(path)
             r = eval_episode(env, vgae, hl_agent, ll_agent, scalarizer, cfg, device, G=G, reqs=reqs, topo_id=topo_id)
             all_ratios.append(r['acceptance_ratio'])
-            all_revenues.append(r.get('total_deploy_cost', 0.0))
+            all_revenues.append(r.get('total_revenue', 0.0))
             all_rewards.append(r['hl_reward'])
             all_costs.append(r.get('total_deploy_cost', 0.0))
             if ep % args.log_interval == 0 or ep == total_eps:
@@ -105,6 +105,7 @@ def main():
             ep_start = time.time()
             r = eval_episode(env, vgae, hl_agent, ll_agent, scalarizer, cfg, device)
             all_ratios.append(r['acceptance_ratio'])
+            all_revenues.append(r.get('total_revenue', 0.0))
             all_rewards.append(r['hl_reward'])
             all_costs.append(r.get('total_deploy_cost', 0.0))
             if ep % args.log_interval == 0 or ep == total_eps:
@@ -115,6 +116,7 @@ def main():
     print(f"\n=== Evaluation Summary ===")
     print(f"  Tổng thời gian : {(time.time() - start_time)/60:.2f} phút")
     print(f"  AccRatio       : {np.mean(all_ratios):.4f} ± {np.std(all_ratios):.4f}")
+    print(f"  Revenue        : {np.mean(all_revenues):.4f} ± {np.std(all_revenues):.4f}")
     print(f"  HL Reward      : {np.mean(all_rewards):.4f} ± {np.std(all_rewards):.4f}")
     print(f"  DeployCost     : {np.mean(all_costs):.4f} ± {np.std(all_costs):.4f}")
 

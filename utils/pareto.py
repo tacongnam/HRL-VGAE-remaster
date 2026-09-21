@@ -1,52 +1,18 @@
-"""
-pareto.py — Pareto-based Multi-Objective Mechanism
-
-Hai objectives (cả hai đều MAXIMIZE, sau khi chuẩn hoá dấu):
-  obj[0] = r_accept  ≡  revenue + urgency + LL_quality   (maximize)
-  obj[1] = r_cost    ≡  -mu * deploy_cost                (maximize, tức minimize cost)
-
-Quy tắc dominance (maximize cả hai):
-  A dominates B  ⟺  A[i] >= B[i] ∀i  AND  A[j] > B[j] ∃j
-
-ParetoArchive lưu tập non-dominated solutions qua các episode.
-
-ParetoScalarizer còn được giữ lại với MỤC ĐÍCH PHỤ:
-  - Tính scalar r_H để HL replay buffer có thể dùng Bellman update
-    (DQN cần scalar target; đây là bước scalarization phụ trợ, KHÔNG phải
-    cơ chế lựa chọn chính).
-  - HL action selection KHÔNG dùng argmax(scalar) nữa; xem hl_agent.py.
-"""
-
 import random
 import numpy as np
 from typing import List, Tuple, Optional, Dict, Any
 from config import Config
 
-# ─────────────────────────────────────────────────────────────
-# 1. Pareto Dominance Logic
-# ─────────────────────────────────────────────────────────────
+N_OBJ = 4
+
 
 def dominates(a: np.ndarray, b: np.ndarray) -> bool:
-    """
-    Return True nếu vector a dominates vector b.
-    Giả định TẤT CẢ objectives đều MAXIMIZE.
-    Để minimize obj_i, hãy truyền vào -obj_i trước khi gọi hàm này.
-
-    A dominates B ⟺
-      - a[i] >= b[i]  ∀i   (a không kém hơn b trên mọi chiều)
-      - a[j] >  b[j]  ∃j   (a tốt hơn b trên ít nhất một chiều)
-    """
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
     return bool(np.all(a >= b) and np.any(a > b))
 
 
 def pareto_rank(candidates: np.ndarray) -> np.ndarray:
-    """
-    Tính Pareto rank (front index) cho mỗi candidate.
-    candidates: shape [N, n_obj], tất cả objectives maximize.
-    Trả về array int [N] — rank 0 = non-dominated (Pareto front).
-    """
     n = len(candidates)
     ranks = np.zeros(n, dtype=np.int32)
     for i in range(n):
@@ -59,10 +25,6 @@ def pareto_rank(candidates: np.ndarray) -> np.ndarray:
 
 
 def non_dominated_indices(points: np.ndarray) -> List[int]:
-    """
-    Trả về danh sách index của các điểm không bị dominated trong `points`.
-    points: shape [N, n_obj], tất cả objectives maximize.
-    """
     n = len(points)
     keep = []
     for i in range(n):
@@ -78,25 +40,156 @@ def non_dominated_indices(points: np.ndarray) -> List[int]:
     return keep
 
 
-# ─────────────────────────────────────────────────────────────
-# 2. Pareto Archive
-# ─────────────────────────────────────────────────────────────
+def compute_hypervolume(points: np.ndarray, reference_point: np.ndarray) -> float:
+    points = np.asarray(points, dtype=np.float64)
+    ref = np.asarray(reference_point, dtype=np.float64)
+    if points.ndim == 1:
+        points = points.reshape(1, -1)
+    valid = np.all(points > ref, axis=1)
+    points = points[valid]
+    if len(points) == 0:
+        return 0.0
+    n_obj = points.shape[1]
+    if n_obj == 1:
+        return float(np.max(points[:, 0]) - ref[0])
+    if n_obj == 2:
+        return _hv_2d(points, ref)
+    return _hv_wfg(points, ref)
+
+
+def _hv_2d(points: np.ndarray, ref: np.ndarray) -> float:
+    pts = points[np.argsort(points[:, 0])[::-1]]
+    hv = 0.0
+    prev_y = ref[1]
+    for p in pts:
+        if p[1] > prev_y:
+            hv += (p[0] - ref[0]) * (p[1] - prev_y)
+            prev_y = p[1]
+    return float(hv)
+
+
+def _hv_wfg(points: np.ndarray, ref: np.ndarray) -> float:
+    if len(points) == 0:
+        return 0.0
+    if points.shape[1] == 2:
+        return _hv_2d(points, ref)
+    nd_idx = non_dominated_indices(points)
+    points = points[nd_idx]
+    if len(points) == 1:
+        return float(np.prod(points[0] - ref))
+    order = np.argsort(points[:, 0])[::-1]
+    points = points[order]
+    hv = 0.0
+    n = len(points)
+    for i in range(n):
+        lower_x = points[i + 1][0] if i + 1 < n else ref[0]
+        x_width = points[i][0] - lower_x
+        if x_width <= 0.0:
+            continue
+        sub_pts = points[:i + 1, 1:]
+        hv += x_width * _hv_wfg(sub_pts, ref[1:])
+    return float(hv)
+
+
+def hypervolume_contribution(points: np.ndarray, idx: int,
+                              reference_point: np.ndarray) -> float:
+    pts = np.asarray(points, dtype=np.float64)
+    ref = np.asarray(reference_point, dtype=np.float64)
+    hv_all = compute_hypervolume(pts, ref)
+    pts_without = np.delete(pts, idx, axis=0)
+    hv_without = compute_hypervolume(pts_without, ref) if len(pts_without) > 0 else 0.0
+    return hv_all - hv_without
+
+
+def prune_by_hypervolume(vectors: List[np.ndarray], max_size: int,
+                          reference_point: np.ndarray) -> List[np.ndarray]:
+    if max_size <= 0:
+        raise ValueError("max_size must be > 0")
+    nd_idx = non_dominated_indices(np.array(vectors))
+    vectors = [vectors[i] for i in nd_idx]
+    while len(vectors) > max_size:
+        pts = np.array(vectors)
+        contribs = [hypervolume_contribution(pts, i, reference_point)
+                    for i in range(len(vectors))]
+        remove_idx = int(np.argmin(contribs))
+        vectors.pop(remove_idx)
+    return vectors
+
+
+def hv_score_for_action(q_vectors: List[np.ndarray],
+                         reference_point: np.ndarray) -> float:
+    if not q_vectors:
+        return 0.0
+    pts = np.array(q_vectors, dtype=np.float64)
+    nd_idx = non_dominated_indices(pts)
+    nd_pts = pts[nd_idx]
+    return compute_hypervolume(nd_pts, reference_point)
+
+
+def select_by_hypervolume(q_sets: List[List[np.ndarray]],
+                           valid_mask: np.ndarray,
+                           reference_point: np.ndarray,
+                           rng: Optional[random.Random] = None) -> int:
+    valid_indices = [i for i in range(len(q_sets)) if valid_mask[i]]
+    if not valid_indices:
+        raise ValueError("No valid action available")
+    if len(valid_indices) == 1:
+        return valid_indices[0]
+
+    hv_scores = np.array([
+        hv_score_for_action(q_sets[i], reference_point)
+        for i in valid_indices
+    ], dtype=np.float64)
+
+    best_hv = np.max(hv_scores)
+    tied = [valid_indices[j] for j, s in enumerate(hv_scores) if s >= best_hv - 1e-12]
+    if len(tied) == 1:
+        return tied[0]
+
+    best_cost = None
+    best_idx = tied[0]
+    for idx in tied:
+        qs = q_sets[idx]
+        if not qs:
+            continue
+        mean_cost_obj = float(np.mean([v[0] for v in qs]))
+        if best_cost is None or mean_cost_obj > best_cost:
+            best_cost = mean_cost_obj
+            best_idx = idx
+
+    return best_idx
+
+
+def select_by_pareto_dominance(q_vectors: np.ndarray,
+                                valid_mask: np.ndarray,
+                                pareto_w: Optional[np.ndarray] = None,
+                                epsilon_decomp: float = 0.0) -> int:
+    n = len(q_vectors)
+    valid_indices = [i for i in range(n) if valid_mask[i]]
+    if not valid_indices:
+        raise ValueError("No valid action available")
+    if len(valid_indices) == 1:
+        return valid_indices[0]
+
+    valid_qs = np.array([q_vectors[i] for i in valid_indices])
+    nd_local = non_dominated_indices(valid_qs)
+    nd_global = [valid_indices[i] for i in nd_local]
+
+    if len(nd_global) == 1:
+        return nd_global[0]
+
+    nd_qs = np.array([q_vectors[i] for i in nd_global])
+    if pareto_w is not None:
+        w = np.asarray(pareto_w, dtype=np.float64)
+        scores = nd_qs @ w
+        best_local = int(np.argmax(scores))
+    else:
+        best_local = random.randint(0, len(nd_global) - 1)
+
+    return nd_global[best_local]
+
 
 class ParetoArchive:
-    """
-    Non-dominated solution archive.
-
-    Mỗi entry là một dict với ít nhất hai key bắt buộc:
-      'obj': np.ndarray  — vector objective (tất cả maximize)
-      + metadata tùy ý (episode, w_accept, w_cost, acceptance_ratio, ...)
-
-    Thuật toán thêm solution mới:
-      1. Nếu solution mới bị dominated bởi bất kỳ entry nào → bỏ qua.
-      2. Xoá các entry bị solution mới dominate.
-      3. Thêm solution mới vào archive.
-      4. Nếu archive đầy (> max_size), xoá entry có crowding distance nhỏ nhất.
-    """
-
     def __init__(self, max_size: int = 200):
         self.max_size = max_size
         self._entries: List[Dict[str, Any]] = []
@@ -105,33 +198,19 @@ class ParetoArchive:
         return len(self._entries)
 
     def add(self, obj: np.ndarray, **metadata) -> bool:
-        """
-        Thêm solution mới với objective vector `obj`.
-        Trả về True nếu được thêm vào, False nếu bị dominated.
-        """
         obj = np.asarray(obj, dtype=np.float64)
-
-        # Bước 1: kiểm tra xem solution mới có bị dominated không
         for entry in self._entries:
             if dominates(entry['obj'], obj):
-                return False  # bị dominated → bỏ qua
-
-        # Bước 2: xoá các entry bị solution mới dominate
+                return False
         self._entries = [e for e in self._entries if not dominates(obj, e['obj'])]
-
-        # Bước 3: thêm vào
         entry = {'obj': obj.copy()}
         entry.update(metadata)
         self._entries.append(entry)
-
-        # Bước 4: nếu đầy, loại bỏ điểm có crowding distance nhỏ nhất
         if len(self._entries) > self.max_size:
             self._prune_by_crowding()
-
         return True
 
     def _prune_by_crowding(self):
-        """Xoá 1 entry có crowding distance nhỏ nhất (giữ diversity)."""
         if len(self._entries) <= 1:
             return
         objs = np.array([e['obj'] for e in self._entries])
@@ -147,7 +226,6 @@ class ParetoArchive:
             crowd[order[-1]] += np.inf
             for r in range(1, n - 1):
                 crowd[order[r]] += (col[order[r + 1]] - col[order[r - 1]]) / range_k
-        # Xoá entry không phải biên và có crowd nhỏ nhất
         finite_mask = np.isfinite(crowd)
         if finite_mask.any():
             remove_idx = int(np.where(finite_mask, crowd, np.inf).argmin())
@@ -156,21 +234,14 @@ class ParetoArchive:
         self._entries.pop(remove_idx)
 
     def get_front(self) -> List[Dict[str, Any]]:
-        """Trả về toàn bộ non-dominated front."""
         return list(self._entries)
 
     def get_obj_matrix(self) -> Optional[np.ndarray]:
-        """Trả về ma trận [N, n_obj] của tất cả objectives trong archive."""
         if not self._entries:
             return None
         return np.array([e['obj'] for e in self._entries])
 
     def best_by_weight(self, w: np.ndarray) -> Optional[Dict[str, Any]]:
-        """
-        Lấy solution tốt nhất theo weighted sum của objectives.
-        Dùng cho MỤC ĐÍCH TRUY VẤN / HIỂN THỊ, không phải để chọn policy
-        trong training loop.
-        """
         if not self._entries:
             return None
         w = np.asarray(w, dtype=np.float64)
@@ -189,87 +260,7 @@ class ParetoArchive:
                 f"obj1=[{objs[:,1].min():.3f}, {objs[:,1].max():.3f}])")
 
 
-# ─────────────────────────────────────────────────────────────
-# 3. Pareto-based Action Selection Utilities
-# ─────────────────────────────────────────────────────────────
-
-def select_by_pareto_dominance(q_vectors: np.ndarray,
-                                valid_mask: np.ndarray,
-                                pareto_w: Optional[np.ndarray] = None,
-                                epsilon_decomp: float = 0.0) -> int:
-    """
-    Chọn action dựa trên Pareto dominance thay vì argmax scalar.
-
-    Thuật toán:
-      1. Lọc các candidate hợp lệ (valid_mask).
-      2. Tìm tập non-dominated trong {Q(s, a) | a valid}.
-      3. Trong tập non-dominated:
-         a. Nếu có duy nhất 1 candidate → chọn nó.
-         b. Nếu có nhiều (không có candidate nào dominant hoàn toàn):
-            - Nếu pareto_w được cung cấp: dùng weighted sum CHỈ TRONG
-              tập non-dominated để phá tie (bước phụ hợp lệ vì
-              tất cả candidates đã non-dominated với nhau).
-            - Nếu không: random uniform trong tập non-dominated.
-
-    Tại sao bước b không phá vỡ tính Pareto-based:
-      Trong tập non-dominated, không có solution nào tốt hơn hẳn
-      solution khác trên mọi objective → không có dominance relation.
-      Dùng weighted sum để phá tie ở bước này tương đương chọn một
-      điểm cụ thể trên Pareto front, là cơ chế hợp lệ.
-
-    q_vectors: shape [N, n_obj]
-    valid_mask: shape [N], bool
-    pareto_w: shape [n_obj], optional
-    Returns: int index trong [0, N)
-    """
-    n = len(q_vectors)
-    valid_indices = [i for i in range(n) if valid_mask[i]]
-    if not valid_indices:
-        raise ValueError("No valid action available")
-
-    if len(valid_indices) == 1:
-        return valid_indices[0]
-
-    # Lấy Q vectors của các candidate hợp lệ
-    valid_qs = np.array([q_vectors[i] for i in valid_indices])  # [M, n_obj]
-
-    # Tìm non-dominated trong valid candidates
-    nd_local = non_dominated_indices(valid_qs)  # indices trong valid_qs
-    nd_global = [valid_indices[i] for i in nd_local]  # indices trong [0, N)
-
-    if len(nd_global) == 1:
-        return nd_global[0]
-
-    # Nhiều non-dominated candidates: phá tie trong tập này
-    nd_qs = np.array([q_vectors[i] for i in nd_global])
-
-    if pareto_w is not None:
-        w = np.asarray(pareto_w, dtype=np.float64)
-        scores = nd_qs @ w
-        best_local = int(np.argmax(scores))
-    else:
-        best_local = random.randint(0, len(nd_global) - 1)
-
-    return nd_global[best_local]
-
-
-# ─────────────────────────────────────────────────────────────
-# 4. ParetoScalarizer — giữ cho Bellman update (HL DQN auxiliary)
-# ─────────────────────────────────────────────────────────────
-
 class ParetoScalarizer:
-    """
-    MỤC ĐÍCH PHỤ: Tính scalar r_H cho Bellman update trong HL replay buffer.
-
-    Lý do giữ lại scalarization:
-      DQN yêu cầu scalar target Q-value để tính Bellman MSE loss.
-      Scalarization ở đây KHÔNG phải là cơ chế chọn policy:
-        - HL action selection dùng Pareto dominance (xem hl_agent.py).
-        - r_H chỉ là "chất lượng tổng hợp" phục vụ gradient signal.
-      Augmented Chebyshev tốt hơn linear weighted sum vì nó đảm bảo
-      coverage của cả concave Pareto front.
-    """
-
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.w_accept = cfg.pareto.accept_weight_init
@@ -304,10 +295,6 @@ class ParetoScalarizer:
 
     def scalarize(self, r_accept: float, r_cost: float,
                   w_accept: float, w_cost: float) -> float:
-        """
-        Augmented Chebyshev scalarization — dùng cho gradient signal DQN.
-        KHÔNG dùng để chọn action trong Pareto mechanism.
-        """
         range_accept = max(1e-6, self.utopia_accept - self.nadir_accept)
         range_cost = max(1e-6, self.utopia_cost - self.nadir_cost)
         d_accept = w_accept * (self.utopia_accept - r_accept) / range_accept
@@ -328,17 +315,11 @@ class ParetoScalarizer:
         self.w_cost = 1.0 - self.w_accept
 
 
-# ─────────────────────────────────────────────────────────────
-# 5. Legacy helper (giữ tương thích với evaluate.py)
-# ─────────────────────────────────────────────────────────────
-
 def is_dominated(a: np.ndarray, b: np.ndarray) -> bool:
-    """b dominates a."""
     return dominates(np.asarray(b), np.asarray(a))
 
 
 def pareto_front(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-    """Trả về tập non-dominated từ danh sách (obj0, obj1), cả hai maximize."""
     if not points:
         return []
     pts = np.array(points, dtype=np.float64)
