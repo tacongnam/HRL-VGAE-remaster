@@ -4,7 +4,12 @@ import torch
 import networkx as nx
 from typing import List, Tuple, Dict, Any, Optional
 from config import Config
-from utils.graph_generator import SFCRequest, build_substrate_network, generate_sfc_requests
+from utils.graph_generator import (
+    SFCRequest,
+    build_substrate_network,
+    generate_sfc_requests,
+)
+
 
 class NFVEnvironment:
     def __init__(self, cfg: Config):
@@ -26,7 +31,12 @@ class NFVEnvironment:
         self.total_deploy_cost: float = 0.0
         self._load_std_cache: Optional[float] = None
 
-    def reset(self, G: nx.Graph = None, requests: List[SFCRequest] = None, topology_id: Optional[str] = None) -> Dict[str, Any]:
+    def reset(
+        self,
+        G: nx.Graph = None,
+        requests: List[SFCRequest] = None,
+        topology_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         self.accepted = 0
         self.rejected = 0
         self.total_attempted = 0
@@ -52,7 +62,10 @@ class NFVEnvironment:
         return self._get_obs()
 
     def _flush_arrivals(self):
-        while self._req_cursor < len(self._all_requests) and self._all_requests[self._req_cursor].arrival_time <= self.t:
+        while (
+            self._req_cursor < len(self._all_requests)
+            and self._all_requests[self._req_cursor].arrival_time <= self.t
+        ):
             r = self._all_requests[self._req_cursor]
             if not r.is_expired(self.t):
                 self.queue.append(r)
@@ -82,8 +95,8 @@ class NFVEnvironment:
         still_active = []
         changed = False
         for active in self.active_embeddings:
-            if active['deadline'] <= self.t:
-                self._rollback_resources(active['allocations'])
+            if active["deadline"] <= self.t:
+                self._rollback_resources(active["allocations"])
                 changed = True
             else:
                 still_active.append(active)
@@ -92,13 +105,20 @@ class NFVEnvironment:
             self._load_std_cache = None
 
     def _get_obs(self) -> Dict[str, Any]:
-        return {'node_features': self._compute_node_features(), 'edge_index': self._build_edge_index(), 'queue': self.queue, 't': self.t}
+        return {
+            "node_features": self._compute_node_features(),
+            "edge_index": self._build_edge_index(),
+            "queue": self.queue,
+            "t": self.t,
+        }
 
     def _compute_node_features(self) -> np.ndarray:
         from data.loader import get_node_features_from_graph
+
         if self._dataset_mode:
             return get_node_features_from_graph(self.G, self.cfg.vgae.d_in)
         from utils.graph_generator import get_node_features
+
         return get_node_features(self.G, self.cfg)
 
     def _build_edge_index(self) -> np.ndarray:
@@ -109,10 +129,12 @@ class NFVEnvironment:
         dst = [v for u, v in edges] + [u for u, v in edges]
         return np.array([src, dst], dtype=np.int64)
 
-    def get_node_features_tensor(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_node_features_tensor(
+        self, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         obs = self._get_obs()
-        x = torch.tensor(obs['node_features'], dtype=torch.float32, device=device)
-        ei = torch.tensor(obs['edge_index'], dtype=torch.long, device=device)
+        x = torch.tensor(obs["node_features"], dtype=torch.float32, device=device)
+        ei = torch.tensor(obs["edge_index"], dtype=torch.long, device=device)
         return x, ei
 
     def build_ll_mask(self, cpu_req: float) -> np.ndarray:
@@ -120,42 +142,49 @@ class NFVEnvironment:
         mask = np.zeros(num_nodes, dtype=bool)
         for u in self.G.nodes():
             nd = self.G.nodes[u]
-            if nd.get('is_function_node', True) and nd['cpu_free'] >= cpu_req:
+            if nd.get("is_function_node", True) and nd["cpu_free"] >= cpu_req:
                 mask[u] = True
         return mask
 
     def allocate(self, node: int, path: List[int], cpu_req: float, bw: float):
         if cpu_req > 0.0:
-            self.G.nodes[node]['cpu_free'] -= cpu_req
+            self.G.nodes[node]["cpu_free"] -= cpu_req
         for i in range(len(path) - 1):
             u, v = path[i], path[i + 1]
-            self.G[u][v]['bw_free'] -= bw
+            self.G[u][v]["bw_free"] -= bw
         if len(path) > 1:
             self._load_std_cache = None
 
     def _rollback_resources(self, allocations):
-        for (node, path, cpu_req, bw) in allocations:
+        for node, path, cpu_req, bw in allocations:
             if cpu_req > 0.0:
-                self.G.nodes[node]['cpu_free'] += cpu_req
+                self.G.nodes[node]["cpu_free"] += cpu_req
             for i in range(len(path) - 1):
                 u, v = path[i], path[i + 1]
-                self.G[u][v]['bw_free'] += bw
+                self.G[u][v]["bw_free"] += bw
         if allocations:
             self._load_std_cache = None
 
     def get_load_std(self) -> float:
         from utils.dijkstra import compute_load_std
+
         if self._load_std_cache is None:
             self._load_std_cache = compute_load_std(self.G)
         return self._load_std_cache
 
-    def commit_sfc(self, sfc: SFCRequest, allocations: List[Tuple], deploy_cost: float = 0.0):
-        self.active_embeddings.append({'sfc_id': sfc.sfc_id, 'deadline': sfc.deadline, 'allocations': allocations})
+    def commit_sfc(
+        self, sfc: SFCRequest, allocations: List[Tuple], deploy_cost: float = 0.0
+    ):
+        self.active_embeddings.append(
+            {"sfc_id": sfc.sfc_id, "deadline": sfc.deadline, "allocations": allocations}
+        )
         self.accepted += 1
         self.total_attempted += 1
         self.total_deploy_cost += deploy_cost
 
-    def reject_sfc(self, sfc: SFCRequest, allocations: List[Tuple], requeue: bool = True):
+    def reject_sfc(
+        self, sfc: SFCRequest, allocations: List[Tuple], requeue: bool = True
+    ):
         self._rollback_resources(allocations)
         if requeue and not sfc.is_expired(self.t):
             if not any(q.sfc_id == sfc.sfc_id for q in self.queue):
@@ -166,14 +195,16 @@ class NFVEnvironment:
 
     def norm_revenue(self, sfc: SFCRequest) -> float:
         rc = self.cfg.reward
-        return (rc.mu_cpu * sfc.total_cpu_req() + rc.mu_bw * sfc.bandwidth * (sfc.F_k + 1)) / max(1, sfc.F_k)
+        return (
+            rc.mu_cpu * sfc.total_cpu_req() + rc.mu_bw * sfc.bandwidth * (sfc.F_k + 1)
+        ) / max(1, sfc.F_k)
 
     def step_time(self) -> bool:
         self.t += 1
         self._release_expired_active_sfcs()
         if self._dataset_mode:
             self._flush_arrivals()
-            done = (self._req_cursor >= len(self._all_requests) and not self.queue)
+            done = self._req_cursor >= len(self._all_requests) and not self.queue
         else:
             if self.t % self.cfg.sfc.arrival_interval == 0:
                 self._arrive_sfcs_random()
@@ -186,7 +217,9 @@ class NFVEnvironment:
         self.queue = [q for q in self.queue if q.sfc_id != sfc.sfc_id]
 
     def acceptance_ratio(self) -> float:
-        return (self.accepted / self.total_attempted) if self.total_attempted > 0 else 0.0
+        return (
+            (self.accepted / self.total_attempted) if self.total_attempted > 0 else 0.0
+        )
 
     @property
     def num_nodes(self) -> int:

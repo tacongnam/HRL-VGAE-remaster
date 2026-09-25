@@ -6,10 +6,13 @@ import torch.optim as optim
 from collections import deque
 from typing import Optional, Tuple, List
 from config import Config
-from ll_dqn import LLNodeScorer, N_OBJ
-from pareto import (
-    non_dominated, select_by_hypervolume,
-    prune_by_hypervolume, hv_score_for_action, build_target_q_set
+from models.ll_dqn import LLNodeScorer, N_OBJ
+from utils.pareto import (
+    non_dominated,
+    select_by_hypervolume,
+    prune_by_hypervolume,
+    hv_score_for_action,
+    build_target_q_set,
 )
 
 
@@ -43,13 +46,17 @@ class LLAgent:
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=cfg.qnet.lr)
         self.buffer = LLReplayBuffer(cfg.qnet.ll_buffer_size)
 
-    def select_node(self,
-                    z_global, z_prev_node, z_nodes,
-                    vnf_features, sfc_features,
-                    cpu_mask: np.ndarray,
-                    pareto_w: torch.Tensor,
-                    verbose: bool = False
-                    ) -> Optional[int]:
+    def select_node(
+        self,
+        z_global,
+        z_prev_node,
+        z_nodes,
+        vnf_features,
+        sfc_features,
+        cpu_mask: np.ndarray,
+        pareto_w: torch.Tensor,
+        verbose: bool = False,
+    ) -> Optional[int]:
         valid_nodes = np.where(cpu_mask)[0]
         if len(valid_nodes) == 0:
             return None
@@ -78,29 +85,35 @@ class LLAgent:
             else:
                 q_sets.append([])
 
-        chosen = select_by_hypervolume(q_sets, cpu_mask, self._ref_point,
-                                       tie_break_rng=self._tie_rng)
+        chosen = select_by_hypervolume(
+            q_sets, cpu_mask, self._ref_point, tie_break_rng=self._tie_rng
+        )
 
         if verbose:
-            hv_scores = [hv_score_for_action(q_sets[i], self._ref_point)
-                         if cpu_mask[i] else 0.0 for i in range(num_nodes)]
+            hv_scores = [
+                hv_score_for_action(q_sets[i], self._ref_point) if cpu_mask[i] else 0.0
+                for i in range(num_nodes)
+            ]
             top5 = sorted(enumerate(hv_scores), key=lambda x: -x[1])[:5]
-            print(f"  [LL-HV] ref={self._ref_point} | "
-                  f"top5={([(n, f'{s:.4f}') for n, s in top5])} | "
-                  f"chosen={chosen} q_set_size={len(q_sets[chosen])}")
+            print(
+                f"  [LL-HV] ref={self._ref_point} | "
+                f"top5={([(n, f'{s:.4f}') for n, s in top5])} | "
+                f"chosen={chosen} q_set_size={len(q_sets[chosen])}"
+            )
 
         return int(chosen)
 
-    def store_transition(self,
-                         state_tuple: Tuple,
-                         next_state_tuple: Optional[Tuple],
-                         reward_vec: np.ndarray,
-                         done: float):
+    def store_transition(
+        self,
+        state_tuple: Tuple,
+        next_state_tuple: Optional[Tuple],
+        reward_vec: np.ndarray,
+        done: float,
+    ):
         self.buffer.push(state_tuple, next_state_tuple, reward_vec, done)
 
     def train_step(self, pareto_w: torch.Tensor) -> Optional[float]:
-        min_buf = min(self.cfg.qnet.batch_size,
-                      self.cfg.qnet.ll_buffer_size // 10)
+        min_buf = min(self.cfg.qnet.batch_size, self.cfg.qnet.ll_buffer_size // 10)
         if len(self.buffer) < min_buf:
             return None
 
@@ -136,7 +149,8 @@ class LLAgent:
                     npw_exp = npw.unsqueeze(0).expand(num_nodes, -1).to(self.device)
 
                     cand_q = self.target_net(
-                        nzg_exp, nzp_exp, n_all_z, nvf_exp, nsf_exp, npw_exp)
+                        nzg_exp, nzp_exp, n_all_z, nvf_exp, nsf_exp, npw_exp
+                    )
                     cand_np = cand_q.cpu().numpy()
 
                     mask_np = np.asarray(n_mask, dtype=bool)
@@ -147,7 +161,8 @@ class LLAgent:
                     next_q_sets_valid = [qs for qs in next_q_sets if qs]
 
                     target_sets = build_target_q_set(
-                        r_vec, next_q_sets_valid,
+                        r_vec,
+                        next_q_sets_valid,
                         self.cfg.qnet.gamma,
                         self._max_q_vecs,
                         self._ref_point,
@@ -161,7 +176,8 @@ class LLAgent:
                 target_q_vecs.append(rep)
 
         target_t = torch.tensor(
-            np.stack(target_q_vecs), dtype=torch.float32, device=self.device)
+            np.stack(target_q_vecs), dtype=torch.float32, device=self.device
+        )
 
         loss = nn.MSELoss()(current_q, target_t)
         self.optimizer.zero_grad()

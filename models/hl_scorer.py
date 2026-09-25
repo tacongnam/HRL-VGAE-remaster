@@ -10,12 +10,12 @@ class HLSharedQScorer(nn.Module):
         super().__init__()
         d_in = cfg.d_hl_input
         self.trunk = nn.Sequential(
-            nn.Linear(d_in, 256), nn.ReLU(),
-            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(d_in, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
         )
-        self.q_heads = nn.ModuleList([
-            nn.Linear(128, 1) for _ in range(N_OBJ_HL)
-        ])
+        self.q_heads = nn.ModuleList([nn.Linear(128, 1) for _ in range(N_OBJ_HL)])
 
     def forward(self, z_global, sfc_features, pareto_w):
         x = torch.cat([z_global, sfc_features, pareto_w], dim=-1)

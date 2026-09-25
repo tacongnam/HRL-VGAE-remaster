@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 import numpy as np
 
+
 @dataclass
 class NetworkConfig:
     num_nodes: int = 50
@@ -11,6 +12,7 @@ class NetworkConfig:
     bw_max_mbps: float = 10000.0
     delay_min_ms: float = 2.0
     delay_max_ms: float = 5.0
+
 
 @dataclass
 class SFCConfig:
@@ -25,6 +27,7 @@ class SFCConfig:
     deadline_min: int = 20
     deadline_max: int = 100
 
+
 @dataclass
 class VGAEConfig:
     d_in: int = 16
@@ -35,6 +38,7 @@ class VGAEConfig:
     train_every_steps: int = 20
     temporal: bool = True
     temporal_hidden: int = 64
+
 
 @dataclass
 class QNetConfig:
@@ -51,6 +55,7 @@ class QNetConfig:
     batch_size: int = 64
     max_q_vectors_per_action: int = 10
 
+
 @dataclass
 class DeployCostConfig:
     w_cpu: float = 1.0
@@ -61,6 +66,7 @@ class DeployCostConfig:
     ram_per_cpu_unit: float = 1.0
     storage_per_vnf: float = 1.0
     init_cost_per_hop: float = 0.5
+
 
 @dataclass
 class ParetoConfig:
@@ -82,20 +88,27 @@ class ParetoConfig:
     failure_penalty_success: float = 10.0
 
     def hv_reference_point(self) -> np.ndarray:
-        return np.array([
-            self.hv_ref_cost,
-            self.hv_ref_delay,
-            self.hv_ref_balance,
-            self.hv_ref_success,
-        ], dtype=np.float64)
+        return np.array(
+            [
+                self.hv_ref_cost,
+                self.hv_ref_delay,
+                self.hv_ref_balance,
+                self.hv_ref_success,
+            ],
+            dtype=np.float64,
+        )
 
     def failure_penalty_vector(self) -> np.ndarray:
-        return np.array([
-            -self.failure_penalty_cost,
-            -self.failure_penalty_delay,
-            -self.failure_penalty_balance,
-            -self.failure_penalty_success,
-        ], dtype=np.float32)
+        return np.array(
+            [
+                -self.failure_penalty_cost,
+                -self.failure_penalty_delay,
+                -self.failure_penalty_balance,
+                -self.failure_penalty_success,
+            ],
+            dtype=np.float32,
+        )
+
 
 @dataclass
 class RewardConfig:
@@ -111,6 +124,7 @@ class RewardConfig:
     lambda_penalty: float = 1.0
     mu_deploy_cost: float = 0.001
 
+
 @dataclass
 class TrainConfig:
     total_steps: int = 200_000
@@ -118,6 +132,7 @@ class TrainConfig:
     log_interval: int = 1
     seed: int = 42
     max_sfc_per_timestep: "Optional[int]" = None
+
 
 @dataclass
 class Config:
@@ -140,7 +155,13 @@ class Config:
 
     @property
     def d_ll_input(self):
-        return self.d_global + 2 * self.vgae.d_latent + self.qnet.d_vnf + self.qnet.d_sfc + 2
+        return (
+            self.d_global
+            + 2 * self.vgae.d_latent
+            + self.qnet.d_vnf
+            + self.qnet.d_sfc
+            + 2
+        )
 
     @property
     def d_hl_input(self):
@@ -151,4 +172,5 @@ class Config:
         if self.train.max_sfc_per_timestep is not None:
             return max(1, self.train.max_sfc_per_timestep)
         import math
+
         return max(1, math.ceil(self.sfc.arrival_rate / self.sfc.arrival_interval))
