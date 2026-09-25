@@ -26,10 +26,7 @@ def non_dominated_indices(points: np.ndarray) -> List[int]:
     n = len(points)
     keep = []
     for i in range(n):
-        dominated = any(
-            j != i and dominates(points[j], points[i])
-            for j in range(n)
-        )
+        dominated = any(j != i and dominates(points[j], points[i]) for j in range(n))
         if not dominated:
             keep.append(i)
     return keep
@@ -73,6 +70,8 @@ def _hv_2d(points: np.ndarray, ref: np.ndarray) -> float:
 def _hv_wfg(points: np.ndarray, ref: np.ndarray) -> float:
     if len(points) == 0:
         return 0.0
+    if points.shape[1] == 1:
+        return float(np.max(points[:, 0]) - ref[0])
     if points.shape[1] == 2:
         return _hv_2d(points, ref)
     nd_idx = non_dominated_indices(points)
@@ -81,15 +80,19 @@ def _hv_wfg(points: np.ndarray, ref: np.ndarray) -> float:
         return float(np.prod(points[0] - ref))
     order = np.argsort(points[:, 0])[::-1]
     points = points[order]
+    n = len(points)
     hv = 0.0
-    for i, p in enumerate(points):
-        x_width = p[0] - (points[i - 1][0] if i > 0 else ref[0])
-        hv += abs(x_width) * _hv_wfg(points[:i + 1][:, 1:], ref[1:])
+    for i in range(n):
+        x_next = points[i + 1][0] if i + 1 < n else ref[0]
+        width = points[i][0] - x_next
+        if width > 0:
+            hv += width * _hv_wfg(points[: i + 1, 1:], ref[1:])
     return float(hv)
 
 
-def hypervolume_contribution(points: np.ndarray, idx: int,
-                              reference_point: np.ndarray) -> float:
+def hypervolume_contribution(
+    points: np.ndarray, idx: int, reference_point: np.ndarray
+) -> float:
     pts = np.asarray(points, dtype=np.float64)
     ref = np.asarray(reference_point, dtype=np.float64)
     hv_all = compute_hypervolume(pts, ref)
@@ -98,8 +101,9 @@ def hypervolume_contribution(points: np.ndarray, idx: int,
     return hv_all - hv_without
 
 
-def prune_by_hypervolume(vectors: List[np.ndarray], max_size: int,
-                          reference_point: np.ndarray) -> List[np.ndarray]:
+def prune_by_hypervolume(
+    vectors: List[np.ndarray], max_size: int, reference_point: np.ndarray
+) -> List[np.ndarray]:
     if max_size <= 0:
         raise ValueError("max_size must be > 0")
     if not vectors:
@@ -107,14 +111,17 @@ def prune_by_hypervolume(vectors: List[np.ndarray], max_size: int,
     vectors = non_dominated(vectors)
     while len(vectors) > max_size:
         pts = np.array(vectors, dtype=np.float64)
-        contribs = [hypervolume_contribution(pts, i, reference_point)
-                    for i in range(len(vectors))]
+        contribs = [
+            hypervolume_contribution(pts, i, reference_point)
+            for i in range(len(vectors))
+        ]
         vectors.pop(int(np.argmin(contribs)))
     return vectors
 
 
-def hv_score_for_action(q_vectors: List[np.ndarray],
-                         reference_point: np.ndarray) -> float:
+def hv_score_for_action(
+    q_vectors: List[np.ndarray], reference_point: np.ndarray
+) -> float:
     if not q_vectors:
         return 0.0
     pts = np.array(q_vectors, dtype=np.float64)
@@ -123,24 +130,25 @@ def hv_score_for_action(q_vectors: List[np.ndarray],
     return compute_hypervolume(nd_pts, reference_point)
 
 
-def select_by_hypervolume(q_sets: List[List[np.ndarray]],
-                           valid_mask: np.ndarray,
-                           reference_point: np.ndarray,
-                           tie_break_rng: Optional[random.Random] = None) -> int:
+def select_by_hypervolume(
+    q_sets: List[List[np.ndarray]],
+    valid_mask: np.ndarray,
+    reference_point: np.ndarray,
+    tie_break_rng: Optional[random.Random] = None,
+) -> int:
     valid_indices = [i for i in range(len(q_sets)) if valid_mask[i]]
     if not valid_indices:
         raise ValueError("No valid action available")
     if len(valid_indices) == 1:
         return valid_indices[0]
 
-    hv_scores = np.array([
-        hv_score_for_action(q_sets[i], reference_point)
-        for i in valid_indices
-    ], dtype=np.float64)
+    hv_scores = np.array(
+        [hv_score_for_action(q_sets[i], reference_point) for i in valid_indices],
+        dtype=np.float64,
+    )
 
     best_hv = np.max(hv_scores)
-    tied = [valid_indices[j] for j, s in enumerate(hv_scores)
-            if s >= best_hv - 1e-12]
+    tied = [valid_indices[j] for j, s in enumerate(hv_scores) if s >= best_hv - 1e-12]
     if len(tied) == 1:
         return tied[0]
 
@@ -176,12 +184,14 @@ def select_by_hypervolume(q_sets: List[List[np.ndarray]],
     return rng.choice(cost_winners)
 
 
-def build_target_q_set(reward_vec: np.ndarray,
-                        next_q_sets: List[List[np.ndarray]],
-                        gamma: float,
-                        max_size: int,
-                        reference_point: np.ndarray,
-                        done: bool = False) -> List[np.ndarray]:
+def build_target_q_set(
+    reward_vec: np.ndarray,
+    next_q_sets: List[List[np.ndarray]],
+    gamma: float,
+    max_size: int,
+    reference_point: np.ndarray,
+    done: bool = False,
+) -> List[np.ndarray]:
     r = np.asarray(reward_vec, dtype=np.float64)
     if done or not next_q_sets or all(len(qs) == 0 for qs in next_q_sets):
         return [r.copy()]
@@ -212,10 +222,10 @@ class ParetoArchive:
     def add(self, obj: np.ndarray, **metadata) -> bool:
         obj = np.asarray(obj, dtype=np.float64)
         for entry in self._entries:
-            if dominates(entry['obj'], obj):
+            if dominates(entry["obj"], obj):
                 return False
-        self._entries = [e for e in self._entries if not dominates(obj, e['obj'])]
-        entry = {'obj': obj.copy()}
+        self._entries = [e for e in self._entries if not dominates(obj, e["obj"])]
+        entry = {"obj": obj.copy()}
         entry.update(metadata)
         self._entries.append(entry)
         if len(self._entries) > self.max_size:
@@ -225,7 +235,7 @@ class ParetoArchive:
     def _prune_by_crowding(self):
         if len(self._entries) <= 1:
             return
-        objs = np.array([e['obj'] for e in self._entries])
+        objs = np.array([e["obj"] for e in self._entries])
         n, m = objs.shape
         crowd = np.zeros(n)
         for k in range(m):
@@ -251,13 +261,13 @@ class ParetoArchive:
     def get_obj_matrix(self) -> Optional[np.ndarray]:
         if not self._entries:
             return None
-        return np.array([e['obj'] for e in self._entries])
+        return np.array([e["obj"] for e in self._entries])
 
     def best_by_weight(self, w: np.ndarray) -> Optional[Dict[str, Any]]:
         if not self._entries:
             return None
         w = np.asarray(w, dtype=np.float64)
-        scores = [float(np.dot(e['obj'], w)) for e in self._entries]
+        scores = [float(np.dot(e["obj"], w)) for e in self._entries]
         return self._entries[int(np.argmax(scores))]
 
     def clear(self):
@@ -267,9 +277,11 @@ class ParetoArchive:
         if not self._entries:
             return "ParetoArchive(empty)"
         objs = self.get_obj_matrix()
-        return (f"ParetoArchive(size={len(self._entries)}, "
-                f"obj0=[{objs[:,0].min():.3f},{objs[:,0].max():.3f}], "
-                f"obj1=[{objs[:,1].min():.3f},{objs[:,1].max():.3f}])")
+        return (
+            f"ParetoArchive(size={len(self._entries)}, "
+            f"obj0=[{objs[:,0].min():.3f},{objs[:,0].max():.3f}], "
+            f"obj1=[{objs[:,1].min():.3f},{objs[:,1].max():.3f}])"
+        )
 
 
 class ParetoScalarizer:
@@ -305,8 +317,9 @@ class ParetoScalarizer:
         self.nadir_accept = min(self.nadir_accept, r_accept)
         self.nadir_cost = min(self.nadir_cost, r_cost)
 
-    def scalarize(self, r_accept: float, r_cost: float,
-                  w_accept: float, w_cost: float) -> float:
+    def scalarize(
+        self, r_accept: float, r_cost: float, w_accept: float, w_cost: float
+    ) -> float:
         range_accept = max(1e-6, self.utopia_accept - self.nadir_accept)
         range_cost = max(1e-6, self.utopia_cost - self.nadir_cost)
         d_accept = w_accept * (self.utopia_accept - r_accept) / range_accept
@@ -315,8 +328,12 @@ class ParetoScalarizer:
         sum_term = d_accept + d_cost
         return -(max_term + self._rho * sum_term)
 
-    def adapt_weights(self, recent_accept_ratio: float,
-                      recent_cost_norm: float, target_accept: float = 0.9):
+    def adapt_weights(
+        self,
+        recent_accept_ratio: float,
+        recent_cost_norm: float,
+        target_accept: float = 0.9,
+    ):
         rate = self.cfg.pareto.weight_adapt_rate
         gap = abs(recent_accept_ratio - target_accept)
         adaptive_rate = rate * (1.0 + 5.0 * gap)
@@ -338,8 +355,11 @@ def pareto_front(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]
     nd = non_dominated_indices(pts)
     return [tuple(pts[i]) for i in nd]
 
+
 # Backward-compat alias
-def select_by_pareto_dominance(q_vectors, valid_mask, pareto_w=None, epsilon_decomp=0.0):
+def select_by_pareto_dominance(
+    q_vectors, valid_mask, pareto_w=None, epsilon_decomp=0.0
+):
     n = len(q_vectors)
     valid_indices = [i for i in range(n) if valid_mask[i]]
     if not valid_indices:

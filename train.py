@@ -9,16 +9,16 @@ import torch
 import torch.optim as optim
 from typing import Optional, List
 from config import Config
-from nfv_env import NFVEnvironment
-from vgae import MNVGAE
-from hl_agent import HLAgent
-from ll_agent import LLAgent
-from dijkstra import custom_dijkstra, compute_path_cost_delay
-from deploy_cost import total_deploy_cost
-from pareto import ParetoScalarizer, ParetoArchive
-from ll_dqn import N_OBJ
-from metrics import MetricsTracker
-from logger import TrainingLogger
+from env.nfv_env import NFVEnvironment
+from models.vgae import MNVGAE
+from agents.hl_agent import HLAgent
+from agents.ll_agent import LLAgent
+from utils.dijkstra import custom_dijkstra, compute_path_cost_delay
+from utils.deploy_cost import total_deploy_cost
+from utils.pareto import ParetoScalarizer, ParetoArchive
+from models.ll_dqn import N_OBJ
+from utils.metrics import MetricsTracker
+from utils.logger import TrainingLogger
 
 
 def set_seeds(seed: int):
@@ -415,7 +415,7 @@ def main():
     parser.add_argument('--checkpoint', type=str, default='vgae_hrl_ql_checkpoint.pt')
     parser.add_argument('--log-dir', type=str, default='runs')
     parser.add_argument('--csv', type=str, default='training_log.csv')
-    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--passes-per-file', type=int, default=5)
     parser.add_argument('--warmup-epochs', type=int, default=2)
     parser.add_argument('--verbose', action='store_true')
