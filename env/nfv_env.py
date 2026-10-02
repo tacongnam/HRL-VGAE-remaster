@@ -3,6 +3,9 @@ import numpy as np
 import torch
 import networkx as nx
 from typing import List, Tuple, Dict, Any, Optional
+import os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config
 from utils.graph_generator import (
     SFCRequest,
@@ -113,7 +116,10 @@ class NFVEnvironment:
         }
 
     def _compute_node_features(self) -> np.ndarray:
-        from data.loader import get_node_features_from_graph
+        try:
+            from data.loader import get_node_features_from_graph
+        except ImportError:
+            from loader import get_node_features_from_graph
 
         if self._dataset_mode:
             return get_node_features_from_graph(self.G, self.cfg.vgae.d_in)

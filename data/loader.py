@@ -9,8 +9,11 @@ import numpy as np
 import networkx as nx
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from utils.graph_generator import SFCRequest, VNF
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from utils.graph_generator import SFCRequest, VNF
+except ImportError:
+    from graph_generator import SFCRequest, VNF
 
 
 def _node_id(name) -> int:
@@ -153,3 +156,82 @@ def train_test_split(
 ) -> Tuple[List[str], List[str]]:
     n_train = max(1, int(len(paths) * train_ratio))
     return paths[:n_train], paths[n_train:]
+
+
+# ---------------------------------------------------------------------------
+# Topology-only helpers
+# ---------------------------------------------------------------------------
+
+
+def parse_topology(path: str) -> Tuple[nx.Graph, List[Dict], str]:
+    """Load a topology-only JSON {V, E, F} and return (G, F_raw, topology_id).
+
+    The topology JSON is the same schema as an episode JSON but without the
+    'R' key (or with an empty 'R' list).  This allows one fixed topology to
+    be shared across many episode files.
+    """
+    with open(path, "r") as f:
+        data = json.load(f)
+    V_raw = data["V"]
+    E_raw = data["E"]
+    F_raw = data.get("F", [])
+    topology_id = compute_topology_id(V_raw, E_raw)
+
+    G = nx.Graph()
+    node_names = sorted(V_raw.keys(), key=lambda x: _node_id(x))
+    for name in node_names:
+        uid = _node_id(name)
+        nd = V_raw[name]
+        is_server = bool(nd.get("server", False))
+        cpu = float(nd["c_v"]) if is_server else 0.0
+        ram = float(nd.get("r_v", 0)) if is_server else 0.0
+        G.add_node(
+            uid,
+            cpu_total=cpu,
+            cpu_free=cpu,
+            ram_total=ram,
+            ram_free=ram,
+            is_function_node=is_server,
+            proc_delay=float(nd.get("d_v", 0.0)) if is_server else 0.0,
+            cost_cpu=float(nd.get("cost_c", 1.0)) if is_server else 0.0,
+            cost_ram=float(nd.get("cost_r", 1.0)) if is_server else 0.0,
+            cost_stor=float(nd.get("cost_h", 1.0)) if is_server else 0.0,
+        )
+    for e in E_raw:
+        u = _node_id(e["u"])
+        v = _node_id(e["v"])
+        bw = float(e["b_l"])
+        dl = float(e["d_l"])
+        G.add_edge(u, v, bw_total=bw, bw_free=bw, delay=dl)
+
+    return G, F_raw, topology_id
+
+
+def save_topology(path: str, G: nx.Graph, F_raw: List[Dict]):
+    """Save topology {V, E, F} to JSON without any requests."""
+    nodes = sorted(G.nodes())
+    V = {}
+    for u in nodes:
+        nd = G.nodes[u]
+        if nd.get("is_function_node", False):
+            V[f"v{u}"] = {
+                "server": True,
+                "c_v": nd["cpu_total"],
+                "r_v": nd.get("ram_total", 0.0),
+                "h_v": 0.0,
+                "d_v": nd.get("proc_delay", 0.0),
+                "cost_c": nd.get("cost_cpu", 1.0),
+                "cost_r": nd.get("cost_ram", 1.0),
+                "cost_h": nd.get("cost_stor", 1.0),
+            }
+        else:
+            V[f"v{u}"] = {"server": False}
+
+    E = []
+    for u, v, d in G.edges(data=True):
+        E.append({"u": f"v{u}", "v": f"v{v}", "b_l": d["bw_total"], "d_l": d["delay"]})
+
+    data = {"V": V, "E": E, "F": F_raw, "R": []}
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)

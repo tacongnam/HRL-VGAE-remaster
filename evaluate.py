@@ -75,6 +75,77 @@ def _compute_hv(scan_json: str, out: str, eps: float):
     print(f"HV={hv:.6f}  ref={ref}  front_size={len(front_pts)}  saved→{out}")
 
 
+def _migrate_hl_state_dict(sd: dict, n_obj: int = 4) -> dict:
+    """Migrate legacy HLSharedQScorer checkpoint to current architecture.
+
+    Handles legacy formats:
+      1. net.* keys         → rename to trunk.*
+      2. trunk.4.weight shape [N, H]:
+           N == n_obj  → split row-i into q_heads.i  (full multi-obj checkpoint)
+           N < n_obj   → copy available rows; zero-init remaining heads
+                          (single/partial-obj checkpoint — heads beyond N are
+                           zero-initialised, not random; trained signal is preserved)
+
+    Current format (trunk.0/2 + q_heads.0-3, no trunk.4) passes through unchanged.
+    Raises ValueError if shapes are inconsistent in an unexpected way.
+    """
+    import torch
+
+    # Step 1: rename net.* → trunk.*
+    if any(k.startswith("net.") for k in sd):
+        sd = {
+            ("trunk." + k[len("net.") :] if k.startswith("net.") else k): v
+            for k, v in sd.items()
+        }
+
+    # Step 2: split old combined final linear into per-objective heads
+    if "trunk.4.weight" in sd:
+        w = sd.pop("trunk.4.weight")  # shape [N, H]
+        b = sd.pop("trunk.4.bias")  # shape [N]
+        n_ckpt, H = int(w.shape[0]), int(w.shape[1])
+        if n_ckpt > n_obj:
+            raise ValueError(
+                f"Checkpoint trunk.4.weight has {n_ckpt} rows but model has {n_obj} heads."
+            )
+        for i in range(n_obj):
+            if i < n_ckpt:
+                sd[f"q_heads.{i}.weight"] = w[i : i + 1].clone()
+                sd[f"q_heads.{i}.bias"] = b[i : i + 1].clone()
+            else:
+                # Head was never trained — zero-init (neutral, not random)
+                sd[f"q_heads.{i}.weight"] = torch.zeros(1, H)
+                sd[f"q_heads.{i}.bias"] = torch.zeros(1)
+
+    return sd
+
+
+def _migrate_ll_state_dict(sd: dict, n_obj: int = 4) -> dict:
+    """Migrate legacy LLNodeScorer checkpoint to current architecture.
+
+    LLNodeScorer uses 'shared' backbone — no rename needed.
+    If the checkpoint has fewer than n_obj q_heads, zero-init the missing ones.
+    Existing heads are preserved exactly. Current-format passes through unchanged.
+    """
+    import torch
+
+    existing = sorted(
+        int(k.split(".")[1])
+        for k in sd
+        if k.startswith("q_heads.") and k.endswith(".weight")
+    )
+    if not existing:
+        return sd
+    n_ckpt = max(existing) + 1
+    if n_ckpt >= n_obj:
+        return sd
+    H = int(sd[f"q_heads.{existing[-1]}.weight"].shape[1])
+    sd = dict(sd)
+    for i in range(n_ckpt, n_obj):
+        sd[f"q_heads.{i}.weight"] = torch.zeros(1, H)
+        sd[f"q_heads.{i}.bias"] = torch.zeros(1)
+    return sd
+
+
 def _load_checkpoint(checkpoint: str, cfg, device):
     import torch
     from models.vgae import MNVGAE
@@ -88,13 +159,15 @@ def _load_checkpoint(checkpoint: str, cfg, device):
     vgae.eval()
 
     hl_agent = HLAgent(cfg, device)
-    hl_agent.q_net.load_state_dict(ckpt["hl_q"])
-    hl_agent.target_net.load_state_dict(ckpt["hl_q"])
+    hl_q_sd = _migrate_hl_state_dict(ckpt["hl_q"])
+    hl_agent.q_net.load_state_dict(hl_q_sd)
+    hl_agent.target_net.load_state_dict(hl_q_sd)
     hl_agent.epsilon = 0.0
 
     ll_agent = LLAgent(cfg, device)
-    ll_agent.q_net.load_state_dict(ckpt["ll_q"])
-    ll_agent.target_net.load_state_dict(ckpt["ll_q"])
+    ll_q_sd = _migrate_ll_state_dict(ckpt["ll_q"])
+    ll_agent.q_net.load_state_dict(ll_q_sd)
+    ll_agent.target_net.load_state_dict(ll_q_sd)
     ll_agent.epsilon = 0.0
 
     scalarizer = ParetoScalarizer(cfg)
