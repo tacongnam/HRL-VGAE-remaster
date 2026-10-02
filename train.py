@@ -111,6 +111,7 @@ def run_episode(
 
     z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
     graph_dirty = False
+    z_nodes_cpu = z_nodes.cpu()  # Cache CPU copy for next_state
 
     while not done:
         if not env.queue:
@@ -120,6 +121,7 @@ def run_episode(
                 or (env._dataset_mode and env._req_cursor < len(env._all_requests))
             ):
                 z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
+                z_nodes_cpu = z_nodes.cpu()
                 graph_dirty = False
             continue
 
@@ -149,6 +151,7 @@ def run_episode(
                 )
             z_nodes = z_nodes.detach()
             z_global = z_global.detach()
+            z_nodes_cpu = z_nodes.cpu()
             sfc_processed_since_vgae_train = 0
 
         hl_result = hl_agent.select_sfc(
@@ -158,6 +161,7 @@ def run_episode(
             done = env.step_time()
             if not done and graph_dirty:
                 z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
+                z_nodes_cpu = z_nodes.cpu()
                 graph_dirty = False
             continue
 
@@ -170,10 +174,12 @@ def run_episode(
         partial_allocations = []
         embedding_failed = False
         current_source = selected_sfc.source
+        # Pre-compute all masks once for this SFC
+        ll_masks = [env.build_ll_mask(vnf.cpu_req) for vnf in selected_sfc.vnf_sequence]
 
         for i in range(selected_sfc.F_k):
             vnf = selected_sfc.vnf_sequence[i]
-            cpu_mask = env.build_ll_mask(vnf.cpu_req)
+            cpu_mask = ll_masks[i]
             z_prev = z_nodes[current_source].detach()
             vnf_feat = build_vnf_feature(vnf, cfg, device)
 
@@ -212,7 +218,7 @@ def run_episode(
             state_tuple = (
                 z_global.cpu(),
                 z_prev.cpu(),
-                z_nodes[chosen_node].detach().cpu(),
+                z_nodes_cpu[chosen_node],
                 vnf_feat.cpu(),
                 sfc_feat.cpu(),
                 pareto_w.cpu(),
@@ -361,13 +367,13 @@ def run_episode(
                         next_state = None
                     else:
                         next_vnf = selected_sfc.vnf_sequence[k + 1]
-                        next_mask = env.build_ll_mask(next_vnf.cpu_req)
-                        next_zp = z_nodes[cur_rec["target_node"]].detach().cpu()
+                        next_mask = ll_masks[k + 1]
+                        next_zp = z_nodes_cpu[cur_rec["target_node"]]
                         next_vf = build_vnf_feature(next_vnf, cfg, device).cpu()
                         next_state = (
                             z_global.cpu(),
                             next_zp,
-                            z_nodes.cpu(),
+                            z_nodes_cpu,
                             next_vf,
                             sfc_feat.cpu(),
                             next_mask,
@@ -423,6 +429,7 @@ def run_episode(
         done = env.step_time()
         if not done and graph_dirty:
             z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
+            z_nodes_cpu = z_nodes.cpu()
             graph_dirty = False
 
     if pareto_archive is not None and env.accepted > 0:
