@@ -122,12 +122,26 @@ def prune_by_hypervolume(
 def hv_score_for_action(
     q_vectors: List[np.ndarray], reference_point: np.ndarray
 ) -> float:
+    """Compute hypervolume for a single action (cached version)."""
     if not q_vectors:
         return 0.0
     pts = np.array(q_vectors, dtype=np.float64)
     nd_idx = non_dominated_indices(pts)
     nd_pts = pts[nd_idx]
     return compute_hypervolume(nd_pts, reference_point)
+
+
+def hv_scores_batch(
+    q_sets: List[List[np.ndarray]],
+    valid_mask: np.ndarray,
+    reference_point: np.ndarray,
+) -> np.ndarray:
+    """Batch compute HV scores only for valid actions."""
+    valid_indices = np.where(valid_mask)[0]
+    hv_scores = np.zeros(len(q_sets), dtype=np.float64)
+    for idx in valid_indices:
+        hv_scores[idx] = hv_score_for_action(q_sets[idx], reference_point)
+    return hv_scores
 
 
 def select_by_hypervolume(
@@ -142,6 +156,7 @@ def select_by_hypervolume(
     if len(valid_indices) == 1:
         return valid_indices[0]
 
+    # Batch compute HV scores only for valid indices
     hv_scores = np.array(
         [hv_score_for_action(q_sets[i], reference_point) for i in valid_indices],
         dtype=np.float64,
@@ -152,7 +167,7 @@ def select_by_hypervolume(
     if len(tied) == 1:
         return tied[0]
 
-    # Tie-break 1: lower normalized cost (higher cost objective = index 0)
+    # Tie-break 1: higher cost objective (higher cost_obj = lower cost)
     best_cost = None
     best_tied = tied[0]
     for idx in tied:
