@@ -81,10 +81,10 @@ def _migrate_hl_state_dict(sd: dict, n_obj: int = 4) -> dict:
     Handles legacy formats:
       1. net.* keys         → rename to trunk.*
       2. trunk.4.weight shape [N, H]:
-           N == n_obj  → split row-i into q_heads.i  (full multi-obj checkpoint)
-           N < n_obj   → copy available rows; zero-init remaining heads
-                          (single/partial-obj checkpoint — heads beyond N are
-                           zero-initialised, not random; trained signal is preserved)
+            N == n_obj  → split row-i into q_heads.i  (full multi-obj checkpoint)
+            N < n_obj   → copy available rows; zero-init remaining heads
+                           (single/partial-obj checkpoint — heads beyond N are
+                            zero-initialised, not random; trained signal is preserved)
 
     Current format (trunk.0/2 + q_heads.0-3, no trunk.4) passes through unchanged.
     Raises ValueError if shapes are inconsistent in an unexpected way.
@@ -285,45 +285,46 @@ def _scan_pareto(args):
     weights = [k / max(1, n_pts - 1) for k in range(n_pts)]
     results = []
 
-    for w_accept in weights:
-        w_cost = 1.0 - w_accept
-        for path, meta in path_meta_list:
-            G, reqs, _, topo_id = parse_episode(path)
-            env = NFVEnvironment(cfg)
-            env.reset(G, reqs, topology_id=topo_id)
-            stats = run_episode(
-                env,
-                vgae,
-                hl_agent,
-                ll_agent,
-                vgae_optimizer=None,
-                scalarizer=scalarizer,
-                cfg=cfg,
-                device=device,
-                train=False,
-                fixed_weight=(w_accept, w_cost),
-            )
-            entry = {
-                "w_accept": w_accept,
-                "w_cost": w_cost,
-                "acc_ratio": float(stats["acceptance_ratio"]),
-                "deploy_cost": float(stats["total_deploy_cost"]),
-                "topology": meta["topology"],
-                "allocation": meta["allocation"],
-                "difficulty": meta["difficulty"],
-                "test_index": meta["test_index"],
-                "path": path,
-            }
-            results.append(entry)
+    with torch.no_grad():
+        for w_accept in weights:
+            w_cost = 1.0 - w_accept
+            for path, meta in path_meta_list:
+                G, reqs, _, topo_id = parse_episode(path)
+                env = NFVEnvironment(cfg)
+                env.reset(G, reqs, topology_id=topo_id)
+                stats = run_episode(
+                    env,
+                    vgae,
+                    hl_agent,
+                    ll_agent,
+                    vgae_optimizer=None,
+                    scalarizer=scalarizer,
+                    cfg=cfg,
+                    device=device,
+                    train=False,
+                    fixed_weight=(w_accept, w_cost),
+                )
+                entry = {
+                    "w_accept": w_accept,
+                    "w_cost": w_cost,
+                    "acc_ratio": float(stats["acceptance_ratio"]),
+                    "deploy_cost": float(stats["total_deploy_cost"]),
+                    "topology": meta["topology"],
+                    "allocation": meta["allocation"],
+                    "difficulty": meta["difficulty"],
+                    "test_index": meta["test_index"],
+                    "path": path,
+                }
+                results.append(entry)
 
-        # Per-weight summary
-        w_entries = [e for e in results if abs(e["w_accept"] - w_accept) < 1e-9]
-        mean_acc = float(np.mean([e["acc_ratio"] for e in w_entries]))
-        mean_cost = float(np.mean([e["deploy_cost"] for e in w_entries]))
-        print(
-            f"  w_accept={w_accept:.2f}  acc={mean_acc:.4f}  cost={mean_cost:.2f}"
-            f"  (n={len(w_entries)})"
-        )
+            # Per-weight summary
+            w_entries = [e for e in results if abs(e["w_accept"] - w_accept) < 1e-9]
+            mean_acc = float(np.mean([e["acc_ratio"] for e in w_entries]))
+            mean_cost = float(np.mean([e["deploy_cost"] for e in w_entries]))
+            print(
+                f"  w_accept={w_accept:.2f}  acc={mean_acc:.4f}  cost={mean_cost:.2f}"
+                f"  (n={len(w_entries)})"
+            )
 
     with open(args.pareto_out, "w") as f:
         json.dump(results, f, indent=2)
