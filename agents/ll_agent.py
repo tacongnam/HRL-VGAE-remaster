@@ -66,16 +66,15 @@ class LLAgent:
 
         num_nodes = z_nodes.shape[0]
         self.q_net.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             zg_exp = z_global.unsqueeze(0).expand(num_nodes, -1)
             zp_exp = z_prev_node.unsqueeze(0).expand(num_nodes, -1)
             vf_exp = vnf_features.unsqueeze(0).expand(num_nodes, -1)
             sf_exp = sfc_features.unsqueeze(0).expand(num_nodes, -1)
             pw_exp = pareto_w.unsqueeze(0).expand(num_nodes, -1)
             q_vecs = self.q_net(zg_exp, zp_exp, z_nodes, vf_exp, sf_exp, pw_exp)
-        self.q_net.train()
+            q_np = q_vecs.cpu().numpy()
 
-        q_np = q_vecs.cpu().numpy()
         q_sets: List[List[np.ndarray]] = []
         for i in range(num_nodes):
             if cpu_mask[i]:
