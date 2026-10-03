@@ -493,6 +493,20 @@ def main():
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--archive-size", type=int, default=200)
+    parser.add_argument(
+        "--train-manifest",
+        type=str,
+        default="",
+        help="Path to train_manifest.txt (one absolute path per line). "
+        "If set, overrides --train-dir and --train-filter.",
+    )
+    parser.add_argument(
+        "--train-filter",
+        type=str,
+        default="",
+        help="Substring filter applied to filenames when using --train-dir "
+        "(e.g. 'hard' to select only hard testcases).",
+    )
     args = parser.parse_args()
 
     cfg = Config()
@@ -502,7 +516,15 @@ def main():
     try:
         from data.loader import discover_episodes, parse_episode
 
-        train_paths = discover_episodes(args.train_dir)
+        if args.train_manifest:
+            with open(args.train_manifest) as _mf:
+                train_paths = [l.strip() for l in _mf if l.strip()]
+        else:
+            train_paths = discover_episodes(args.train_dir)
+            if args.train_filter:
+                train_paths = [
+                    p for p in train_paths if args.train_filter in os.path.basename(p)
+                ]
         test_paths = discover_episodes(args.test_dir) if args.test_dir else []
     except Exception:
         train_paths = []

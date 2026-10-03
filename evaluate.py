@@ -177,11 +177,80 @@ def _load_checkpoint(checkpoint: str, cfg, device):
     return vgae, hl_agent, ll_agent, scalarizer
 
 
+def _discover_recursive(root: str):
+    """Recursively find all episode_*.json files under root.
+
+    Returns list of (path, meta) where meta = {topology, allocation, difficulty, test_index}.
+    Expected directory structure: root/{topology}/{allocation}/{difficulty}/episode_NNNN.json
+    Falls back to flat discover_episodes(root) for backward compatibility.
+    """
+    import glob as _glob
+
+    structured = []
+    for path in sorted(_glob.glob(os.path.join(root, "*", "*", "*", "episode_*.json"))):
+        parts = path.replace("\\", "/").split("/")
+        # Find the segment that matches known difficulties
+        try:
+            diff_idx = next(
+                i for i, p in enumerate(parts) if p in ("easy", "normal", "hard")
+            )
+            difficulty = parts[diff_idx]
+            allocation = parts[diff_idx - 1]
+            topology = parts[diff_idx - 2]
+            fname = os.path.splitext(os.path.basename(path))[0]
+            test_index = (
+                int(fname.split("_")[-1]) if fname.split("_")[-1].isdigit() else 0
+            )
+            structured.append(
+                (
+                    path,
+                    {
+                        "topology": topology,
+                        "allocation": allocation,
+                        "difficulty": difficulty,
+                        "test_index": test_index,
+                    },
+                )
+            )
+        except StopIteration:
+            structured.append(
+                (
+                    path,
+                    {
+                        "topology": "unknown",
+                        "allocation": "unknown",
+                        "difficulty": "unknown",
+                        "test_index": 0,
+                    },
+                )
+            )
+
+    if structured:
+        return structured
+
+    # Fallback: flat directory
+    from data.loader import discover_episodes
+
+    flat = discover_episodes(root)
+    return [
+        (
+            p,
+            {
+                "topology": "unknown",
+                "allocation": "unknown",
+                "difficulty": "unknown",
+                "test_index": 0,
+            },
+        )
+        for p in flat
+    ]
+
+
 def _scan_pareto(args):
     import torch
     from config import Config
     from env.nfv_env import NFVEnvironment
-    from data.loader import discover_episodes, parse_episode
+    from data.loader import parse_episode
     from train import run_episode
 
     cfg = Config()
@@ -190,8 +259,26 @@ def _scan_pareto(args):
         args.checkpoint, cfg, device
     )
 
-    test_paths = discover_episodes(args.data_dir)
-    if not test_paths:
+    if args.recursive:
+        path_meta_list = _discover_recursive(args.data_dir)
+    else:
+        from data.loader import discover_episodes
+
+        flat = discover_episodes(args.data_dir)
+        path_meta_list = [
+            (
+                p,
+                {
+                    "topology": "unknown",
+                    "allocation": "unknown",
+                    "difficulty": "unknown",
+                    "test_index": 0,
+                },
+            )
+            for p in flat
+        ]
+
+    if not path_meta_list:
         raise FileNotFoundError(f"No episodes found in {args.data_dir}")
 
     n_pts = args.pareto_points
@@ -200,8 +287,7 @@ def _scan_pareto(args):
 
     for w_accept in weights:
         w_cost = 1.0 - w_accept
-        acc_ratios, deploy_costs = [], []
-        for path in test_paths:
+        for path, meta in path_meta_list:
             G, reqs, _, topo_id = parse_episode(path)
             env = NFVEnvironment(cfg)
             env.reset(G, reqs, topology_id=topo_id)
@@ -217,17 +303,26 @@ def _scan_pareto(args):
                 train=False,
                 fixed_weight=(w_accept, w_cost),
             )
-            acc_ratios.append(stats["acceptance_ratio"])
-            deploy_costs.append(stats["total_deploy_cost"])
-        entry = {
-            "w_accept": w_accept,
-            "w_cost": w_cost,
-            "acc_ratio": float(np.mean(acc_ratios)),
-            "deploy_cost": float(np.mean(deploy_costs)),
-        }
-        results.append(entry)
+            entry = {
+                "w_accept": w_accept,
+                "w_cost": w_cost,
+                "acc_ratio": float(stats["acceptance_ratio"]),
+                "deploy_cost": float(stats["total_deploy_cost"]),
+                "topology": meta["topology"],
+                "allocation": meta["allocation"],
+                "difficulty": meta["difficulty"],
+                "test_index": meta["test_index"],
+                "path": path,
+            }
+            results.append(entry)
+
+        # Per-weight summary
+        w_entries = [e for e in results if abs(e["w_accept"] - w_accept) < 1e-9]
+        mean_acc = float(np.mean([e["acc_ratio"] for e in w_entries]))
+        mean_cost = float(np.mean([e["deploy_cost"] for e in w_entries]))
         print(
-            f"  w_accept={w_accept:.2f}  acc={entry['acc_ratio']:.4f}  cost={entry['deploy_cost']:.2f}"
+            f"  w_accept={w_accept:.2f}  acc={mean_acc:.4f}  cost={mean_cost:.2f}"
+            f"  (n={len(w_entries)})"
         )
 
     with open(args.pareto_out, "w") as f:
@@ -235,6 +330,7 @@ def _scan_pareto(args):
     print(f"Pareto scan saved → {args.pareto_out}")
 
     if args.compute_hv:
+        # _compute_hv expects {acc_ratio, deploy_cost} — compatible subset
         _compute_hv(args.pareto_out, args.hv_out, args.hv_eps)
 
 
@@ -251,6 +347,12 @@ def main():
     parser.add_argument("--compute-hv", action="store_true")
     parser.add_argument("--hv-out", type=str, default="hv_result.json")
     parser.add_argument("--hv-eps", type=float, default=1e-2)
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Recursively discover episodes under --data-dir with "
+        "{topology}/{allocation}/{difficulty}/ structure (for data/all_tests/).",
+    )
     args = parser.parse_args()
 
     if args.pareto_scan:
