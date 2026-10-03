@@ -32,7 +32,7 @@ def set_seeds(seed: int):
 
 def encode_graph(vgae, env, device, update_temporal=True):
     x, ei = env.get_node_features_tensor(device)
-    with torch.no_grad():
+    with torch.inference_mode():
         z_nodes, z_global, mu, logvar = vgae(
             x, ei, graph_id=env.topology_id, update_temporal=update_temporal
         )
@@ -111,7 +111,7 @@ def run_episode(
 
     z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
     graph_dirty = False
-    z_nodes_cpu = z_nodes.cpu()  # Cache CPU copy for next_state
+    z_nodes_cpu = z_nodes.cpu()
 
     while not done:
         if not env.queue:
@@ -145,7 +145,7 @@ def run_episode(
             vgae_loss_acc += v_loss.item()
             vgae_updates += 1
             vgae.eval()
-            with torch.no_grad():
+            with torch.inference_mode():
                 z_nodes, z_global, mu, logvar = vgae(
                     x, ei, graph_id=env.topology_id, update_temporal=True
                 )
@@ -174,7 +174,6 @@ def run_episode(
         partial_allocations = []
         embedding_failed = False
         current_source = selected_sfc.source
-        # Pre-compute all masks once for this SFC
         ll_masks = [env.build_ll_mask(vnf.cpu_req) for vnf in selected_sfc.vnf_sequence]
 
         for i in range(selected_sfc.F_k):
