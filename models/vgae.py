@@ -61,7 +61,7 @@ class MNVGAE(nn.Module):
             if prev is None:
                 prev = z_global_static.detach()
             new_state = self.temporal_cell(
-                z_global_static.unsqueeze(0), prev.unsqueeze(0)
+                z_global_static.unsqueeze(0), prev.clone().unsqueeze(0)
             ).squeeze(0)
             z_global = new_state
             if update_temporal:
