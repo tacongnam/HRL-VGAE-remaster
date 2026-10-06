@@ -76,32 +76,17 @@ def _compute_hv(scan_json: str, out: str, eps: float):
 
 
 def _migrate_hl_state_dict(sd: dict, n_obj: int = 4) -> dict:
-    """Migrate legacy HLSharedQScorer checkpoint to current architecture.
-
-    Handles legacy formats:
-      1. net.* keys         → rename to trunk.*
-      2. trunk.4.weight shape [N, H]:
-            N == n_obj  → split row-i into q_heads.i  (full multi-obj checkpoint)
-            N < n_obj   → copy available rows; zero-init remaining heads
-                           (single/partial-obj checkpoint — heads beyond N are
-                            zero-initialised, not random; trained signal is preserved)
-
-    Current format (trunk.0/2 + q_heads.0-3, no trunk.4) passes through unchanged.
-    Raises ValueError if shapes are inconsistent in an unexpected way.
-    """
     import torch
 
-    # Step 1: rename net.* → trunk.*
     if any(k.startswith("net.") for k in sd):
         sd = {
             ("trunk." + k[len("net.") :] if k.startswith("net.") else k): v
             for k, v in sd.items()
         }
 
-    # Step 2: split old combined final linear into per-objective heads
     if "trunk.4.weight" in sd:
-        w = sd.pop("trunk.4.weight")  # shape [N, H]
-        b = sd.pop("trunk.4.bias")  # shape [N]
+        w = sd.pop("trunk.4.weight")
+        b = sd.pop("trunk.4.bias")
         n_ckpt, H = int(w.shape[0]), int(w.shape[1])
         if n_ckpt > n_obj:
             raise ValueError(
@@ -112,7 +97,6 @@ def _migrate_hl_state_dict(sd: dict, n_obj: int = 4) -> dict:
                 sd[f"q_heads.{i}.weight"] = w[i : i + 1].clone()
                 sd[f"q_heads.{i}.bias"] = b[i : i + 1].clone()
             else:
-                # Head was never trained — zero-init (neutral, not random)
                 sd[f"q_heads.{i}.weight"] = torch.zeros(1, H)
                 sd[f"q_heads.{i}.bias"] = torch.zeros(1)
 
@@ -120,12 +104,6 @@ def _migrate_hl_state_dict(sd: dict, n_obj: int = 4) -> dict:
 
 
 def _migrate_ll_state_dict(sd: dict, n_obj: int = 4) -> dict:
-    """Migrate legacy LLNodeScorer checkpoint to current architecture.
-
-    LLNodeScorer uses 'shared' backbone — no rename needed.
-    If the checkpoint has fewer than n_obj q_heads, zero-init the missing ones.
-    Existing heads are preserved exactly. Current-format passes through unchanged.
-    """
     import torch
 
     existing = sorted(
@@ -178,18 +156,11 @@ def _load_checkpoint(checkpoint: str, cfg, device):
 
 
 def _discover_recursive(root: str):
-    """Recursively find all episode_*.json files under root.
-
-    Returns list of (path, meta) where meta = {topology, allocation, difficulty, test_index}.
-    Expected directory structure: root/{topology}/{allocation}/{difficulty}/episode_NNNN.json
-    Falls back to flat discover_episodes(root) for backward compatibility.
-    """
     import glob as _glob
 
     structured = []
     for path in sorted(_glob.glob(os.path.join(root, "*", "*", "*", "episode_*.json"))):
         parts = path.replace("\\", "/").split("/")
-        # Find the segment that matches known difficulties
         try:
             diff_idx = next(
                 i for i, p in enumerate(parts) if p in ("easy", "normal", "hard")
@@ -228,7 +199,6 @@ def _discover_recursive(root: str):
     if structured:
         return structured
 
-    # Fallback: flat directory
     from data.loader import discover_episodes
 
     flat = discover_episodes(root)
@@ -281,6 +251,28 @@ def _scan_pareto(args):
     if not path_meta_list:
         raise FileNotFoundError(f"No episodes found in {args.data_dir}")
 
+    # ------------------------------------------------------------------
+    # NEW: --single-episode overrides path_meta_list to exactly 1 file.
+    # Useful for quick visual/HV check without running full evaluation.
+    # ------------------------------------------------------------------
+    if getattr(args, "single_episode", None):
+        if not os.path.exists(args.single_episode):
+            raise FileNotFoundError(
+                f"--single-episode not found: {args.single_episode}"
+            )
+        path_meta_list = [
+            (
+                args.single_episode,
+                {
+                    "topology": "single",
+                    "allocation": "single",
+                    "difficulty": "single",
+                    "test_index": 0,
+                },
+            )
+        ]
+        print(f"[evaluate] single-episode mode: {args.single_episode}")
+
     n_pts = args.pareto_points
     weights = [k / max(1, n_pts - 1) for k in range(n_pts)]
     results = []
@@ -317,7 +309,6 @@ def _scan_pareto(args):
                 }
                 results.append(entry)
 
-            # Per-weight summary
             w_entries = [e for e in results if abs(e["w_accept"] - w_accept) < 1e-9]
             mean_acc = float(np.mean([e["acc_ratio"] for e in w_entries]))
             mean_cost = float(np.mean([e["deploy_cost"] for e in w_entries]))
@@ -331,7 +322,6 @@ def _scan_pareto(args):
     print(f"Pareto scan saved → {args.pareto_out}")
 
     if args.compute_hv:
-        # _compute_hv expects {acc_ratio, deploy_cost} — compatible subset
         _compute_hv(args.pareto_out, args.hv_out, args.hv_eps)
 
 
@@ -353,6 +343,15 @@ def main():
         action="store_true",
         help="Recursively discover episodes under --data-dir with "
         "{topology}/{allocation}/{difficulty}/ structure (for data/all_tests/).",
+    )
+    # NEW: single-episode for quick visual check
+    parser.add_argument(
+        "--single-episode",
+        type=str,
+        default="",
+        help="Path to a single test episode JSON. When set with --pareto-scan, "
+             "evaluates only that one file for quick visual/HV check. "
+             "Full evaluation (all test files) runs when this flag is omitted.",
     )
     args = parser.parse_args()
 

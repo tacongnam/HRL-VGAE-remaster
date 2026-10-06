@@ -69,6 +69,101 @@ def _build_reward_vec_4obj(
     return np.array([r_cost, r_delay, r_balance, r_success], dtype=np.float32)
 
 
+# ---------------------------------------------------------------------------
+# NEW: load pretrained VGAE + freeze static encoder
+# ---------------------------------------------------------------------------
+
+def load_pretrained_vgae(
+    vgae: MNVGAE,
+    checkpoint_path: str,
+    device: torch.device,
+    cfg: "Config" = None,
+) -> "Optional[optim.Optimizer]":
+    """Load pretrained VGAE weights, freeze static encoder.
+
+    Frozen (requires_grad=False): gcn0.*, skip.*, gcn_mu.*, gcn_logvar.*
+    Trainable (requires_grad=True): temporal_cell.*
+
+    Compatibility: verifies d_in, d_hidden, d_latent, temporal flag match
+    between checkpoint and current cfg before loading.
+
+    Returns:
+        Adam optimizer covering only temporal_cell parameters, or None if
+        temporal is disabled. Caller must check for None before calling
+        optimizer.step().
+    """
+    ckpt = torch.load(checkpoint_path, map_location=device)
+
+    # Compatibility check against pretrain_cfg stored in checkpoint
+    if cfg is not None and "pretrain_cfg" in ckpt:
+        pc = ckpt["pretrain_cfg"]
+        mismatches = []
+        for key, cfg_val in [
+            ("d_in", cfg.vgae.d_in),
+            ("d_hidden", cfg.vgae.d_hidden),
+            ("d_latent", cfg.vgae.d_latent),
+            ("temporal", cfg.vgae.temporal),
+        ]:
+            if key in pc and pc[key] != cfg_val:
+                mismatches.append(f"  {key}: checkpoint={pc[key]}, current={cfg_val}")
+        if mismatches:
+            raise ValueError(
+                "Pretrained VGAE checkpoint incompatible with current Config:\n"
+                + "\n".join(mismatches)
+            )
+
+    state_dict = ckpt["vgae"] if "vgae" in ckpt else ckpt
+    vgae.load_state_dict(state_dict)
+    print(f"[pretrain] Loaded VGAE from {checkpoint_path}")
+    if "topology_id" in ckpt:
+        print(f"[pretrain] Topology id : {ckpt['topology_id']}")
+    if "epochs" in ckpt:
+        print(f"[pretrain] Pre-trained : {ckpt['epochs']} epochs  "
+              f"best_loss={ckpt.get('best_loss', 0.0):.6f}")
+
+    # --- Freeze static encoder ---
+    _STATIC_PREFIXES = ("gcn0.", "skip.", "gcn_mu.", "gcn_logvar.")
+    frozen_names = []
+    for name, param in vgae.named_parameters():
+        if any(name.startswith(p) for p in _STATIC_PREFIXES):
+            param.requires_grad_(False)
+            frozen_names.append(name)
+
+    # --- Assert freeze correct ---
+    for name in frozen_names:
+        param = dict(vgae.named_parameters())[name]
+        assert not param.requires_grad, (
+            f"BUG: {name} should be frozen but requires_grad=True"
+        )
+
+    # --- Assert temporal_cell trainable ---
+    temporal_params = []
+    for name, param in vgae.named_parameters():
+        if name.startswith("temporal_cell"):
+            assert param.requires_grad, (
+                f"BUG: {name} should be trainable but requires_grad=False"
+            )
+            temporal_params.append(param)
+
+    frozen_numel = sum(dict(vgae.named_parameters())[n].numel() for n in frozen_names)
+    temporal_numel = sum(p.numel() for p in temporal_params)
+    print(f"[pretrain] Frozen static encoder : {len(frozen_names)} tensors  "
+          f"({frozen_numel:,} params)")
+    print(f"[pretrain] Trainable temporal_cell: {len(temporal_params)} tensors  "
+          f"({temporal_numel:,} params)")
+
+    if not temporal_params:
+        # temporal disabled in cfg — no optimizer needed for VGAE in HRL
+        print("[pretrain] temporal_cell disabled — VGAE will not be updated in HRL")
+        return None
+
+    return optim.Adam(temporal_params, lr=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# run_episode — unchanged from original
+# ---------------------------------------------------------------------------
+
 def run_episode(
     env: NFVEnvironment,
     vgae,
@@ -125,6 +220,14 @@ def run_episode(
                 graph_dirty = False
             continue
 
+        # VGAE online update.
+        # Pretrained mode: vgae_optimizer covers only temporal_cell params.
+        #   - update_temporal=True so temporal_cell forward() runs and state
+        #     is written, giving gradient flow through temporal_cell weights.
+        #   - Static encoder params have requires_grad=False; backward ignores them.
+        #   - vgae_optimizer=None means temporal disabled; skip this block.
+        # Non-pretrained mode: full optimizer, update_temporal=False (original
+        #   behavior: train without writing state, then re-encode below).
         if (
             train
             and vgae_optimizer is not None
@@ -132,8 +235,14 @@ def run_episode(
         ):
             vgae_optimizer.zero_grad()
             vgae.train()
+            _pretrained_mode = not any(
+                p.requires_grad
+                for name, p in vgae.named_parameters()
+                if any(name.startswith(s) for s in ("gcn0.", "skip.", "gcn_mu.", "gcn_logvar."))
+            )
+            _upd_temporal = _pretrained_mode  # True in pretrained, False in scratch
             z_nodes_tr, _, mu_tr, logvar_tr = vgae(
-                x, ei, graph_id=env.topology_id, update_temporal=False
+                x, ei, graph_id=env.topology_id, update_temporal=_upd_temporal
             )
             kl = vgae.kl_loss(mu_tr, logvar_tr)
             recon_loss = _compute_recon_loss_sampled(
@@ -482,6 +591,7 @@ def _build_env_and_agents(cfg, device):
 
 def main():
     parser = argparse.ArgumentParser()
+    # --- existing args ---
     parser.add_argument("--train-dir", type=str, default="data/train")
     parser.add_argument("--test-dir", type=str, default="data/test1")
     parser.add_argument("--checkpoint", type=str, default="vgae_hrl_ql_checkpoint.pt")
@@ -492,19 +602,18 @@ def main():
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--archive-size", type=int, default=200)
+    parser.add_argument("--train-manifest", type=str, default="")
+    parser.add_argument("--train-filter", type=str, default="")
+    # --- NEW args ---
     parser.add_argument(
-        "--train-manifest",
-        type=str,
-        default="",
-        help="Path to train_manifest.txt (one absolute path per line). "
-        "If set, overrides --train-dir and --train-filter.",
+        "--train-file", type=str, default="",
+        help="Path to a single train.json. Takes priority over --train-dir "
+             "and --train-manifest when set.",
     )
     parser.add_argument(
-        "--train-filter",
-        type=str,
-        default="",
-        help="Substring filter applied to filenames when using --train-dir "
-        "(e.g. 'hard' to select only hard testcases).",
+        "--pretrained-vgae", type=str, default="",
+        help="Path to pretrained VGAE checkpoint (from pretrain_vgae.py). "
+             "If set, static encoder is frozen and only temporal_cell is trained.",
     )
     args = parser.parse_args()
 
@@ -512,10 +621,19 @@ def main():
     set_seeds(cfg.train.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # ------------------------------------------------------------------
+    # Resolve train paths
+    # ------------------------------------------------------------------
     try:
         from data.loader import discover_episodes, parse_episode
 
-        if args.train_manifest:
+        if args.train_file:
+            # Single file — highest priority
+            if not os.path.exists(args.train_file):
+                raise FileNotFoundError(f"--train-file not found: {args.train_file}")
+            train_paths = [args.train_file]
+            print(f"[train] Single file mode: {args.train_file}")
+        elif args.train_manifest:
             with open(args.train_manifest) as _mf:
                 train_paths = [l.strip() for l in _mf if l.strip()]
         else:
@@ -525,17 +643,41 @@ def main():
                     p for p in train_paths if args.train_filter in os.path.basename(p)
                 ]
         test_paths = discover_episodes(args.test_dir) if args.test_dir else []
-    except Exception:
+    except Exception as e:
         train_paths = []
         test_paths = []
+        print(f"[train] Warning: could not resolve train paths: {e}")
 
     if not train_paths:
-        raise FileNotFoundError(f"No episodes found: {args.train_dir}")
+        raise FileNotFoundError(
+            f"No episodes found. Check --train-file / --train-dir / --train-manifest."
+        )
 
     env = NFVEnvironment(cfg)
     vgae, hl_agent, ll_agent, vgae_optimizer, scalarizer = _build_env_and_agents(
         cfg, device
     )
+
+    # ------------------------------------------------------------------
+    # Load pretrained VGAE if requested
+    # ------------------------------------------------------------------
+    if args.pretrained_vgae:
+        if not os.path.exists(args.pretrained_vgae):
+            raise FileNotFoundError(
+                f"--pretrained-vgae not found: {args.pretrained_vgae}"
+            )
+        # load_pretrained_vgae performs freeze + asserts internally.
+        # Returns Adam(temporal_cell params) or None if temporal disabled.
+        vgae_optimizer = load_pretrained_vgae(vgae, args.pretrained_vgae, device, cfg)
+        if vgae_optimizer is not None:
+            print("[train] Pretrained mode: static encoder frozen, "
+                  "temporal_cell trainable.")
+        else:
+            print("[train] Pretrained mode: temporal disabled — "
+                  "VGAE not updated during HRL.")
+    else:
+        print("[train] No pretrained VGAE — training VGAE from scratch (full optimizer)")
+
     tracker = MetricsTracker()
     pareto_archive = ParetoArchive(max_size=args.archive_size)
 
