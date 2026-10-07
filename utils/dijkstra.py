@@ -1,8 +1,8 @@
 import heapq
 import math
-import numpy as np
+
 import networkx as nx
-from typing import List, Optional, Tuple
+import numpy as np
 
 
 def custom_dijkstra(
@@ -12,7 +12,7 @@ def custom_dijkstra(
     req_bw: float,
     omega_bw: float = 100.0,
     lambda_penalty: float = 1.0,
-) -> Optional[List[int]]:
+) -> list[int] | None:
     if source == target:
         return [source]
     dist = {source: 0.0}
@@ -20,6 +20,7 @@ def custom_dijkstra(
     heap = [(0.0, source)]
     visited = set()
     log_omega = math.log(omega_bw)
+    adj = G._adj
 
     while heap:
         d, u = heapq.heappop(heap)
@@ -28,10 +29,18 @@ def custom_dijkstra(
         visited.add(u)
         if u == target:
             break
-        for v, e in G[u].items():
-            if v in visited or e["bw_free"] < req_bw:
+        u_nbrs = adj[u]
+        for v, e in u_nbrs.items():
+            if v in visited:
                 continue
-            rho = np.clip(1.0 - e["bw_free"] / e["bw_total"], 0.0, 1.0 - 1e-9)
+            bw_free = e["bw_free"]
+            if bw_free < req_bw:
+                continue
+            rho = 1.0 - bw_free / e["bw_total"]
+            if rho < 0.0:
+                rho = 0.0
+            elif rho > 0.999999999:
+                rho = 0.999999999
             w = e["delay"] + lambda_penalty * (math.exp(rho * log_omega) - 1.0)
             new_dist = d + w
             if new_dist < dist.get(v, math.inf):
@@ -45,20 +54,26 @@ def custom_dijkstra(
     while cur is not None:
         path.append(cur)
         cur = prev[cur]
-    return path[::-1]
+    path.reverse()
+    return path
 
 
-def compute_path_cost_delay(G: nx.Graph, path: List[int]) -> Tuple[float, float]:
-    if len(path) < 2:
+def compute_path_cost_delay(G: nx.Graph, path: list[int]) -> tuple[float, float]:
+    p_len = len(path)
+    if p_len < 2:
         return 0.0, 0.0
     cost, delay = 0.0, 0.0
-    for i in range(len(path) - 1):
-        e = G[path[i]][path[i + 1]]
+    adj = G._adj
+    for i in range(p_len - 1):
+        e = adj[path[i]][path[i + 1]]
         cost += 1.0 - e["bw_free"] / e["bw_total"]
         delay += e["delay"]
     return float(cost), float(delay)
 
 
 def compute_load_std(G: nx.Graph) -> float:
-    utils = [1.0 - e["bw_free"] / e["bw_total"] for _, _, e in G.edges(data=True)]
-    return float(np.std(utils, ddof=1)) if len(utils) >= 2 else 0.0
+    edges = G.edges(data=True)
+    if len(edges) < 2:
+        return 0.0
+    utils = [1.0 - d["bw_free"] / d["bw_total"] for _, _, d in edges]
+    return float(np.std(utils, ddof=1))

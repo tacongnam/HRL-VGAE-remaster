@@ -13,3 +13,5 @@ runs/*
 *.pt
 *.md
 training_log.csv
+.prettierrc
+pyproject.toml

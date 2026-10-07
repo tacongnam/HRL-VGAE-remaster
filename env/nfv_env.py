@@ -1,16 +1,16 @@
 import random
+from typing import Any, Dict, List, Optional, Tuple
+import networkx as nx
 import numpy as np
 import torch
-import networkx as nx
-from typing import List, Tuple, Dict, Any, Optional
 from config import Config
+from data import get_node_features_from_graph
 from utils import (
     SFCRequest,
     build_substrate_network,
-    generate_sfc_requests,
     compute_load_std,
+    generate_sfc_requests,
 )
-from data import get_node_features_from_graph
 from utils.graph_generator import get_node_features
 
 
@@ -33,6 +33,7 @@ class NFVEnvironment:
         self.topology_id: Optional[str] = None
         self.total_deploy_cost: float = 0.0
         self._load_std_cache: Optional[float] = None
+        self._edge_index_cache: Optional[np.ndarray] = None
 
     def reset(
         self,
@@ -48,13 +49,14 @@ class NFVEnvironment:
         self.queue = []
         self.active_embeddings = []
         self._load_std_cache = None
+        self._edge_index_cache = None
         if G is not None and requests is not None:
             self._dataset_mode = True
             self.G = G.copy()
             self.topology_id = topology_id
             self._all_requests = sorted(requests, key=lambda r: r.arrival_time)
             self._req_cursor = 0
-            self._flush_arrivals()
+            self._flush_arrivals_initial()
         else:
             self._dataset_mode = False
             self.G = build_substrate_network(self.cfg, self.rng)
@@ -64,19 +66,44 @@ class NFVEnvironment:
             self._arrive_sfcs_random()
         return self._get_obs()
 
-    def _flush_arrivals(self):
-        while (
-            self._req_cursor < len(self._all_requests)
-            and self._all_requests[self._req_cursor].arrival_time <= self.t
-        ):
-            r = self._all_requests[self._req_cursor]
-            if not r.is_expired(self.t):
+    def _flush_arrivals_initial(self):
+        reqs = self._all_requests
+        n_reqs = len(reqs)
+        cur = self._req_cursor
+        t = self.t
+        while cur < n_reqs and reqs[cur].arrival_time <= t:
+            r = reqs[cur]
+            if r.deadline > t:
                 self.queue.append(r)
             else:
                 self.rejected += 1
                 self.total_attempted += 1
-            self._req_cursor += 1
-        self._purge_expired_queue()
+            cur += 1
+        self._req_cursor = cur
+
+    def _flush_arrivals(self):
+        reqs = self._all_requests
+        n_reqs = len(reqs)
+        cur = self._req_cursor
+        t = self.t
+        while cur < n_reqs and reqs[cur].arrival_time <= t:
+            r = reqs[cur]
+            if r.deadline > t:
+                self.queue.append(r)
+            else:
+                self.rejected += 1
+                self.total_attempted += 1
+            cur += 1
+        self._req_cursor = cur
+        if self.queue:
+            valid = []
+            for q in self.queue:
+                if q.deadline <= t:
+                    self.rejected += 1
+                    self.total_attempted += 1
+                else:
+                    valid.append(q)
+            self.queue = valid
 
     def _arrive_sfcs_random(self):
         new_sfcs = generate_sfc_requests(self.cfg, self.t, self.next_sfc_id, self.rng)
@@ -85,9 +112,10 @@ class NFVEnvironment:
         self._purge_expired_queue()
 
     def _purge_expired_queue(self):
+        t = self.t
         valid = []
         for q in self.queue:
-            if q.is_expired(self.t):
+            if q.deadline <= t:
                 self.rejected += 1
                 self.total_attempted += 1
             else:
@@ -95,12 +123,21 @@ class NFVEnvironment:
         self.queue = valid
 
     def _release_expired_active_sfcs(self):
+        if not self.active_embeddings:
+            return
         still_active = []
         changed = False
+        t = self.t
+        adj = self.G._adj
+        nodes = self.G.nodes
         for active in self.active_embeddings:
-            if active["deadline"] <= self.t:
-                self._rollback_resources(active["allocations"])
+            if active["deadline"] <= t:
                 changed = True
+                for node, path, cpu_req, bw in active["allocations"]:
+                    if cpu_req > 0.0:
+                        nodes[node]["cpu_free"] += cpu_req
+                    for i in range(len(path) - 1):
+                        adj[path[i]][path[i + 1]]["bw_free"] += bw
             else:
                 still_active.append(active)
         self.active_embeddings = still_active
@@ -120,20 +157,24 @@ class NFVEnvironment:
         }
 
     def _build_edge_index(self) -> np.ndarray:
+        if self._edge_index_cache is not None:
+            return self._edge_index_cache
         edges = list(self.G.edges())
         if not edges:
-            return np.zeros((2, 0), dtype=np.int64)
-        src = [u for u, v in edges] + [v for u, v in edges]
-        dst = [v for u, v in edges] + [u for u, v in edges]
-        return np.array([src, dst], dtype=np.int64)
+            self._edge_index_cache = np.zeros((2, 0), dtype=np.int64)
+        else:
+            src = [u for u, v in edges] + [v for u, v in edges]
+            dst = [v for u, v in edges] + [u for u, v in edges]
+            self._edge_index_cache = np.array([src, dst], dtype=np.int64)
+        return self._edge_index_cache
 
     def get_node_features_tensor(
         self, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         obs = self._get_obs()
         return (
-            torch.tensor(obs["node_features"], dtype=torch.float32, device=device),
-            torch.tensor(obs["edge_index"], dtype=torch.long, device=device),
+            torch.from_numpy(obs["node_features"]).to(device),
+            torch.from_numpy(obs["edge_index"]).to(device),
         )
 
     def build_ll_mask(self, cpu_req: float) -> np.ndarray:
@@ -146,19 +187,23 @@ class NFVEnvironment:
     def allocate(self, node: int, path: List[int], cpu_req: float, bw: float):
         if cpu_req > 0.0:
             self.G.nodes[node]["cpu_free"] -= cpu_req
+        adj = self.G._adj
         for i in range(len(path) - 1):
-            self.G[path[i]][path[i + 1]]["bw_free"] -= bw
+            adj[path[i]][path[i + 1]]["bw_free"] -= bw
         if len(path) > 1:
             self._load_std_cache = None
 
     def _rollback_resources(self, allocations):
+        if not allocations:
+            return
+        adj = self.G._adj
+        nodes = self.G.nodes
         for node, path, cpu_req, bw in allocations:
             if cpu_req > 0.0:
-                self.G.nodes[node]["cpu_free"] += cpu_req
+                nodes[node]["cpu_free"] += cpu_req
             for i in range(len(path) - 1):
-                self.G[path[i]][path[i + 1]]["bw_free"] += bw
-        if allocations:
-            self._load_std_cache = None
+                adj[path[i]][path[i + 1]]["bw_free"] += bw
+        self._load_std_cache = None
 
     def get_load_std(self) -> float:
         if self._load_std_cache is None:
@@ -179,7 +224,7 @@ class NFVEnvironment:
         self, sfc: SFCRequest, allocations: List[Tuple], requeue: bool = True
     ):
         self._rollback_resources(allocations)
-        if requeue and not sfc.is_expired(self.t):
+        if requeue and sfc.deadline > self.t:
             if not any(q.sfc_id == sfc.sfc_id for q in self.queue):
                 self.queue.append(sfc)
         else:
@@ -198,7 +243,7 @@ class NFVEnvironment:
         if self._dataset_mode:
             self._flush_arrivals()
             if self._req_cursor >= len(self._all_requests):
-                unexpired = [q for q in self.queue if not q.is_expired(self.t)]
+                unexpired = [q for q in self.queue if q.deadline > self.t]
                 if unexpired:
                     next_event = (
                         min(e["deadline"] for e in self.active_embeddings)
@@ -210,7 +255,7 @@ class NFVEnvironment:
                         self._release_expired_active_sfcs()
                         self._purge_expired_queue()
             return self._req_cursor >= len(self._all_requests) and not any(
-                not q.is_expired(self.t) for q in self.queue
+                q.deadline > self.t for q in self.queue
             )
         else:
             if self.t % self.cfg.sfc.arrival_interval == 0:

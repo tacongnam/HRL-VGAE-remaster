@@ -1,19 +1,14 @@
 import random
+from collections import deque
+
+import networkx as nx
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import networkx as nx
-from collections import deque
-from typing import Optional, Tuple, List, Any
+from torch import nn, optim
+
 from config import Config
 from models import LLNodeScorer
-from utils import (
-    non_dominated,
-    prune_by_hypervolume,
-    select_by_hypervolume,
-    build_target_q_set,
-)
+from utils import build_target_q_set, non_dominated, prune_by_hypervolume, select_by_hypervolume
 
 
 class LLReplayBuffer:
@@ -46,6 +41,7 @@ class LLAgent:
         self.target_net.eval()
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=cfg.qnet.lr)
         self.buffer = LLReplayBuffer(cfg.qnet.ll_buffer_size)
+        self._obj_scale = torch.tensor([1.0, 1000.0], dtype=torch.float32, device=device)
 
     def _update_ref_point(self, q_np: np.ndarray):
         if q_np.size == 0:
@@ -54,12 +50,9 @@ class LLAgent:
         m = self.cfg.pareto.ll_ref_momentum
         finite_mask = np.isfinite(self._obs_min)
         self._obs_min = np.where(
-            finite_mask,
-            np.minimum(batch_min, m * self._obs_min + (1 - m) * batch_min),
-            batch_min,
+            finite_mask, np.minimum(batch_min, m * self._obs_min + (1.0 - m) * batch_min), batch_min
         )
-        margin = self.cfg.pareto.ll_ref_margin
-        self._ref_point = self._obs_min - margin
+        self._ref_point = self._obs_min - self.cfg.pareto.ll_ref_margin
 
     def select_node(
         self,
@@ -70,25 +63,22 @@ class LLAgent:
         sfc_features: torch.Tensor,
         cpu_mask: np.ndarray,
         pareto_w: torch.Tensor,
-        current_source: Optional[int] = None,
-        G: Optional[nx.Graph] = None,
+        current_source: int | None = None,
+        G: nx.Graph | None = None,
         k_hop: int = 3,
         verbose: bool = False,
-    ) -> Optional[int]:
-        valid_nodes = np.where(cpu_mask)[0]
-        if len(valid_nodes) == 0:
+    ) -> int | None:
+        valid_nodes = np.flatnonzero(cpu_mask)
+        if valid_nodes.size == 0:
             return None
-
         if random.random() < self.epsilon:
             if G is not None and current_source is not None and k_hop > 0:
                 try:
-                    lengths = nx.single_source_shortest_path_length(
-                        G, current_source, cutoff=k_hop
-                    )
+                    lengths = nx.single_source_shortest_path_length(G, current_source, cutoff=k_hop)
                     candidates = [n for n in valid_nodes if n in lengths]
                     if candidates:
                         return int(random.choice(candidates))
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
             return int(random.choice(valid_nodes))
 
@@ -106,25 +96,20 @@ class LLAgent:
             q_np = q_vecs.cpu().numpy()
 
         self._update_ref_point(q_np)
-
-        q_sets: List[List[np.ndarray]] = [[] for _ in range(num_nodes)]
+        q_sets: list[list[np.ndarray]] = [[] for _ in range(num_nodes)]
         for local_j, global_i in enumerate(valid_nodes):
             nd_set = non_dominated([q_np[local_j]])
-            q_sets[global_i] = prune_by_hypervolume(
-                nd_set, self._max_q_vecs, self._ref_point
-            )
+            q_sets[global_i] = prune_by_hypervolume(nd_set, self._max_q_vecs, self._ref_point)
 
         chosen = select_by_hypervolume(
             q_sets, cpu_mask, self._ref_point, tie_break_rng=self._tie_rng
         )
         return int(chosen)
 
-    def store_transition(
-        self, state_tuple, next_state_tuple, reward_vec: np.ndarray, done: float
-    ):
+    def store_transition(self, state_tuple, next_state_tuple, reward_vec: np.ndarray, done: float):
         self.buffer.push(state_tuple, next_state_tuple, reward_vec, done)
 
-    def train_step(self, pareto_w: Optional[torch.Tensor] = None) -> Optional[float]:
+    def train_step(self, pareto_w: torch.Tensor | None = None) -> float | None:
         min_buf = min(self.cfg.qnet.batch_size, self.cfg.qnet.ll_buffer_size // 10)
         if len(self.buffer) < min_buf:
             return None
@@ -133,6 +118,7 @@ class LLAgent:
         states, next_states, reward_vecs, dones = zip(*batch)
 
         zg_l, zp_l, zc_l, vf_l, sf_l, pw_l = zip(*states)
+        self.q_net.train()
         current_q = self.q_net(
             torch.stack(zg_l).to(self.device),
             torch.stack(zp_l).to(self.device),
@@ -142,51 +128,74 @@ class LLAgent:
             torch.stack(pw_l).to(self.device),
         )
 
-        with torch.no_grad():
-            target_q_vecs = []
-            for i, ns in enumerate(next_states):
-                r_vec = np.asarray(reward_vecs[i], dtype=np.float64)
-                is_done = bool(dones[i] > 0.5)
+        eval_zg, eval_zp, eval_zv, eval_vf, eval_sf, eval_pw = [], [], [], [], [], []
+        slices = []
+        cursor = 0
 
-                if ns is None or is_done:
-                    target_sets = [r_vec.copy()]
+        for i, ns in enumerate(next_states):
+            is_done = bool(dones[i] > 0.5)
+            if ns is None or is_done:
+                slices.append((cursor, cursor))
+            else:
+                nzg, nzp, n_all_z, nvf, nsf, n_mask, npw = ns
+                valid_idx = np.flatnonzero(np.asarray(n_mask, dtype=bool))
+                k = len(valid_idx)
+                if k == 0:
+                    slices.append((cursor, cursor))
                 else:
-                    nzg, nzp, n_all_z, nvf, nsf, n_mask, npw = ns
-                    valid_idx = np.where(np.asarray(n_mask, dtype=bool))[0]
-                    if len(valid_idx) == 0:
-                        target_sets = [r_vec.copy()]
-                    else:
-                        k = len(valid_idx)
-                        n_valid_z = n_all_z[valid_idx].to(self.device)
-                        cand_q = self.target_net(
-                            nzg.unsqueeze(0).expand(k, -1).to(self.device),
-                            nzp.unsqueeze(0).expand(k, -1).to(self.device),
-                            n_valid_z,
-                            nvf.unsqueeze(0).expand(k, -1).to(self.device),
-                            nsf.unsqueeze(0).expand(k, -1).to(self.device),
-                            npw.unsqueeze(0).expand(k, -1).to(self.device),
-                        )
-                        cand_np = cand_q.cpu().numpy()
-                        target_sets = build_target_q_set(
-                            r_vec,
-                            [[cand_np[j]] for j in range(k)],
-                            self.cfg.qnet.gamma,
-                            self._max_q_vecs,
-                            self._ref_point,
-                            done=is_done,
-                        )
-                target_q_vecs.append(
-                    np.mean(target_sets, axis=0).astype(np.float32)
-                    if target_sets
-                    else r_vec.astype(np.float32)
+                    eval_zg.append(nzg.unsqueeze(0).expand(k, -1))
+                    eval_zp.append(nzp.unsqueeze(0).expand(k, -1))
+                    eval_zv.append(n_all_z[valid_idx])
+                    eval_vf.append(nvf.unsqueeze(0).expand(k, -1))
+                    eval_sf.append(nsf.unsqueeze(0).expand(k, -1))
+                    eval_pw.append(npw.unsqueeze(0).expand(k, -1))
+                    slices.append((cursor, cursor + k))
+                    cursor += k
+
+        all_cand_np = None
+        if eval_zg:
+            batched_zg = torch.cat(eval_zg, dim=0).to(self.device)
+            batched_zp = torch.cat(eval_zp, dim=0).to(self.device)
+            batched_zv = torch.cat(eval_zv, dim=0).to(self.device)
+            batched_vf = torch.cat(eval_vf, dim=0).to(self.device)
+            batched_sf = torch.cat(eval_sf, dim=0).to(self.device)
+            batched_pw = torch.cat(eval_pw, dim=0).to(self.device)
+            with torch.inference_mode():
+                all_cand_np = (
+                    self.target_net(
+                        batched_zg, batched_zp, batched_zv, batched_vf, batched_sf, batched_pw
+                    )
+                    .cpu()
+                    .numpy()
                 )
 
-        target_t = torch.tensor(
-            np.stack(target_q_vecs), dtype=torch.float32, device=self.device
-        )
-        obj_scale = torch.tensor([1.0, 1000.0], dtype=torch.float32, device=self.device)
-        loss = nn.MSELoss()(current_q * obj_scale, target_t * obj_scale)
-        self.optimizer.zero_grad()
+        target_q_vecs = []
+        for i, ns in enumerate(next_states):
+            r_vec = np.asarray(reward_vecs[i], dtype=np.float64)
+            is_done = bool(dones[i] > 0.5)
+            st, ed = slices[i]
+            if ns is None or is_done or st == ed or all_cand_np is None:
+                target_sets = [r_vec]
+            else:
+                cand_np = all_cand_np[st:ed]
+                k = cand_np.shape[0]
+                target_sets = build_target_q_set(
+                    r_vec,
+                    [[cand_np[j]] for j in range(k)],
+                    self.cfg.qnet.gamma,
+                    self._max_q_vecs,
+                    self._ref_point,
+                    done=is_done,
+                )
+            target_q_vecs.append(
+                np.mean(target_sets, axis=0).astype(np.float32)
+                if target_sets
+                else r_vec.astype(np.float32)
+            )
+
+        target_t = torch.from_numpy(np.stack(target_q_vecs)).to(self.device)
+        loss = nn.MSELoss()(current_q * self._obj_scale, target_t * self._obj_scale)
+        self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
         self.optimizer.step()
@@ -195,4 +204,4 @@ class LLAgent:
         if self.train_steps % self.cfg.qnet.target_update_freq == 0:
             self.target_net.load_state_dict(self.q_net.state_dict())
 
-        return loss.item()
+        return float(loss.item())

@@ -1,6 +1,7 @@
 import argparse
 import random
 import time
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -22,6 +23,26 @@ from utils import (
     total_deploy_cost,
 )
 
+class LiveProfiler:
+    def __init__(self, print_every: int = 1):
+        self.print_every = print_every
+        self.step = 0
+        self.t_last = time.perf_counter()
+
+    def hit(self, stage_name: str):
+        now = time.perf_counter()
+        elapsed = (now - self.t_last) * 1000.0
+        self.t_last = now
+        if self.step % self.print_every == 0:
+            pass
+            #print(f"[LIVE STEP {self.step:4d}] {stage_name:<22} : {elapsed:8.2f} ms", flush=True)
+
+    def inc(self):
+        self.step += 1
+
+
+live_prof = LiveProfiler(print_every=1)
+
 
 def set_seeds(seed: int):
     random.seed(seed)
@@ -34,18 +55,12 @@ def set_seeds(seed: int):
 def encode_graph(vgae, env, device, update_temporal=True):
     x, ei = env.get_node_features_tensor(device)
     with torch.inference_mode():
-        z_nodes, z_global, mu, logvar = vgae(
-            x, ei, graph_id=env.topology_id, update_temporal=update_temporal
-        )
+        z_nodes, z_global, mu, logvar = vgae(x, ei, graph_id=env.topology_id, update_temporal=update_temporal)
     return z_nodes.detach(), z_global.detach(), x, ei, mu, logvar
 
 
 def build_vnf_feature(vnf, cfg, device):
-    return torch.tensor(
-        [vnf.cpu_req / cfg.network.cpu_capacity_mips, 1.0],
-        dtype=torch.float32,
-        device=device,
-    )
+    return torch.tensor([vnf.cpu_req / cfg.network.cpu_capacity_mips, 1.0], dtype=torch.float32, device=device)
 
 
 def _compute_recon_loss_sampled(z_nodes, edge_index, num_nodes, neg_ratio, device):
@@ -57,21 +72,17 @@ def _compute_recon_loss_sampled(z_nodes, edge_index, num_nodes, neg_ratio, devic
     neg_src = torch.randint(0, num_nodes, (num_neg,), device=device)
     neg_dst = torch.randint(0, num_nodes, (num_neg,), device=device)
     neg_score = (z_nodes[neg_src] * z_nodes[neg_dst]).sum(dim=-1)
-    return F.binary_cross_entropy_with_logits(
-        pos_score, torch.ones_like(pos_score)
-    ) + F.binary_cross_entropy_with_logits(neg_score, torch.zeros_like(neg_score))
+    return F.binary_cross_entropy_with_logits(pos_score, torch.ones_like(pos_score)) + \
+           F.binary_cross_entropy_with_logits(neg_score, torch.zeros_like(neg_score))
 
 
 def _build_reward_vec_2obj(r_perf: float, r_cost: float) -> np.ndarray:
     return np.array([r_perf, r_cost], dtype=np.float32)
 
 
-def load_pretrained_vgae(
-    vgae: MNVGAE, checkpoint_path: str, device: torch.device, cfg: Config = None
-) -> optim.Optimizer | None:
+def load_pretrained_vgae(vgae: MNVGAE, checkpoint_path: str, device: torch.device, cfg: Config = None) -> optim.Optimizer | None:
     ckpt = torch.load(checkpoint_path, map_location=device)
-    state_dict = ckpt.get("vgae", ckpt)
-    vgae.load_state_dict(state_dict)
+    vgae.load_state_dict(ckpt.get("vgae", ckpt))
 
     _STATIC_PREFIXES = ("gcn0.", "skip.", "gcn_mu.", "gcn_logvar.")
     temporal_params = []
@@ -81,9 +92,7 @@ def load_pretrained_vgae(
         elif name.startswith("temporal_cell"):
             temporal_params.append(param)
 
-    print(
-        f"[pretrain] Loaded VGAE from {checkpoint_path} | Trainable temporal params: {len(temporal_params)}"
-    )
+    print(f"[pretrain] Loaded VGAE from {checkpoint_path} | Trainable temporal params: {len(temporal_params)}")
     return optim.Adam(temporal_params, lr=1e-3) if temporal_params else None
 
 
@@ -116,19 +125,20 @@ def run_episode(
     w_accept, w_cost = (
         fixed_weight
         if fixed_weight
-        else (
-            scalarizer.sample_weight()
-            if train
-            else (scalarizer.w_accept, scalarizer.w_cost)
-        )
+        else (scalarizer.sample_weight() if train else (scalarizer.w_accept, scalarizer.w_cost))
     )
     pareto_w = torch.tensor([w_accept, w_cost], dtype=torch.float32, device=device)
 
     z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
     graph_dirty = False
     z_nodes_cpu = z_nodes.cpu()
+    last_printed_t = None
 
     while not done:
+        if env.t != last_printed_t:
+            print(f"[Timestep: {env.t}] Queue size: {len(env.queue)} | Active: {len(env.active_embeddings)}", flush=True)
+            last_printed_t = env.t
+
         if not env.queue:
             done = env.step_time()
             if not done and graph_dirty:
@@ -136,20 +146,13 @@ def run_episode(
                 z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
             continue
 
-        if (
-            train
-            and vgae_optimizer is not None
-            and sfc_vgae_count >= cfg.vgae.train_every_steps
-        ):
+        if train and vgae_optimizer is not None and sfc_vgae_count >= cfg.vgae.train_every_steps:
             vgae_optimizer.zero_grad()
             vgae.train()
             _is_pretrained = not any(
                 p.requires_grad
                 for n, p in vgae.named_parameters()
-                if any(
-                    n.startswith(s)
-                    for s in ("gcn0.", "skip.", "gcn_mu.", "gcn_logvar.")
-                )
+                if any(n.startswith(s) for s in ("gcn0.", "skip.", "gcn_mu.", "gcn_logvar."))
             )
             z_nodes_tr, z_global_tr, mu_tr, logvar_tr = vgae(
                 x, ei, graph_id=env.topology_id, update_temporal=_is_pretrained
@@ -177,7 +180,7 @@ def run_episode(
         if hl_res is None:
             done = env.step_time()
             if not done and graph_dirty:
-                z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)  # noqa: RUF059
+                z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
                 z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
             continue
 
@@ -241,9 +244,7 @@ def run_episode(
                 break
 
             env.allocate(chosen_node, path, vnf.cpu_req, selected_sfc.bandwidth)
-            partial_allocations.append(
-                (chosen_node, path, vnf.cpu_req, selected_sfc.bandwidth)
-            )
+            partial_allocations.append((chosen_node, path, vnf.cpu_req, selected_sfc.bandwidth))
             p_cost, p_delay = compute_path_cost_delay(env.G, path)
             ll_records.append(
                 {
@@ -346,17 +347,13 @@ def run_episode(
                             z_global.cpu(),
                             z_nodes_cpu[cur_rec["target_node"]],
                             z_nodes_cpu,
-                            build_vnf_feature(
-                                selected_sfc.vnf_sequence[k + 1], cfg, device
-                            ).cpu(),
+                            build_vnf_feature(selected_sfc.vnf_sequence[k + 1], cfg, device).cpu(),
                             sfc_feat.cpu(),
                             env.build_ll_mask(selected_sfc.vnf_sequence[k + 1].cpu_req),
                             pareto_w.cpu(),
                         )
                     )
-                    ll_agent.store_transition(
-                        cur_rec["state"], next_s, r_vec, float(is_term)
-                    )
+                    ll_agent.store_transition(cur_rec["state"], next_s, r_vec, float(is_term))
 
         ep_hl_r += r_H
         if env._dataset_mode:
@@ -365,14 +362,11 @@ def run_episode(
         if train:
             next_sfcs = [q for q in env.queue if not q.is_expired(env.t)]
             next_feats = [
-                torch.tensor(
-                    q.to_feature_vector(env.t), dtype=torch.float32, device=device
-                )
+                torch.tensor(q.to_feature_vector(env.t), dtype=torch.float32, device=device)
                 for q in next_sfcs
             ]
             hl_done = not env.queue and (
-                not hasattr(env, "_req_cursor")
-                or env._req_cursor >= len(env._all_requests)
+                not hasattr(env, "_req_cursor") or env._req_cursor >= len(env._all_requests)
             )
             hl_agent.store_transition(
                 z_global.cpu(),
@@ -443,7 +437,6 @@ def run_episode(
         "pareto_archive_size": len(pareto_archive) if pareto_archive else 0,
     }
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-dir", type=str, default="data/train")
@@ -464,9 +457,7 @@ def main():
     set_seeds(cfg.train.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_paths = (
-        [args.train_file] if args.train_file else discover_episodes(args.train_dir)
-    )
+    train_paths = [args.train_file] if args.train_file else discover_episodes(args.train_dir)
     if not train_paths:
         raise FileNotFoundError("No training files found.")
 
@@ -476,8 +467,7 @@ def main():
     ll_agent = LLAgent(cfg, device)
     vgae_optimizer = (
         load_pretrained_vgae(vgae, args.pretrained_vgae, device, cfg)
-        if args.pretrained_vgae
-        else optim.Adam(vgae.parameters(), lr=cfg.vgae.lr)
+        if args.pretrained_vgae else optim.Adam(vgae.parameters(), lr=cfg.vgae.lr)
     )
     scalarizer = ParetoScalarizer(cfg)
 
@@ -488,9 +478,7 @@ def main():
     total_train_episodes = args.epochs * len(train_paths) * args.passes_per_file
     warmup_episodes = args.warmup_epochs * len(train_paths) * args.passes_per_file
     decay_episodes = int((total_train_episodes - warmup_episodes) * 0.75)
-    eps_decay_per_ep = (cfg.qnet.eps_end / cfg.qnet.eps_start) ** (
-        1.0 / max(1, decay_episodes)
-    )
+    eps_decay_per_ep = (cfg.qnet.eps_end / cfg.qnet.eps_start) ** (1.0 / max(1, decay_episodes))
 
     with TrainingLogger(log_dir=args.log_dir, csv_path=args.csv) as logger:
         for epoch in range(1, args.epochs + 1):
@@ -510,32 +498,16 @@ def main():
                     ep_start = time.perf_counter()
 
                     stats = run_episode(
-                        env,
-                        vgae,
-                        hl_agent,
-                        ll_agent,
-                        vgae_optimizer,
-                        scalarizer,
-                        cfg,
-                        device,
-                        pareto_archive=pareto_archive,
-                        tracker=tracker,
-                        train=True,
+                        env, vgae, hl_agent, ll_agent, vgae_optimizer, scalarizer, cfg, device,
+                        pareto_archive=pareto_archive, tracker=tracker, train=True,
                         verbose=args.verbose and global_ep <= 2,
                     )
 
                     if not is_warmup:
-                        hl_agent.epsilon = max(
-                            cfg.qnet.eps_end, hl_agent.epsilon * eps_decay_per_ep
-                        )
-                        ll_agent.epsilon = max(
-                            cfg.qnet.eps_end, ll_agent.epsilon * eps_decay_per_ep
-                        )
+                        hl_agent.epsilon = max(cfg.qnet.eps_end, hl_agent.epsilon * eps_decay_per_ep)
+                        ll_agent.epsilon = max(cfg.qnet.eps_end, ll_agent.epsilon * eps_decay_per_ep)
 
-                    stats["epsilon_hl"], stats["epsilon_ll"] = (
-                        hl_agent.epsilon,
-                        ll_agent.epsilon,
-                    )
+                    stats["epsilon_hl"], stats["epsilon_ll"] = (hl_agent.epsilon, ll_agent.epsilon)
                     m = tracker.flush_episode(global_ep, env, stats)
                     logger.log(m)
 

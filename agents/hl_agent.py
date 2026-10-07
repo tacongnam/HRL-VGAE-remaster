@@ -1,18 +1,17 @@
 import random
+from collections import deque
+from typing import Any, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from collections import deque
-from typing import List, Optional, Tuple
 from config import Config
 from models import HLSharedQScorer
-from utils import (
-    SFCRequest,
-    non_dominated,
-    prune_by_hypervolume,
+from utils.pareto import (
+    build_target_q_set_fast,
+    non_dominated_2d_fast,
+    prune_by_hypervolume_fast,
     select_by_hypervolume,
-    build_target_q_set,
 )
 
 
@@ -41,10 +40,10 @@ class HLReplayBuffer:
                 action_idx,
                 reward_vec.copy(),
                 next_z_global,
-                list(next_sfc_feats),
+                next_sfc_feats,
                 next_pareto_w,
                 done,
-                valid_action_mask.copy() if valid_action_mask is not None else None,
+                valid_action_mask,
             )
         )
 
@@ -74,21 +73,18 @@ class HLAgent:
     def select_sfc(
         self,
         z_global: torch.Tensor,
-        queue: List[SFCRequest],
+        queue: List,
         t: int,
         pareto_w: torch.Tensor,
         blocked_until: Optional[dict] = None,
         verbose: bool = False,
-    ) -> Optional[Tuple[int, SFCRequest]]:
+    ) -> Optional[Tuple[int, Any]]:
         blocked_until = blocked_until or {}
         valid_indices = [
-            i
-            for i, q in enumerate(queue)
-            if not q.is_expired(t) and blocked_until.get(q.sfc_id, t) <= t
+            i for i, q in enumerate(queue) if not q.is_expired(t) and blocked_until.get(q.sfc_id, t) <= t
         ]
         if not valid_indices:
             return None
-
         if random.random() < self.epsilon:
             chosen = random.choice(valid_indices)
             return chosen, queue[chosen]
@@ -96,21 +92,15 @@ class HLAgent:
         m = len(valid_indices)
         self.q_net.eval()
         with torch.inference_mode():
-            sfc_feats_np = np.stack(
-                [queue[i].to_feature_vector(t) for i in valid_indices]
-            ).astype(np.float32)
-            sfc_feats_t = torch.tensor(
-                sfc_feats_np, dtype=torch.float32, device=self.device
-            )
+            sfc_feats_np = np.stack([queue[i].to_feature_vector(t) for i in valid_indices]).astype(np.float32)
+            sfc_feats_t = torch.from_numpy(sfc_feats_np).to(self.device)
             zg_exp = z_global.unsqueeze(0).expand(m, -1)
             pw_exp = pareto_w.unsqueeze(0).expand(m, -1)
             q_vecs = self.q_net(zg_exp, sfc_feats_t, pw_exp)
             q_np = q_vecs.cpu().numpy()
 
         q_sets = [
-            prune_by_hypervolume(
-                non_dominated([q_np[j]]), self._max_q_vecs, self._ref_point
-            )
+            [prune_by_hypervolume_fast(non_dominated_2d_fast(q_np[j:j+1]), self._max_q_vecs, self._ref_point)[0]]
             for j in range(m)
         ]
         best_local = select_by_hypervolume(
@@ -141,66 +131,57 @@ class HLAgent:
             valid_masks,
         ) = zip(*batch)
 
-        current_q = self.q_net(
-            torch.stack(z_globals).to(self.device),
-            torch.stack(sfc_feats).to(self.device),
-            torch.stack(pareto_ws).to(self.device),
-        )
+        self.q_net.train()
+        zg_t = torch.stack(z_globals).to(self.device)
+        sf_t = torch.stack(sfc_feats).to(self.device)
+        pw_t = torch.stack(pareto_ws).to(self.device)
+        current_q = self.q_net(zg_t, sf_t, pw_t)
 
-        with torch.no_grad():
-            target_q_vecs = []
-            for i in range(len(batch)):
-                r_vec = np.asarray(reward_vecs[i], dtype=np.float64)
-                nfeats = next_sfc_feats_list[i]
-                is_done = bool(dones[i] > 0.5)
+        eval_zg, eval_sf, eval_pw = [], [], []
+        slices = []
+        cursor = 0
 
-                if is_done or not nfeats:
-                    target_sets = [r_vec.copy()]
-                else:
-                    nfeats_t = torch.stack(nfeats).to(self.device)
-                    m_next = nfeats_t.shape[0]
-                    cand_q = self.target_net(
-                        next_z_globals[i]
-                        .to(self.device)
-                        .unsqueeze(0)
-                        .expand(m_next, -1),
-                        nfeats_t,
-                        next_pareto_ws[i]
-                        .to(self.device)
-                        .unsqueeze(0)
-                        .expand(m_next, -1),
-                    )
-                    cand_np = cand_q.cpu().numpy()
-                    mask = (
-                        valid_masks[i]
-                        if valid_masks[i] is not None
-                        else np.ones(m_next, dtype=bool)
-                    )
-                    next_q_sets = [
-                        [cand_np[j]]
-                        for j in range(m_next)
-                        if (mask[j] if j < len(mask) else True)
-                    ]
-                    target_sets = build_target_q_set(
-                        r_vec,
-                        next_q_sets,
-                        self.cfg.qnet.gamma,
-                        self._max_q_vecs,
-                        self._ref_point,
-                        done=is_done,
-                    )
+        for i in range(len(batch)):
+            is_done = bool(dones[i] > 0.5)
+            nfeats = next_sfc_feats_list[i]
+            if is_done or nfeats is None or len(nfeats) == 0:
+                slices.append((cursor, cursor))
+            else:
+                m_next = len(nfeats)
+                eval_zg.append(next_z_globals[i].unsqueeze(0).expand(m_next, -1))
+                eval_sf.append(torch.stack(nfeats) if isinstance(nfeats[0], torch.Tensor) else torch.from_numpy(np.stack(nfeats)))
+                eval_pw.append(next_pareto_ws[i].unsqueeze(0).expand(m_next, -1))
+                slices.append((cursor, cursor + m_next))
+                cursor += m_next
 
-                target_q_vecs.append(
-                    np.mean(target_sets, axis=0).astype(np.float32)
-                    if target_sets
-                    else r_vec.astype(np.float32)
+        all_cand_np = None
+        if eval_zg:
+            batched_zg = torch.cat(eval_zg, dim=0).to(self.device)
+            batched_sf = torch.cat(eval_sf, dim=0).to(self.device)
+            batched_pw = torch.cat(eval_pw, dim=0).to(self.device)
+            with torch.inference_mode():
+                all_cand_np = self.target_net(batched_zg, batched_sf, batched_pw).cpu().numpy()
+
+        target_q_vecs = np.empty((len(batch), 2), dtype=np.float32)
+        for i in range(len(batch)):
+            r_vec = np.asarray(reward_vecs[i], dtype=np.float64)
+            is_done = bool(dones[i] > 0.5)
+            st, ed = slices[i]
+            if is_done or st == ed or all_cand_np is None:
+                target_q_vecs[i] = r_vec
+            else:
+                cand_np = all_cand_np[st:ed]
+                mask = valid_masks[i]
+                if mask is not None and len(mask) == cand_np.shape[0]:
+                    cand_np = cand_np[mask]
+                t_set = build_target_q_set_fast(
+                    r_vec, cand_np, self.cfg.qnet.gamma, self._max_q_vecs, self._ref_point, done=is_done
                 )
+                target_q_vecs[i] = np.mean(t_set, axis=0) if t_set.size > 0 else r_vec
 
-        target_t = torch.tensor(
-            np.stack(target_q_vecs), dtype=torch.float32, device=self.device
-        )
+        target_t = torch.from_numpy(target_q_vecs).to(self.device)
         loss = nn.MSELoss()(current_q, target_t)
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
         self.optimizer.step()
@@ -209,4 +190,4 @@ class HLAgent:
         if self.train_steps % self.cfg.qnet.target_update_freq == 0:
             self.target_net.load_state_dict(self.q_net.state_dict())
 
-        return loss.item()
+        return float(loss.item())
