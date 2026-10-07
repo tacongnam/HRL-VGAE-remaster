@@ -3,15 +3,15 @@ import numpy as np
 import torch
 import networkx as nx
 from typing import List, Tuple, Dict, Any, Optional
-import os, sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config
-from utils.graph_generator import (
+from utils import (
     SFCRequest,
     build_substrate_network,
     generate_sfc_requests,
+    compute_load_std,
 )
+from data import get_node_features_from_graph
+from utils.graph_generator import get_node_features
 
 
 class NFVEnvironment:
@@ -109,23 +109,15 @@ class NFVEnvironment:
 
     def _get_obs(self) -> Dict[str, Any]:
         return {
-            "node_features": self._compute_node_features(),
+            "node_features": (
+                get_node_features_from_graph(self.G, self.cfg.vgae.d_in)
+                if self._dataset_mode
+                else get_node_features(self.G, self.cfg)
+            ),
             "edge_index": self._build_edge_index(),
             "queue": self.queue,
             "t": self.t,
         }
-
-    def _compute_node_features(self) -> np.ndarray:
-        try:
-            from data.loader import get_node_features_from_graph
-        except ImportError:
-            from loader import get_node_features_from_graph
-
-        if self._dataset_mode:
-            return get_node_features_from_graph(self.G, self.cfg.vgae.d_in)
-        from utils.graph_generator import get_node_features
-
-        return get_node_features(self.G, self.cfg)
 
     def _build_edge_index(self) -> np.ndarray:
         edges = list(self.G.edges())
@@ -139,15 +131,14 @@ class NFVEnvironment:
         self, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         obs = self._get_obs()
-        x = torch.tensor(obs["node_features"], dtype=torch.float32, device=device)
-        ei = torch.tensor(obs["edge_index"], dtype=torch.long, device=device)
-        return x, ei
+        return (
+            torch.tensor(obs["node_features"], dtype=torch.float32, device=device),
+            torch.tensor(obs["edge_index"], dtype=torch.long, device=device),
+        )
 
     def build_ll_mask(self, cpu_req: float) -> np.ndarray:
-        num_nodes = self.G.number_of_nodes()
-        mask = np.zeros(num_nodes, dtype=bool)
-        for u in self.G.nodes():
-            nd = self.G.nodes[u]
+        mask = np.zeros(self.G.number_of_nodes(), dtype=bool)
+        for u, nd in self.G.nodes(data=True):
             if nd.get("is_function_node", True) and nd["cpu_free"] >= cpu_req:
                 mask[u] = True
         return mask
@@ -156,8 +147,7 @@ class NFVEnvironment:
         if cpu_req > 0.0:
             self.G.nodes[node]["cpu_free"] -= cpu_req
         for i in range(len(path) - 1):
-            u, v = path[i], path[i + 1]
-            self.G[u][v]["bw_free"] -= bw
+            self.G[path[i]][path[i + 1]]["bw_free"] -= bw
         if len(path) > 1:
             self._load_std_cache = None
 
@@ -166,14 +156,11 @@ class NFVEnvironment:
             if cpu_req > 0.0:
                 self.G.nodes[node]["cpu_free"] += cpu_req
             for i in range(len(path) - 1):
-                u, v = path[i], path[i + 1]
-                self.G[u][v]["bw_free"] += bw
+                self.G[path[i]][path[i + 1]]["bw_free"] += bw
         if allocations:
             self._load_std_cache = None
 
     def get_load_std(self) -> float:
-        from utils.dijkstra import compute_load_std
-
         if self._load_std_cache is None:
             self._load_std_cache = compute_load_std(self.G)
         return self._load_std_cache
@@ -210,21 +197,19 @@ class NFVEnvironment:
         self._release_expired_active_sfcs()
         if self._dataset_mode:
             self._flush_arrivals()
-            # Episode ends when all requests have been flushed AND the queue
-            # contains no SFC that can still be processed (non-expired).
-            # Using `not self.queue` was too strict: re-queued failed SFCs
-            # kept the queue non-empty long after cursor exhaustion, causing
-            # thousands of wasted timesteps. `_purge_expired_queue()` is
-            # already called inside `_flush_arrivals()`, so any SFC still in
-            # self.queue at this point has not yet expired at time t.
-            # Therefore `self.queue` being non-empty means there are genuinely
-            # pending SFCs — but only when cursor is not yet exhausted.
-            # Once cursor is exhausted, remaining queue entries are re-queued
-            # failed SFCs whose deadline may still be in the future; we must
-            # let them expire naturally OR terminate immediately since no new
-            # SFCs will arrive and the agent will keep failing them.
-            # Correct termination: cursor exhausted AND no non-expired SFC.
-            done = self._req_cursor >= len(self._all_requests) and not any(
+            if self._req_cursor >= len(self._all_requests):
+                unexpired = [q for q in self.queue if not q.is_expired(self.t)]
+                if unexpired:
+                    next_event = (
+                        min(e["deadline"] for e in self.active_embeddings)
+                        if self.active_embeddings
+                        else min(q.deadline for q in unexpired)
+                    )
+                    if next_event > self.t:
+                        self.t = next_event
+                        self._release_expired_active_sfcs()
+                        self._purge_expired_queue()
+            return self._req_cursor >= len(self._all_requests) and not any(
                 not q.is_expired(self.t) for q in self.queue
             )
         else:
@@ -232,8 +217,7 @@ class NFVEnvironment:
                 self._arrive_sfcs_random()
             else:
                 self._purge_expired_queue()
-            done = self.t >= self.cfg.train.episode_horizon
-        return done
+            return self.t >= self.cfg.train.episode_horizon
 
     def remove_sfc_from_queue(self, sfc: SFCRequest):
         self.queue = [q for q in self.queue if q.sfc_id != sfc.sfc_id]

@@ -1,226 +1,109 @@
-import sys
-import os
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import json
+import os
+import glob
 import numpy as np
+import torch
+
+from config import Config
+from env import NFVEnvironment
+from models import MNVGAE
+from agents import HLAgent, LLAgent
+from utils import (
+    ParetoScalarizer,
+    pareto_front,
+    compute_hypervolume,
+    coverage_metric,
+    spacing_metric,
+    spread_metric,
+)
+from data import parse_episode, discover_episodes
 
 
-def _load_scan(path: str) -> list:
-    with open(path) as f:
+def _compute_hv(scan_json: str, out: str, eps: float, baseline_json: str = ""):
+    with open(scan_json) as f:
         data = json.load(f)
-    valid = [
-        r
-        for r in data
-        if isinstance(r.get("acc_ratio"), (int, float))
-        and isinstance(r.get("deploy_cost"), (int, float))
-        and np.isfinite(r["acc_ratio"])
-        and np.isfinite(r["deploy_cost"])
-    ]
-    if not valid:
-        raise ValueError(f"No valid entries in {path}")
-    return valid
-
-
-def _to_hv_space(results: list):
-    return np.array(
-        [[r["acc_ratio"], -r["deploy_cost"]] for r in results], dtype=np.float64
+    pts = np.unique(
+        np.array([[r["acc_ratio"], -r["deploy_cost"]] for r in data], dtype=np.float64),
+        axis=0,
     )
-
-
-def _ref_point(pts: np.ndarray, eps: float = 1e-2) -> np.ndarray:
-    return np.array([pts[:, 0].min() - eps, pts[:, 1].min() - eps])
-
-
-def _compute_hv(scan_json: str, out: str, eps: float):
-    from utils.pareto import pareto_front, compute_hypervolume
-
-    results = _load_scan(scan_json)
-    pts = _to_hv_space(results)
-    pts = np.unique(pts, axis=0)
     front_pts = pareto_front([tuple(p) for p in pts])
-    if not front_pts:
-        print("WARNING: empty Pareto front")
-        hv = 0.0
-        ref = _ref_point(pts, eps).tolist()
-    else:
-        front_arr = np.array(front_pts, dtype=np.float64)
-        ref = _ref_point(pts, eps)
-        hv = compute_hypervolume(front_arr, ref)
-        ref = ref.tolist()
-    output = {
-        "hypervolume": float(hv),
-        "reference_point": {"acc_ratio": ref[0], "neg_deploy_cost": ref[1]},
-        "pareto_front": [
-            {
-                "acc_ratio": float(p[0]),
-                "neg_deploy_cost": float(p[1]),
-                "deploy_cost": float(-p[1]),
-            }
-            for p in (front_pts if front_pts else [])
-        ],
-        "all_points": [
-            {
-                "acc_ratio": float(r["acc_ratio"]),
-                "deploy_cost": float(r["deploy_cost"]),
-                "w_accept": float(r.get("w_accept", 0.0)),
-                "w_cost": float(r.get("w_cost", 0.0)),
-            }
-            for r in results
-        ],
-    }
-    with open(out, "w") as f:
-        json.dump(output, f, indent=2)
-    print(f"HV={hv:.6f}  ref={ref}  front_size={len(front_pts)}  saved→{out}")
-
-
-def _migrate_hl_state_dict(sd: dict, n_obj: int = 4) -> dict:
-    import torch
-
-    if any(k.startswith("net.") for k in sd):
-        sd = {
-            ("trunk." + k[len("net.") :] if k.startswith("net.") else k): v
-            for k, v in sd.items()
-        }
-
-    if "trunk.4.weight" in sd:
-        w = sd.pop("trunk.4.weight")
-        b = sd.pop("trunk.4.bias")
-        n_ckpt, H = int(w.shape[0]), int(w.shape[1])
-        if n_ckpt > n_obj:
-            raise ValueError(
-                f"Checkpoint trunk.4.weight has {n_ckpt} rows but model has {n_obj} heads."
-            )
-        for i in range(n_obj):
-            if i < n_ckpt:
-                sd[f"q_heads.{i}.weight"] = w[i : i + 1].clone()
-                sd[f"q_heads.{i}.bias"] = b[i : i + 1].clone()
-            else:
-                sd[f"q_heads.{i}.weight"] = torch.zeros(1, H)
-                sd[f"q_heads.{i}.bias"] = torch.zeros(1)
-
-    return sd
-
-
-def _migrate_ll_state_dict(sd: dict, n_obj: int = 4) -> dict:
-    import torch
-
-    existing = sorted(
-        int(k.split(".")[1])
-        for k in sd
-        if k.startswith("q_heads.") and k.endswith(".weight")
+    ref = np.array([pts[:, 0].min() - eps, pts[:, 1].min() - eps])
+    hv = (
+        compute_hypervolume(np.array(front_pts, dtype=np.float64), ref)
+        if front_pts
+        else 0.0
     )
-    if not existing:
-        return sd
-    n_ckpt = max(existing) + 1
-    if n_ckpt >= n_obj:
-        return sd
-    H = int(sd[f"q_heads.{existing[-1]}.weight"].shape[1])
-    sd = dict(sd)
-    for i in range(n_ckpt, n_obj):
-        sd[f"q_heads.{i}.weight"] = torch.zeros(1, H)
-        sd[f"q_heads.{i}.bias"] = torch.zeros(1)
-    return sd
+
+    front_arr = np.array(front_pts, dtype=np.float64) if front_pts else np.empty((0, 2))
+    spacing = spacing_metric(front_arr, normalize=True)
+    spread = spread_metric(front_arr, normalize=True)
+
+    metrics_dict = {
+        "hypervolume": float(hv),
+        "spacing": float(spacing),
+        "delta": float(spread),
+        "spread": float(spread),
+        "reference_point": {
+            "acc_ratio": float(ref[0]),
+            "neg_deploy_cost": float(ref[1]),
+        },
+        "pareto_front": [
+            {"acc_ratio": float(p[0]), "deploy_cost": float(-p[1])} for p in front_pts
+        ],
+        "all_points": data,
+    }
+
+    if baseline_json and os.path.exists(baseline_json):
+        with open(baseline_json) as f:
+            base_data = json.load(f)
+        base_pts = np.unique(
+            np.array(
+                [[r["acc_ratio"], -r["deploy_cost"]] for r in base_data],
+                dtype=np.float64,
+            ),
+            axis=0,
+        )
+        base_front = np.array(
+            pareto_front([tuple(p) for p in base_pts]), dtype=np.float64
+        )
+        c_ab = coverage_metric(front_arr, base_front, maximize=True)
+        c_ba = coverage_metric(base_front, front_arr, maximize=True)
+        metrics_dict["coverage_ab"] = float(c_ab)
+        metrics_dict["coverage_ba"] = float(c_ba)
+        metrics_dict["coverage"] = float(c_ab)
+
+    with open(out, "w") as f:
+        json.dump(metrics_dict, f, indent=2)
+    print(
+        f"HV={hv:.6f}  Spacing={spacing:.4f}  Delta={spread:.4f}  "
+        f"ref={ref.tolist()}  front_size={len(front_pts)}  saved→{out}"
+    )
 
 
-def _load_checkpoint(checkpoint: str, cfg, device):
-    import torch
-    from models.vgae import MNVGAE
-    from agents.hl_agent import HLAgent
-    from agents.ll_agent import LLAgent
-    from utils.pareto import ParetoScalarizer
-
+def _load_checkpoint(checkpoint: str, cfg: Config, device: torch.device):
     ckpt = torch.load(checkpoint, map_location=device)
     vgae = MNVGAE(cfg).to(device)
     vgae.load_state_dict(ckpt["vgae"])
     vgae.eval()
 
     hl_agent = HLAgent(cfg, device)
-    hl_q_sd = _migrate_hl_state_dict(ckpt["hl_q"])
-    hl_agent.q_net.load_state_dict(hl_q_sd)
-    hl_agent.target_net.load_state_dict(hl_q_sd)
+    hl_agent.q_net.load_state_dict(ckpt["hl_q"])
+    hl_agent.target_net.load_state_dict(ckpt["hl_q"])
     hl_agent.epsilon = 0.0
 
     ll_agent = LLAgent(cfg, device)
-    ll_q_sd = _migrate_ll_state_dict(ckpt["ll_q"])
-    ll_agent.q_net.load_state_dict(ll_q_sd)
-    ll_agent.target_net.load_state_dict(ll_q_sd)
+    ll_agent.q_net.load_state_dict(ckpt["ll_q"])
+    ll_agent.target_net.load_state_dict(ckpt["ll_q"])
     ll_agent.epsilon = 0.0
 
     scalarizer = ParetoScalarizer(cfg)
     scalarizer.w_accept = float(ckpt.get("w_accept", 0.5))
     scalarizer.w_cost = float(ckpt.get("w_cost", 0.5))
-
     return vgae, hl_agent, ll_agent, scalarizer
 
 
-def _discover_recursive(root: str):
-    import glob as _glob
-
-    structured = []
-    for path in sorted(_glob.glob(os.path.join(root, "*", "*", "*", "episode_*.json"))):
-        parts = path.replace("\\", "/").split("/")
-        try:
-            diff_idx = next(
-                i for i, p in enumerate(parts) if p in ("easy", "normal", "hard")
-            )
-            difficulty = parts[diff_idx]
-            allocation = parts[diff_idx - 1]
-            topology = parts[diff_idx - 2]
-            fname = os.path.splitext(os.path.basename(path))[0]
-            test_index = (
-                int(fname.split("_")[-1]) if fname.split("_")[-1].isdigit() else 0
-            )
-            structured.append(
-                (
-                    path,
-                    {
-                        "topology": topology,
-                        "allocation": allocation,
-                        "difficulty": difficulty,
-                        "test_index": test_index,
-                    },
-                )
-            )
-        except StopIteration:
-            structured.append(
-                (
-                    path,
-                    {
-                        "topology": "unknown",
-                        "allocation": "unknown",
-                        "difficulty": "unknown",
-                        "test_index": 0,
-                    },
-                )
-            )
-
-    if structured:
-        return structured
-
-    from data.loader import discover_episodes
-
-    flat = discover_episodes(root)
-    return [
-        (
-            p,
-            {
-                "topology": "unknown",
-                "allocation": "unknown",
-                "difficulty": "unknown",
-                "test_index": 0,
-            },
-        )
-        for p in flat
-    ]
-
-
 def _scan_pareto(args):
-    import torch
-    from config import Config
-    from env.nfv_env import NFVEnvironment
-    from data.loader import parse_episode
     from train import run_episode
 
     cfg = Config()
@@ -229,58 +112,22 @@ def _scan_pareto(args):
         args.checkpoint, cfg, device
     )
 
-    if args.recursive:
-        path_meta_list = _discover_recursive(args.data_dir)
+    if args.single_episode:
+        paths = [args.single_episode]
+    elif args.recursive:
+        paths = sorted(
+            glob.glob(os.path.join(args.data_dir, "*", "*", "*", "episode_*.json"))
+        )
     else:
-        from data.loader import discover_episodes
+        paths = discover_episodes(args.data_dir)
 
-        flat = discover_episodes(args.data_dir)
-        path_meta_list = [
-            (
-                p,
-                {
-                    "topology": "unknown",
-                    "allocation": "unknown",
-                    "difficulty": "unknown",
-                    "test_index": 0,
-                },
-            )
-            for p in flat
-        ]
-
-    if not path_meta_list:
-        raise FileNotFoundError(f"No episodes found in {args.data_dir}")
-
-    # ------------------------------------------------------------------
-    # NEW: --single-episode overrides path_meta_list to exactly 1 file.
-    # Useful for quick visual/HV check without running full evaluation.
-    # ------------------------------------------------------------------
-    if getattr(args, "single_episode", None):
-        if not os.path.exists(args.single_episode):
-            raise FileNotFoundError(
-                f"--single-episode not found: {args.single_episode}"
-            )
-        path_meta_list = [
-            (
-                args.single_episode,
-                {
-                    "topology": "single",
-                    "allocation": "single",
-                    "difficulty": "single",
-                    "test_index": 0,
-                },
-            )
-        ]
-        print(f"[evaluate] single-episode mode: {args.single_episode}")
-
-    n_pts = args.pareto_points
-    weights = [k / max(1, n_pts - 1) for k in range(n_pts)]
+    weights = [k / max(1, args.pareto_points - 1) for k in range(args.pareto_points)]
     results = []
 
     with torch.no_grad():
-        for w_accept in weights:
-            w_cost = 1.0 - w_accept
-            for path, meta in path_meta_list:
+        for w_acc in weights:
+            w_cost = 1.0 - w_acc
+            for path in paths:
                 G, reqs, _, topo_id = parse_episode(path)
                 env = NFVEnvironment(cfg)
                 env.reset(G, reqs, topology_id=topo_id)
@@ -289,38 +136,31 @@ def _scan_pareto(args):
                     vgae,
                     hl_agent,
                     ll_agent,
-                    vgae_optimizer=None,
-                    scalarizer=scalarizer,
-                    cfg=cfg,
-                    device=device,
+                    None,
+                    scalarizer,
+                    cfg,
+                    device,
                     train=False,
-                    fixed_weight=(w_accept, w_cost),
+                    fixed_weight=(w_acc, w_cost),
                 )
-                entry = {
-                    "w_accept": w_accept,
-                    "w_cost": w_cost,
-                    "acc_ratio": float(stats["acceptance_ratio"]),
-                    "deploy_cost": float(stats["total_deploy_cost"]),
-                    "topology": meta["topology"],
-                    "allocation": meta["allocation"],
-                    "difficulty": meta["difficulty"],
-                    "test_index": meta["test_index"],
-                    "path": path,
-                }
-                results.append(entry)
+                results.append(
+                    {
+                        "w_accept": w_acc,
+                        "w_cost": w_cost,
+                        "acc_ratio": float(stats["acceptance_ratio"]),
+                        "deploy_cost": float(stats["total_deploy_cost"]),
+                        "path": path,
+                    }
+                )
 
-            w_entries = [e for e in results if abs(e["w_accept"] - w_accept) < 1e-9]
-            mean_acc = float(np.mean([e["acc_ratio"] for e in w_entries]))
-            mean_cost = float(np.mean([e["deploy_cost"] for e in w_entries]))
+            w_entries = [e for e in results if abs(e["w_accept"] - w_acc) < 1e-9]
             print(
-                f"  w_accept={w_accept:.2f}  acc={mean_acc:.4f}  cost={mean_cost:.2f}"
-                f"  (n={len(w_entries)})"
+                f"  w_accept={w_acc:.2f}  acc={np.mean([e['acc_ratio'] for e in w_entries]):.4f}  cost={np.mean([e['deploy_cost'] for e in w_entries]):.2f}"
             )
 
     with open(args.pareto_out, "w") as f:
         json.dump(results, f, indent=2)
     print(f"Pareto scan saved → {args.pareto_out}")
-
     if args.compute_hv:
         _compute_hv(args.pareto_out, args.hv_out, args.hv_eps)
 
@@ -333,26 +173,13 @@ def main():
     parser.add_argument("--pareto-scan", action="store_true")
     parser.add_argument("--checkpoint", type=str, default="vgae_hrl_ql_checkpoint.pt")
     parser.add_argument("--data-dir", type=str, default="data/dataset_01/test")
+    parser.add_argument("--single-episode", type=str, default="")
+    parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--pareto-points", type=int, default=11)
     parser.add_argument("--pareto-out", type=str, default="pareto_front.json")
     parser.add_argument("--compute-hv", action="store_true")
     parser.add_argument("--hv-out", type=str, default="hv_result.json")
     parser.add_argument("--hv-eps", type=float, default=1e-2)
-    parser.add_argument(
-        "--recursive",
-        action="store_true",
-        help="Recursively discover episodes under --data-dir with "
-        "{topology}/{allocation}/{difficulty}/ structure (for data/all_tests/).",
-    )
-    # NEW: single-episode for quick visual check
-    parser.add_argument(
-        "--single-episode",
-        type=str,
-        default="",
-        help="Path to a single test episode JSON. When set with --pareto-scan, "
-             "evaluates only that one file for quick visual/HV check. "
-             "Full evaluation (all test files) runs when this flag is omitted.",
-    )
     args = parser.parse_args()
 
     if args.pareto_scan:

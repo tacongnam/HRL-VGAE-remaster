@@ -1,19 +1,17 @@
 import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 from collections import deque
 from typing import List, Optional, Tuple
 from config import Config
-from models.hl_scorer import HLSharedQScorer, N_OBJ_HL
-from utils.graph_generator import SFCRequest
-from utils.pareto import (
+from models import HLSharedQScorer
+from utils import (
+    SFCRequest,
     non_dominated,
-    non_dominated_indices,
-    select_by_hypervolume,
     prune_by_hypervolume,
-    hv_score_for_action,
+    select_by_hypervolume,
     build_target_q_set,
 )
 
@@ -43,7 +41,7 @@ class HLReplayBuffer:
                 action_idx,
                 reward_vec.copy(),
                 next_z_global,
-                [f for f in next_sfc_feats],
+                list(next_sfc_feats),
                 next_pareto_w,
                 done,
                 valid_action_mask.copy() if valid_action_mask is not None else None,
@@ -73,19 +71,6 @@ class HLAgent:
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=cfg.qnet.lr)
         self.buffer = HLReplayBuffer(cfg.qnet.hl_buffer_size)
 
-    def _get_q_sets(
-        self, net, z_global_exp, sfc_feats_t, pw_exp, valid_indices
-    ) -> List[List[np.ndarray]]:
-        q_vecs = net(z_global_exp, sfc_feats_t, pw_exp)
-        q_np = q_vecs.cpu().numpy()
-        q_sets = []
-        for j, global_idx in enumerate(valid_indices):
-            vec = q_np[j]
-            nd_set = non_dominated([vec])
-            nd_set = prune_by_hypervolume(nd_set, self._max_q_vecs, self._ref_point)
-            q_sets.append(nd_set)
-        return q_sets
-
     def select_sfc(
         self,
         z_global: torch.Tensor,
@@ -105,69 +90,37 @@ class HLAgent:
             return None
 
         if random.random() < self.epsilon:
-            chosen_local = random.choice(valid_indices)
-            return chosen_local, queue[chosen_local]
+            chosen = random.choice(valid_indices)
+            return chosen, queue[chosen]
 
+        m = len(valid_indices)
         self.q_net.eval()
-        with torch.no_grad():
-            sfc_feats = [
-                torch.tensor(
-                    queue[i].to_feature_vector(t),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                for i in valid_indices
-            ]
-            sfc_feats_t = torch.stack(sfc_feats)
-            m = len(valid_indices)
-            z_global_exp = z_global.unsqueeze(0).expand(m, -1)
+        with torch.inference_mode():
+            sfc_feats_np = np.stack(
+                [queue[i].to_feature_vector(t) for i in valid_indices]
+            ).astype(np.float32)
+            sfc_feats_t = torch.tensor(
+                sfc_feats_np, dtype=torch.float32, device=self.device
+            )
+            zg_exp = z_global.unsqueeze(0).expand(m, -1)
             pw_exp = pareto_w.unsqueeze(0).expand(m, -1)
-            q_sets = self._get_q_sets(
-                self.q_net, z_global_exp, sfc_feats_t, pw_exp, valid_indices
-            )
-        self.q_net.train()
+            q_vecs = self.q_net(zg_exp, sfc_feats_t, pw_exp)
+            q_np = q_vecs.cpu().numpy()
 
-        valid_mask = np.ones(m, dtype=bool)
+        q_sets = [
+            prune_by_hypervolume(
+                non_dominated([q_np[j]]), self._max_q_vecs, self._ref_point
+            )
+            for j in range(m)
+        ]
         best_local = select_by_hypervolume(
-            q_sets, valid_mask, self._ref_point, tie_break_rng=self._tie_rng
+            q_sets, np.ones(m, dtype=bool), self._ref_point, tie_break_rng=self._tie_rng
         )
-
-        if verbose:
-            hv_scores = [hv_score_for_action(qs, self._ref_point) for qs in q_sets]
-            print(
-                f"  [HL-HV] ref={self._ref_point} | "
-                f"hv_scores={[f'{s:.4f}' for s in hv_scores]} | "
-                f"chosen_local={best_local} q_set_size={len(q_sets[best_local])}"
-            )
-
         best_idx = valid_indices[best_local]
         return best_idx, queue[best_idx]
 
-    def store_transition(
-        self,
-        z_global,
-        sfc_feat,
-        pareto_w,
-        action_idx: int,
-        reward_vec: np.ndarray,
-        next_z_global,
-        next_sfc_feats,
-        next_pareto_w,
-        done: float,
-        valid_action_mask: Optional[np.ndarray] = None,
-    ):
-        self.buffer.push(
-            z_global,
-            sfc_feat,
-            pareto_w,
-            action_idx,
-            reward_vec,
-            next_z_global,
-            next_sfc_feats,
-            next_pareto_w,
-            done,
-            valid_action_mask,
-        )
+    def store_transition(self, *args, **kwargs):
+        self.buffer.push(*args, **kwargs)
 
     def train_step(self) -> Optional[float]:
         min_buf = min(self.cfg.qnet.batch_size, self.cfg.qnet.hl_buffer_size // 10)
@@ -188,12 +141,11 @@ class HLAgent:
             valid_masks,
         ) = zip(*batch)
 
-        z_globals_t = torch.stack(z_globals).to(self.device)
-        sfc_feats_t = torch.stack(sfc_feats).to(self.device)
-        pareto_ws_t = torch.stack(pareto_ws).to(self.device)
-        dones_t = torch.tensor(dones, dtype=torch.float32, device=self.device)
-
-        current_q = self.q_net(z_globals_t, sfc_feats_t, pareto_ws_t)
+        current_q = self.q_net(
+            torch.stack(z_globals).to(self.device),
+            torch.stack(sfc_feats).to(self.device),
+            torch.stack(pareto_ws).to(self.device),
+        )
 
         with torch.no_grad():
             target_q_vecs = []
@@ -205,27 +157,30 @@ class HLAgent:
                 if is_done or not nfeats:
                     target_sets = [r_vec.copy()]
                 else:
-                    nz = next_z_globals[i].to(self.device)
-                    npw = next_pareto_ws[i].to(self.device)
                     nfeats_t = torch.stack(nfeats).to(self.device)
                     m_next = nfeats_t.shape[0]
-                    nz_exp = nz.unsqueeze(0).expand(m_next, -1)
-                    npw_exp = npw.unsqueeze(0).expand(m_next, -1)
-
+                    cand_q = self.target_net(
+                        next_z_globals[i]
+                        .to(self.device)
+                        .unsqueeze(0)
+                        .expand(m_next, -1),
+                        nfeats_t,
+                        next_pareto_ws[i]
+                        .to(self.device)
+                        .unsqueeze(0)
+                        .expand(m_next, -1),
+                    )
+                    cand_np = cand_q.cpu().numpy()
                     mask = (
                         valid_masks[i]
                         if valid_masks[i] is not None
                         else np.ones(m_next, dtype=bool)
                     )
-
-                    cand_q = self.target_net(nz_exp, nfeats_t, npw_exp)
-                    cand_np = cand_q.cpu().numpy()
-
-                    next_q_sets = []
-                    for j in range(m_next):
-                        if mask[j] if j < len(mask) else True:
-                            next_q_sets.append([cand_np[j]])
-
+                    next_q_sets = [
+                        [cand_np[j]]
+                        for j in range(m_next)
+                        if (mask[j] if j < len(mask) else True)
+                    ]
                     target_sets = build_target_q_set(
                         r_vec,
                         next_q_sets,
@@ -235,17 +190,15 @@ class HLAgent:
                         done=is_done,
                     )
 
-                if target_sets:
-                    pts = np.array(target_sets, dtype=np.float32)
-                    rep = pts.mean(axis=0)
-                else:
-                    rep = r_vec.astype(np.float32)
-                target_q_vecs.append(rep)
+                target_q_vecs.append(
+                    np.mean(target_sets, axis=0).astype(np.float32)
+                    if target_sets
+                    else r_vec.astype(np.float32)
+                )
 
         target_t = torch.tensor(
             np.stack(target_q_vecs), dtype=torch.float32, device=self.device
         )
-
         loss = nn.MSELoss()(current_q, target_t)
         self.optimizer.zero_grad()
         loss.backward()

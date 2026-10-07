@@ -1,6 +1,7 @@
+import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional
-import numpy as np
+import math
 
 
 @dataclass
@@ -78,10 +79,10 @@ class ParetoConfig:
     weight_adapt_rate: float = 0.01
     utopia_momentum: float = 0.98
     front_log_every: int = 25
-    hv_ref_cost: float = -1.0
-    hv_ref_delay: float = -1.0
-    hv_ref_balance: float = -1.0
-    hv_ref_success: float = -1.0
+    hv_ref_cost: float = -25.0
+    hv_ref_delay: float = -25.0
+    hv_ref_balance: float = -25.0
+    hv_ref_success: float = -25.0
     failure_penalty_cost: float = 10.0
     failure_penalty_delay: float = 10.0
     failure_penalty_balance: float = 10.0
@@ -131,7 +132,9 @@ class TrainConfig:
     episode_horizon: int = 500
     log_interval: int = 1
     seed: int = 42
-    max_sfc_per_timestep: "Optional[int]" = None
+    max_sfc_per_timestep: Optional[int] = None
+    train_interval_sfc: int = 4
+    k_hop_explore: int = 3
 
 
 @dataclass
@@ -146,15 +149,15 @@ class Config:
     pareto: ParetoConfig = field(default_factory=ParetoConfig)
 
     @property
-    def d_latent(self):
+    def d_latent(self) -> int:
         return self.vgae.d_latent
 
     @property
-    def d_global(self):
+    def d_global(self) -> int:
         return 2 * self.vgae.d_latent
 
     @property
-    def d_ll_input(self):
+    def d_ll_input(self) -> int:
         return (
             self.d_global
             + 2 * self.vgae.d_latent
@@ -164,21 +167,11 @@ class Config:
         )
 
     @property
-    def d_hl_input(self):
+    def d_hl_input(self) -> int:
         return self.d_global + self.qnet.d_sfc + 2
 
     @property
     def sfc_quota_per_timestep(self) -> int:
         if self.train.max_sfc_per_timestep is not None:
             return max(1, self.train.max_sfc_per_timestep)
-        import math
-
-        return max(1, math.ceil(self.sfc.arrival_rate / self.sfc.arrival_interval))
-
-    @property
-    def sfc_quota_per_timestep(self) -> int:
-        if self.train.max_sfc_per_timestep is not None:
-            return max(1, self.train.max_sfc_per_timestep)
-        import math
-
         return max(1, math.ceil(self.sfc.arrival_rate / self.sfc.arrival_interval))
