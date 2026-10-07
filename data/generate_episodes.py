@@ -145,7 +145,7 @@ def main():
         help="Number of episode files to generate",
     )
     parser.add_argument(
-        "--sim-duration", type=int, default=500, help="Simulation duration (time units)"
+        "--sim-duration", type=int, default=50, help="Simulation duration (time units)"
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Master seed — deterministic for same args"
