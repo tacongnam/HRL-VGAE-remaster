@@ -12,3 +12,4 @@ runs/*
 .venv/*
 *.pt
 *.md
+training_log.csv

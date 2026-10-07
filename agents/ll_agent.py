@@ -37,6 +37,7 @@ class LLAgent:
         self.epsilon = cfg.qnet.eps_start
         self.train_steps = 0
         self._ref_point = cfg.pareto.hv_reference_point()
+        self._obs_min = np.array([np.inf, np.inf], dtype=np.float64)
         self._max_q_vecs = cfg.qnet.max_q_vectors_per_action
         self._tie_rng = random.Random(cfg.train.seed + 1)
         self.q_net = LLNodeScorer(cfg).to(device)
@@ -45,6 +46,20 @@ class LLAgent:
         self.target_net.eval()
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=cfg.qnet.lr)
         self.buffer = LLReplayBuffer(cfg.qnet.ll_buffer_size)
+
+    def _update_ref_point(self, q_np: np.ndarray):
+        if q_np.size == 0:
+            return
+        batch_min = q_np.min(axis=0).astype(np.float64)
+        m = self.cfg.pareto.ll_ref_momentum
+        finite_mask = np.isfinite(self._obs_min)
+        self._obs_min = np.where(
+            finite_mask,
+            np.minimum(batch_min, m * self._obs_min + (1 - m) * batch_min),
+            batch_min,
+        )
+        margin = self.cfg.pareto.ll_ref_margin
+        self._ref_point = self._obs_min - margin
 
     def select_node(
         self,
@@ -89,6 +104,8 @@ class LLAgent:
             pw_exp = pareto_w.unsqueeze(0).expand(k, -1)
             q_vecs = self.q_net(zg_exp, zp_exp, z_valid, vf_exp, sf_exp, pw_exp)
             q_np = q_vecs.cpu().numpy()
+
+        self._update_ref_point(q_np)
 
         q_sets: List[List[np.ndarray]] = [[] for _ in range(num_nodes)]
         for local_j, global_i in enumerate(valid_nodes):
@@ -167,7 +184,8 @@ class LLAgent:
         target_t = torch.tensor(
             np.stack(target_q_vecs), dtype=torch.float32, device=self.device
         )
-        loss = nn.MSELoss()(current_q, target_t)
+        obj_scale = torch.tensor([1.0, 1000.0], dtype=torch.float32, device=self.device)
+        loss = nn.MSELoss()(current_q * obj_scale, target_t * obj_scale)
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)

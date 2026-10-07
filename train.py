@@ -259,27 +259,6 @@ def run_episode(
             )
             curr_src = chosen_node
 
-            path = custom_dijkstra(
-                env.G,
-                curr_src,
-                chosen_node,
-                selected_sfc.bandwidth,
-                cfg.reward.omega_bw,
-                cfg.reward.lambda_penalty,
-            )
-            if path is None or env.G.nodes[chosen_node]["cpu_free"] < vnf.cpu_req:
-                embedding_failed = True
-                break
-
-            p_cost, p_delay = compute_path_cost_delay(env.G, path)
-            ll_records[-1]["path_cost"] = p_cost
-            ll_records[-1]["path_delay"] = p_delay
-            env.allocate(chosen_node, path, vnf.cpu_req, selected_sfc.bandwidth)
-            partial_allocations.append(
-                (chosen_node, path, vnf.cpu_req, selected_sfc.bandwidth)
-            )
-            curr_src = chosen_node
-
         dest_cost, dest_delay = 0.0, 0.0
         if not embedding_failed:
             dest_path = custom_dijkstra(
@@ -423,14 +402,11 @@ def run_episode(
                 hl_updates += 1
 
         sfc_step_count += 1
-        if env.queue and sfc_step_count < cfg.sfc_quota_per_timestep:
-            continue
-
-        sfc_step_count = 0
-        done = env.step_time()
-        if not done and graph_dirty:
-            z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
-            z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
+        done = env.step_time() if not env.queue else done
+        if not env.queue:
+            if not done and graph_dirty:
+                z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
+                z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
 
     if pareto_archive is not None and env.accepted > 0:
         pareto_archive.add(

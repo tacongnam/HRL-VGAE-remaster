@@ -87,22 +87,15 @@ class ParetoConfig:
     failure_penalty_delay: float = 10.0
     failure_penalty_balance: float = 10.0
     failure_penalty_success: float = 10.0
+    ll_ref_momentum: float = 0.99
+    ll_ref_margin: float = 1.0
 
     def hv_reference_point(self) -> np.ndarray:
-        return np.array(
-            [
-                self.hv_ref_cost,
-                self.hv_ref_success,
-            ],
-            dtype=np.float64,
-        )
+        return np.array([self.hv_ref_cost, self.hv_ref_success], dtype=np.float64)
 
     def failure_penalty_vector(self) -> np.ndarray:
         return np.array(
-            [
-                -self.failure_penalty_cost,
-                -self.failure_penalty_success,
-            ],
+            [-self.failure_penalty_cost, -self.failure_penalty_success],
             dtype=np.float32,
         )
 
