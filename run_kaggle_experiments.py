@@ -4,33 +4,31 @@ Kaggle experiment runner for HRL-VGAE.
 Pipeline per testcase (independent experiment):
   1. Train on data/testcase/{topology}_{allocation}_{difficulty}.json
   2. Generate 10 test episodes → data/test/{topology}/{allocation}/{difficulty}/
-  3. Pareto scan + Hypervolume / Spacing / Spread
-     → results/{topology}_{allocation}_{difficulty}/
+  3. Screen all 10 tests (1 weight) → AR + deploy_cost for each
+  4. Select the episode with the highest AR
+  5. Full Pareto scan ONLY on that episode → Hypervolume / Spacing / Spread
 
 Topology : nsf, cogent, conus
 Allocation: centers, uniform, rural, urban
 Difficulty: easy, normal, hard
 
-Usage (Kaggle notebook or script):
-  # Full grid (36 experiments) — may exceed 12h
+Usage:
   python run_kaggle_experiments.py
-
-  # Subset
   python run_kaggle_experiments.py --topology nsf
   python run_kaggle_experiments.py --topology nsf --allocation centers
   python run_kaggle_experiments.py --topology nsf --allocation centers --difficulty hard
-  python run_kaggle_experiments.py --skip-train --skip-generate   # evaluate only
+  python run_kaggle_experiments.py --skip-train --skip-generate
 """
 
 from __future__ import annotations
 
 import argparse
-import os
+import json
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
 # Grid definition
@@ -49,24 +47,20 @@ DEFAULT_SEED = 42
 # ---------------------------------------------------------------------------
 
 def ensure_dir(path: str | Path) -> Path:
-    """Create directory if missing; return Path."""
     p = Path(path)
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def testcase_path(testcase_dir: Path, topology: str, allocation: str, difficulty: str) -> Path:
-    """data/testcase/{topology}_{allocation}_{difficulty}.json"""
     return testcase_dir / f"{topology}_{allocation}_{difficulty}.json"
 
 
 def test_out_dir(test_root: Path, topology: str, allocation: str, difficulty: str) -> Path:
-    """data/test/{topology}/{allocation}/{difficulty}/"""
     return test_root / topology / allocation / difficulty
 
 
 def result_dir(results_root: Path, topology: str, allocation: str, difficulty: str) -> Path:
-    """results/{topology}_{allocation}_{difficulty}/"""
     return results_root / f"{topology}_{allocation}_{difficulty}"
 
 
@@ -137,27 +131,168 @@ def generate_tests(
     return run_cmd(cmd, dry_run=dry_run)
 
 
-def evaluate_one(
+def evaluate_screen_all(
     checkpoint: Path,
     data_dir: Path,
+    screen_out: Path,
+    dry_run: bool,
+) -> int:
+    """
+    Run all episodes in data_dir with a single weight (pareto-points=1).
+    Produces AR + deploy_cost per episode for ranking.
+    """
+    ensure_dir(screen_out.parent)
+    cmd = [
+        sys.executable, "evaluate.py",
+        "--pareto-scan",
+        "--checkpoint", str(checkpoint),
+        "--data-dir", str(data_dir),
+        "--pareto-points", "1",
+        "--pareto-out", str(screen_out),
+    ]
+    return run_cmd(cmd, dry_run=dry_run)
+
+
+def evaluate_pareto_single(
+    checkpoint: Path,
+    episode_path: Path,
     pareto_out: Path,
     hv_out: Path,
     pareto_points: int,
     dry_run: bool,
 ) -> int:
+    """Full Pareto scan on one episode only, then compute HV metrics."""
     ensure_dir(pareto_out.parent)
     ensure_dir(hv_out.parent)
     cmd = [
         sys.executable, "evaluate.py",
         "--pareto-scan",
         "--checkpoint", str(checkpoint),
-        "--data-dir", str(data_dir),
+        "--single-episode", str(episode_path),
         "--pareto-points", str(pareto_points),
         "--pareto-out", str(pareto_out),
         "--compute-hv",
         "--hv-out", str(hv_out),
     ]
     return run_cmd(cmd, dry_run=dry_run)
+
+
+# ---------------------------------------------------------------------------
+# Select best-AR episode from screening JSON
+# ---------------------------------------------------------------------------
+
+def select_best_ar_episode(screen_json: Path) -> Optional[Dict[str, Any]]:
+    """
+    Read screening scan (1 weight × N episodes).
+    Return the entry with highest acc_ratio.
+    Tie-break: lower deploy_cost, then path name.
+    """
+    if not screen_json.is_file():
+        print(f"[ERROR] screen file missing: {screen_json}", flush=True)
+        return None
+
+    with open(screen_json) as f:
+        data = json.load(f)
+
+    if not data:
+        print(f"[ERROR] empty screen results: {screen_json}", flush=True)
+        return None
+
+    # Aggregate by path in case of duplicate weights (should be 1)
+    best_by_path: Dict[str, Dict[str, Any]] = {}
+    for row in data:
+        path = row.get("path", "")
+        ar = float(row.get("acc_ratio", 0.0))
+        cost = float(row.get("deploy_cost", float("inf")))
+        prev = best_by_path.get(path)
+        if prev is None or ar > prev["acc_ratio"] or (
+            ar == prev["acc_ratio"] and cost < prev["deploy_cost"]
+        ):
+            best_by_path[path] = {
+                "path": path,
+                "acc_ratio": ar,
+                "deploy_cost": cost,
+                "w_accept": row.get("w_accept"),
+                "w_cost": row.get("w_cost"),
+            }
+
+    ranked = sorted(
+        best_by_path.values(),
+        key=lambda r: (-r["acc_ratio"], r["deploy_cost"], r["path"]),
+    )
+    best = ranked[0]
+    print(
+        f"[SELECT] best AR episode: {best['path']}  "
+        f"AR={best['acc_ratio']:.4f}  cost={best['deploy_cost']:.2f}",
+        flush=True,
+    )
+    print("[SELECT] ranking (all tests):", flush=True)
+    for i, r in enumerate(ranked, 1):
+        mark = " <-- PARETO" if i == 1 else ""
+        print(
+            f"  {i:2d}. AR={r['acc_ratio']:.4f}  cost={r['deploy_cost']:.2f}  "
+            f"{Path(r['path']).name}{mark}",
+            flush=True,
+        )
+    return best
+
+
+def write_summary(
+    summary_path: Path,
+    *,
+    name: str,
+    screen_json: Path,
+    best: Dict[str, Any],
+    pareto_out: Path,
+    hv_out: Path,
+) -> None:
+    """Save a small summary linking screening + chosen Pareto episode + metrics."""
+    ensure_dir(summary_path.parent)
+    hv_metrics: Dict[str, Any] = {}
+    if hv_out.is_file():
+        with open(hv_out) as f:
+            hv = json.load(f)
+        hv_metrics = {
+            "hypervolume": hv.get("hypervolume"),
+            "spacing": hv.get("spacing"),
+            "spread": hv.get("spread"),
+            "delta": hv.get("delta"),
+            "front_size": len(hv.get("pareto_front", [])),
+        }
+
+    all_screen: List[Dict[str, Any]] = []
+    if screen_json.is_file():
+        with open(screen_json) as f:
+            all_screen = json.load(f)
+
+    summary = {
+        "experiment": name,
+        "screening": {
+            "file": str(screen_json),
+            "num_entries": len(all_screen),
+            "all_tests": [
+                {
+                    "path": r.get("path"),
+                    "acc_ratio": r.get("acc_ratio"),
+                    "deploy_cost": r.get("deploy_cost"),
+                    "w_accept": r.get("w_accept"),
+                    "w_cost": r.get("w_cost"),
+                }
+                for r in all_screen
+            ],
+        },
+        "selected_for_pareto": {
+            "path": best.get("path"),
+            "acc_ratio": best.get("acc_ratio"),
+            "deploy_cost": best.get("deploy_cost"),
+        },
+        "pareto_scan": str(pareto_out),
+        "hv_result": str(hv_out),
+        "metrics": hv_metrics,
+    }
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[SUMMARY] saved → {summary_path}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +303,7 @@ def iter_experiments(
     topologies: Iterable[str],
     allocations: Iterable[str],
     difficulties: Iterable[str],
-) -> List[tuple[str, str, str]]:
+) -> List[Tuple[str, str, str]]:
     return [
         (t, a, d)
         for t in topologies
@@ -200,8 +335,9 @@ def run_experiment(
     dry_run: bool,
 ) -> bool:
     """
-    Run one independent experiment.
-    Returns True on success (all requested stages OK), False otherwise.
+    One independent experiment:
+      train → generate 10 tests → screen AR/cost on all 10
+      → pick highest-AR episode → full Pareto + HV on that episode only.
     """
     name = f"{topology}_{allocation}_{difficulty}"
     tc = testcase_path(testcase_dir, topology, allocation, difficulty)
@@ -218,21 +354,19 @@ def run_experiment(
     csv_path = log_csv_path(log_root, topology, allocation, difficulty)
     out_test = test_out_dir(test_root, topology, allocation, difficulty)
     res_dir = result_dir(results_root, topology, allocation, difficulty)
-    pareto_out = res_dir / "pareto_front.json"
-    hv_out = res_dir / "hv_result.json"
 
-    # Ensure all output roots exist up front
-    ensure_dir(ckpt_root)
-    ensure_dir(log_root)
-    ensure_dir(test_root)
-    ensure_dir(results_root)
-    ensure_dir(out_test)
-    ensure_dir(res_dir)
+    screen_out = res_dir / "screen_ar_cost.json"       # all 10 tests, 1 weight
+    pareto_out = res_dir / "pareto_front.json"         # full Pareto on best AR
+    hv_out = res_dir / "hv_result.json"
+    summary_out = res_dir / "summary.json"
+
+    for d in (ckpt_root, log_root, test_root, results_root, out_test, res_dir):
+        ensure_dir(d)
 
     t0 = time.perf_counter()
     ok = True
 
-    # 1. Train
+    # ----- 1. Train -----
     if not skip_train:
         rc = train_one(
             train_file=tc,
@@ -249,10 +383,10 @@ def run_experiment(
             ok = False
     else:
         print(f"[SKIP train] {name}", flush=True)
-        if not ckpt.is_file() and not dry_run:
+        if not dry_run and not ckpt.is_file():
             print(f"[WARN] checkpoint missing: {ckpt}", flush=True)
 
-    # 2. Generate 10 test episodes
+    # ----- 2. Generate 10 test episodes -----
     if ok and not skip_generate:
         rc = generate_tests(
             topology_json=tc,
@@ -264,30 +398,70 @@ def run_experiment(
         if rc != 0:
             print(f"[FAIL] generate: {name}", flush=True)
             ok = False
-    else:
-        if skip_generate:
-            print(f"[SKIP generate] {name}", flush=True)
+    elif skip_generate:
+        print(f"[SKIP generate] {name}", flush=True)
 
-    # 3. Evaluate
+    # ----- 3–5. Screen all → pick best AR → Pareto on that episode -----
     if ok and not skip_evaluate:
         if not dry_run and not ckpt.is_file():
             print(f"[FAIL] no checkpoint for evaluate: {ckpt}", flush=True)
             ok = False
         else:
-            rc = evaluate_one(
+            # 3. Screen: AR + cost on all 10 (pareto-points=1)
+            print(f"[SCREEN] AR/cost on all episodes in {out_test}", flush=True)
+            rc = evaluate_screen_all(
                 checkpoint=ckpt,
                 data_dir=out_test,
-                pareto_out=pareto_out,
-                hv_out=hv_out,
-                pareto_points=pareto_points,
+                screen_out=screen_out,
                 dry_run=dry_run,
             )
             if rc != 0:
-                print(f"[FAIL] evaluate: {name}", flush=True)
+                print(f"[FAIL] screen: {name}", flush=True)
                 ok = False
-    else:
-        if skip_evaluate:
-            print(f"[SKIP evaluate] {name}", flush=True)
+            else:
+                # 4. Select highest-AR episode
+                if dry_run:
+                    best = {
+                        "path": str(out_test / "episode_0000.json"),
+                        "acc_ratio": 0.0,
+                        "deploy_cost": 0.0,
+                    }
+                    print(f"[DRY-RUN] would select best-AR episode from {screen_out}", flush=True)
+                else:
+                    best = select_best_ar_episode(screen_out)
+
+                if best is None:
+                    ok = False
+                else:
+                    # 5. Full Pareto only on the selected episode
+                    episode_path = Path(best["path"])
+                    print(
+                        f"[PARETO] full scan on best-AR episode "
+                        f"({pareto_points} weights): {episode_path}",
+                        flush=True,
+                    )
+                    rc = evaluate_pareto_single(
+                        checkpoint=ckpt,
+                        episode_path=episode_path,
+                        pareto_out=pareto_out,
+                        hv_out=hv_out,
+                        pareto_points=pareto_points,
+                        dry_run=dry_run,
+                    )
+                    if rc != 0:
+                        print(f"[FAIL] pareto: {name}", flush=True)
+                        ok = False
+                    elif not dry_run:
+                        write_summary(
+                            summary_out,
+                            name=name,
+                            screen_json=screen_out,
+                            best=best,
+                            pareto_out=pareto_out,
+                            hv_out=hv_out,
+                        )
+    elif skip_evaluate:
+        print(f"[SKIP evaluate] {name}", flush=True)
 
     elapsed = time.perf_counter() - t0
     status = "OK" if ok else "FAILED"
@@ -297,52 +471,39 @@ def run_experiment(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run HRL-VGAE independent experiments on Kaggle"
+        description="HRL-VGAE Kaggle runner: screen all tests by AR, Pareto on best only"
     )
-    # Paths (Kaggle-friendly defaults under /kaggle/working when present)
     default_root = Path("/kaggle/working") if Path("/kaggle/working").is_dir() else Path(".")
-    parser.add_argument("--testcase-dir", type=str, default="data/testcase",
-                        help="Directory of original testcase JSONs")
-    parser.add_argument("--test-root", type=str, default="data/test",
-                        help="Root for generated test episodes")
-    parser.add_argument("--results-root", type=str,
-                        default=str(default_root / "results"),
-                        help="Root for pareto_front.json / hv_result.json")
-    parser.add_argument("--ckpt-root", type=str,
-                        default=str(default_root / "checkpoints"),
-                        help="Directory for per-experiment checkpoints")
-    parser.add_argument("--log-root", type=str,
-                        default=str(default_root / "logs"),
-                        help="Directory for training CSVs")
 
-    # Grid filters
-    parser.add_argument("--topology", type=str, nargs="*", default=None,
-                        choices=list(TOPOLOGIES),
-                        help="Subset of topologies (default: all)")
-    parser.add_argument("--allocation", type=str, nargs="*", default=None,
-                        choices=list(ALLOCATIONS),
-                        help="Subset of allocations (default: all)")
-    parser.add_argument("--difficulty", type=str, nargs="*", default=None,
-                        choices=list(DIFFICULTIES),
-                        help="Subset of difficulties (default: all)")
+    parser.add_argument("--testcase-dir", type=str, default="data/testcase")
+    parser.add_argument("--test-root", type=str, default="data/test")
+    parser.add_argument("--results-root", type=str, default=str(default_root / "results"))
+    parser.add_argument("--ckpt-root", type=str, default=str(default_root / "checkpoints"))
+    parser.add_argument("--log-root", type=str, default=str(default_root / "logs"))
 
-    # Train / generate / evaluate hyperparams
+    parser.add_argument("--topology", type=str, nargs="*", default=None, choices=list(TOPOLOGIES))
+    parser.add_argument("--allocation", type=str, nargs="*", default=None, choices=list(ALLOCATIONS))
+    parser.add_argument("--difficulty", type=str, nargs="*", default=None, choices=list(DIFFICULTIES))
+
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--passes-per-file", type=int, default=5)
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--num-test-episodes", type=int, default=NUM_TEST_EPISODES)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--pareto-points", type=int, default=11)
+    parser.add_argument(
+        "--pareto-points",
+        type=int,
+        default=11,
+        help="Weight grid size for the BEST-AR episode only (default 11). "
+             "Screening of all 10 tests always uses 1 weight.",
+    )
     parser.add_argument("--pretrained-vgae", type=str, default="")
 
-    # Stage control
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--skip-generate", action="store_true")
     parser.add_argument("--skip-evaluate", action="store_true")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print commands only, do not execute")
-    parser.add_argument("--stop-on-error", action="store_true",
-                        help="Abort entire grid on first failed experiment")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--stop-on-error", action="store_true")
 
     args = parser.parse_args()
 
@@ -356,7 +517,6 @@ def main():
     ckpt_root = Path(args.ckpt_root)
     log_root = Path(args.log_root)
 
-    # Create roots once
     for d in (test_root, results_root, ckpt_root, log_root):
         ensure_dir(d)
 
@@ -364,6 +524,11 @@ def main():
     print(f"Scheduled experiments: {len(experiments)}", flush=True)
     for t, a, d in experiments:
         print(f"  - {t}_{a}_{d}", flush=True)
+    print(
+        f"Pipeline: train → generate {args.num_test_episodes} tests → "
+        f"screen AR/cost (all) → Pareto ({args.pareto_points} pts) on best-AR only",
+        flush=True,
+    )
 
     succeeded, failed, skipped = [], [], []
 
