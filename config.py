@@ -174,3 +174,11 @@ class Config:
         import math
 
         return max(1, math.ceil(self.sfc.arrival_rate / self.sfc.arrival_interval))
+
+    @property
+    def sfc_quota_per_timestep(self) -> int:
+        if self.train.max_sfc_per_timestep is not None:
+            return max(1, self.train.max_sfc_per_timestep)
+        import math
+
+        return max(1, math.ceil(self.sfc.arrival_rate / self.sfc.arrival_interval))

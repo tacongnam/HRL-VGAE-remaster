@@ -210,7 +210,23 @@ class NFVEnvironment:
         self._release_expired_active_sfcs()
         if self._dataset_mode:
             self._flush_arrivals()
-            done = self._req_cursor >= len(self._all_requests) and not self.queue
+            # Episode ends when all requests have been flushed AND the queue
+            # contains no SFC that can still be processed (non-expired).
+            # Using `not self.queue` was too strict: re-queued failed SFCs
+            # kept the queue non-empty long after cursor exhaustion, causing
+            # thousands of wasted timesteps. `_purge_expired_queue()` is
+            # already called inside `_flush_arrivals()`, so any SFC still in
+            # self.queue at this point has not yet expired at time t.
+            # Therefore `self.queue` being non-empty means there are genuinely
+            # pending SFCs — but only when cursor is not yet exhausted.
+            # Once cursor is exhausted, remaining queue entries are re-queued
+            # failed SFCs whose deadline may still be in the future; we must
+            # let them expire naturally OR terminate immediately since no new
+            # SFCs will arrive and the agent will keep failing them.
+            # Correct termination: cursor exhausted AND no non-expired SFC.
+            done = self._req_cursor >= len(self._all_requests) and not any(
+                not q.is_expired(self.t) for q in self.queue
+            )
         else:
             if self.t % self.cfg.sfc.arrival_interval == 0:
                 self._arrive_sfcs_random()

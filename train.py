@@ -216,6 +216,8 @@ def run_episode(
     graph_dirty = False
     z_nodes_cpu = z_nodes.cpu()
 
+    _sfc_count_this_step = 0
+
     while not done:
         if not env.queue:
             done = env.step_time()
@@ -545,9 +547,11 @@ def run_episode(
                 hl_loss_acc += hl_loss
                 hl_updates += 1
 
-        if env.queue:
+        _sfc_count_this_step += 1
+        if env.queue and _sfc_count_this_step < cfg.sfc_quota_per_timestep:
             continue
 
+        _sfc_count_this_step = 0
         done = env.step_time()
         if not done and graph_dirty:
             z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)

@@ -1,0 +1,2 @@
+episode,hl_reward,ll_reward,vgae_loss,hl_loss,ll_loss,accepted,rejected,acceptance_ratio,avg_hops,avg_link_util,avg_cpu_util,total_revenue,total_deploy_cost,epsilon,w_accept,w_cost
+1,-20.4772,-181.8951,79918.572266,0.0,0.0,54,2548,0.0208,2.0,0.0473,0.0296,1.9431,234376.9298,0.9608,1.0,0.0

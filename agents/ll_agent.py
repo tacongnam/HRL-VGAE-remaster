@@ -65,24 +65,27 @@ class LLAgent:
             return int(random.choice(valid_nodes))
 
         num_nodes = z_nodes.shape[0]
+        k = len(valid_nodes)
         self.q_net.eval()
         with torch.inference_mode():
-            zg_exp = z_global.unsqueeze(0).expand(num_nodes, -1)
-            zp_exp = z_prev_node.unsqueeze(0).expand(num_nodes, -1)
-            vf_exp = vnf_features.unsqueeze(0).expand(num_nodes, -1)
-            sf_exp = sfc_features.unsqueeze(0).expand(num_nodes, -1)
-            pw_exp = pareto_w.unsqueeze(0).expand(num_nodes, -1)
-            q_vecs = self.q_net(zg_exp, zp_exp, z_nodes, vf_exp, sf_exp, pw_exp)
-            q_np = q_vecs.cpu().numpy()
+            # Forward only the k valid nodes instead of all num_nodes.
+            # LLNodeScorer is row-independent, so q for valid_nodes[j] is
+            # identical whether computed from the full matrix or the slice.
+            z_valid = z_nodes[valid_nodes]  # [k, d_latent]
+            zg_exp = z_global.unsqueeze(0).expand(k, -1)
+            zp_exp = z_prev_node.unsqueeze(0).expand(k, -1)
+            vf_exp = vnf_features.unsqueeze(0).expand(k, -1)
+            sf_exp = sfc_features.unsqueeze(0).expand(k, -1)
+            pw_exp = pareto_w.unsqueeze(0).expand(k, -1)
+            q_vecs = self.q_net(zg_exp, zp_exp, z_valid, vf_exp, sf_exp, pw_exp)
+            q_np = q_vecs.cpu().numpy()  # [k, N_OBJ]
 
-        q_sets: List[List[np.ndarray]] = []
-        for i in range(num_nodes):
-            if cpu_mask[i]:
-                nd_set = non_dominated([q_np[i]])
-                nd_set = prune_by_hypervolume(nd_set, self._max_q_vecs, self._ref_point)
-                q_sets.append(nd_set)
-            else:
-                q_sets.append([])
+        # Build q_sets indexed by global node id; invalid nodes get empty list.
+        q_sets: List[List[np.ndarray]] = [[] for _ in range(num_nodes)]
+        for local_j, global_i in enumerate(valid_nodes):
+            nd_set = non_dominated([q_np[local_j]])
+            nd_set = prune_by_hypervolume(nd_set, self._max_q_vecs, self._ref_point)
+            q_sets[global_i] = nd_set
 
         chosen = select_by_hypervolume(
             q_sets, cpu_mask, self._ref_point, tie_break_rng=self._tie_rng
@@ -139,34 +142,43 @@ class LLAgent:
                     target_sets = [r_vec.copy()]
                 else:
                     nzg, nzp, n_all_z, nvf, nsf, n_mask, npw = ns
-                    n_all_z = n_all_z.to(self.device)
-                    num_nodes = n_all_z.shape[0]
-                    nzg_exp = nzg.unsqueeze(0).expand(num_nodes, -1).to(self.device)
-                    nzp_exp = nzp.unsqueeze(0).expand(num_nodes, -1).to(self.device)
-                    nvf_exp = nvf.unsqueeze(0).expand(num_nodes, -1).to(self.device)
-                    nsf_exp = nsf.unsqueeze(0).expand(num_nodes, -1).to(self.device)
-                    npw_exp = npw.unsqueeze(0).expand(num_nodes, -1).to(self.device)
 
-                    cand_q = self.target_net(
-                        nzg_exp, nzp_exp, n_all_z, nvf_exp, nsf_exp, npw_exp
-                    )
-                    cand_np = cand_q.cpu().numpy()
-
+                    # --- OPTIMIZATION: only forward valid (masked) nodes ---
                     mask_np = np.asarray(n_mask, dtype=bool)
-                    next_q_sets = [
-                        [cand_np[j]] if (j < len(mask_np) and mask_np[j]) else []
-                        for j in range(num_nodes)
-                    ]
-                    next_q_sets_valid = [qs for qs in next_q_sets if qs]
+                    valid_idx = np.where(mask_np)[0]
 
-                    target_sets = build_target_q_set(
-                        r_vec,
-                        next_q_sets_valid,
-                        self.cfg.qnet.gamma,
-                        self._max_q_vecs,
-                        self._ref_point,
-                        done=is_done,
-                    )
+                    if len(valid_idx) == 0:
+                        target_sets = [r_vec.copy()]
+                    else:
+                        # Slice to valid nodes only before expanding/forwarding.
+                        # LLNodeScorer processes each row independently (no
+                        # cross-node interaction), so slicing is mathematically
+                        # equivalent to forwarding all 104 rows then filtering.
+                        k = len(valid_idx)
+                        n_valid_z = n_all_z[valid_idx].to(self.device)  # [k, d_latent]
+
+                        nzg_exp = nzg.unsqueeze(0).expand(k, -1).to(self.device)
+                        nzp_exp = nzp.unsqueeze(0).expand(k, -1).to(self.device)
+                        nvf_exp = nvf.unsqueeze(0).expand(k, -1).to(self.device)
+                        nsf_exp = nsf.unsqueeze(0).expand(k, -1).to(self.device)
+                        npw_exp = npw.unsqueeze(0).expand(k, -1).to(self.device)
+
+                        cand_q = self.target_net(
+                            nzg_exp, nzp_exp, n_valid_z, nvf_exp, nsf_exp, npw_exp
+                        )  # [k, N_OBJ]
+                        cand_np = cand_q.cpu().numpy()
+
+                        # All k rows are valid by construction; no filter needed.
+                        next_q_sets_valid = [[cand_np[j]] for j in range(k)]
+
+                        target_sets = build_target_q_set(
+                            r_vec,
+                            next_q_sets_valid,
+                            self.cfg.qnet.gamma,
+                            self._max_q_vecs,
+                            self._ref_point,
+                            done=is_done,
+                        )
 
                 if target_sets:
                     rep = np.mean(target_sets, axis=0).astype(np.float32)
