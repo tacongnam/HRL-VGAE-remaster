@@ -92,8 +92,6 @@ class ParetoConfig:
         return np.array(
             [
                 self.hv_ref_cost,
-                self.hv_ref_delay,
-                self.hv_ref_balance,
                 self.hv_ref_success,
             ],
             dtype=np.float64,
@@ -103,8 +101,6 @@ class ParetoConfig:
         return np.array(
             [
                 -self.failure_penalty_cost,
-                -self.failure_penalty_delay,
-                -self.failure_penalty_balance,
                 -self.failure_penalty_success,
             ],
             dtype=np.float32,

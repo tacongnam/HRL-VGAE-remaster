@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from config import Config
 
-N_OBJ = 4
+N_OBJ = 2
 
 
 class LLNodeScorer(nn.Module):

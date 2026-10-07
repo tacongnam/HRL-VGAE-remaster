@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from config import Config
 
-N_OBJ_HL = 4
+N_OBJ_HL = 2
 
 
 class HLSharedQScorer(nn.Module):

@@ -63,10 +63,8 @@ def _compute_recon_loss_sampled(z_nodes, edge_index, num_nodes, neg_ratio, devic
     ) + F.binary_cross_entropy_with_logits(neg_score, torch.zeros_like(neg_score))
 
 
-def _build_reward_vec_4obj(
-    r_cost: float, r_delay: float, r_balance: float, r_success: float
-) -> np.ndarray:
-    return np.array([r_cost, r_delay, r_balance, r_success], dtype=np.float32)
+def _build_reward_vec_2obj(r_perf: float, r_cost: float) -> np.ndarray:
+    return np.array([r_perf, r_cost], dtype=np.float32)
 
 
 def load_pretrained_vgae(
@@ -217,6 +215,15 @@ def run_episode(
                 embedding_failed = True
                 break
 
+            state_record = (
+                z_global.cpu(),
+                z_prev.cpu(),
+                z_nodes_cpu[chosen_node],
+                vnf_feat.cpu(),
+                sfc_feat.cpu(),
+                pareto_w.cpu(),
+            )
+
             path = custom_dijkstra(
                 env.G,
                 curr_src,
@@ -227,6 +234,14 @@ def run_episode(
             )
             if path is None or env.G.nodes[chosen_node]["cpu_free"] < vnf.cpu_req:
                 embedding_failed = True
+                ll_records.append(
+                    {
+                        "state": state_record,
+                        "path_cost": 0.0,
+                        "path_delay": 0.0,
+                        "target_node": chosen_node,
+                    }
+                )
                 break
 
             env.allocate(chosen_node, path, vnf.cpu_req, selected_sfc.bandwidth)
@@ -236,14 +251,7 @@ def run_episode(
             p_cost, p_delay = compute_path_cost_delay(env.G, path)
             ll_records.append(
                 {
-                    "state": (
-                        z_global.cpu(),
-                        z_prev.cpu(),
-                        z_nodes_cpu[chosen_node],
-                        vnf_feat.cpu(),
-                        sfc_feat.cpu(),
-                        pareto_w.cpu(),
-                    ),
+                    "state": state_record,
                     "path_cost": p_cost,
                     "path_delay": p_delay,
                     "target_node": chosen_node,
@@ -339,10 +347,7 @@ def run_episode(
                 + cfg.reward.lambda_L * r_bar_quality
             )
             r_cost_c = -cfg.reward.mu_deploy_cost * deploy_cost
-            hl_reward_vec = _build_reward_vec_4obj(
-                r_cost_c, r_bar_quality, -load_std, 1.0
-            )
-
+            hl_reward_vec = _build_reward_vec_2obj(r_acc_c, r_cost_c)
             r_H = scalarizer.scalarize(r_acc_c, r_cost_c, w_accept, w_cost)
             scalarizer.update_utopia(r_acc_c, r_cost_c)
             ep_r_acc += r_acc_c
@@ -356,11 +361,8 @@ def run_episode(
                 cost_per_step = deploy_cost / n_steps
                 for k, cur_rec in enumerate(ll_records):
                     is_term = k == len(ll_records) - 1
-                    r_vec = _build_reward_vec_4obj(
-                        -cfg.reward.mu_deploy_cost * cost_per_step,
-                        cur_rec["r_quality"],
-                        -load_std,
-                        1.0 if is_term else 0.0,
+                    r_vec = _build_reward_vec_2obj(
+                        cur_rec["r_quality"], -cfg.reward.mu_deploy_cost * cost_per_step
                     )
                     next_s = (
                         None
