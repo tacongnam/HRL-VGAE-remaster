@@ -135,7 +135,7 @@ def run_episode(
     last_printed_t = None
 
     while not done:
-        if env.t != last_printed_t:
+        if env.t != last_printed_t and env.t % 10 == 0:
             print(f"[Timestep: {env.t}] Queue size: {len(env.queue)} | Active: {len(env.active_embeddings)}", flush=True)
             last_printed_t = env.t
 
