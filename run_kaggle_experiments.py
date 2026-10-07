@@ -4,7 +4,7 @@ Kaggle experiment runner for HRL-VGAE.
 Pipeline per testcase (independent experiment):
   1. Train on data/testcase/{topology}_{allocation}_{difficulty}.json
   2. Generate 10 test episodes → data/test/{topology}/{allocation}/{difficulty}/
-  3. Screen all 10 tests (1 weight) → AR + deploy_cost for each
+  3. Screen all 10 tests with checkpoint weights (--ar-cost-only) → AR + cost
   4. Select the episode with the highest AR
   5. Full Pareto scan ONLY on that episode → Hypervolume / Spacing / Spread
 
@@ -138,17 +138,16 @@ def evaluate_screen_all(
     dry_run: bool,
 ) -> int:
     """
-    Run all episodes in data_dir with a single weight (pareto-points=1).
+    Run all episodes once using weights from the checkpoint (no Pareto grid).
     Produces AR + deploy_cost per episode for ranking.
     """
     ensure_dir(screen_out.parent)
     cmd = [
         sys.executable, "evaluate.py",
-        "--pareto-scan",
+        "--ar-cost-only",
         "--checkpoint", str(checkpoint),
         "--data-dir", str(data_dir),
-        "--pareto-points", "1",
-        "--pareto-out", str(screen_out),
+        "--ar-cost-out", str(screen_out),
     ]
     return run_cmd(cmd, dry_run=dry_run)
 
@@ -336,7 +335,8 @@ def run_experiment(
 ) -> bool:
     """
     One independent experiment:
-      train → generate 10 tests → screen AR/cost on all 10
+      train → generate 10 tests
+      → screen AR/cost on all 10 (checkpoint weights via --ar-cost-only)
       → pick highest-AR episode → full Pareto + HV on that episode only.
     """
     name = f"{topology}_{allocation}_{difficulty}"
@@ -407,8 +407,11 @@ def run_experiment(
             print(f"[FAIL] no checkpoint for evaluate: {ckpt}", flush=True)
             ok = False
         else:
-            # 3. Screen: AR + cost on all 10 (pareto-points=1)
-            print(f"[SCREEN] AR/cost on all episodes in {out_test}", flush=True)
+            # 3. Screen: AR + cost on all 10 using checkpoint weights
+            print(
+                f"[SCREEN] AR/cost (checkpoint weights) on all episodes in {out_test}",
+                flush=True,
+            )
             rc = evaluate_screen_all(
                 checkpoint=ckpt,
                 data_dir=out_test,
@@ -485,8 +488,8 @@ def main():
     parser.add_argument("--allocation", type=str, nargs="*", default=None, choices=list(ALLOCATIONS))
     parser.add_argument("--difficulty", type=str, nargs="*", default=None, choices=list(DIFFICULTIES))
 
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--passes-per-file", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--passes-per-file", type=int, default=1)
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--num-test-episodes", type=int, default=NUM_TEST_EPISODES)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -495,7 +498,7 @@ def main():
         type=int,
         default=11,
         help="Weight grid size for the BEST-AR episode only (default 11). "
-             "Screening of all 10 tests always uses 1 weight.",
+             "Screening of all 10 tests uses checkpoint weights (--ar-cost-only).",
     )
     parser.add_argument("--pretrained-vgae", type=str, default="")
 
@@ -526,7 +529,7 @@ def main():
         print(f"  - {t}_{a}_{d}", flush=True)
     print(
         f"Pipeline: train → generate {args.num_test_episodes} tests → "
-        f"screen AR/cost (all) → Pareto ({args.pareto_points} pts) on best-AR only",
+        f"screen AR/cost (ckpt weights) → Pareto ({args.pareto_points} pts) on best-AR only",
         flush=True,
     )
 
