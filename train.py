@@ -1,27 +1,26 @@
 import argparse
 import random
 import time
-import os
+
 import numpy as np
 import torch
-import torch.optim as optim
 import torch.nn.functional as F
-from typing import Optional
+from torch import optim
 
+from agents import HLAgent, LLAgent
 from config import Config
+from data import discover_episodes, parse_episode
 from env import NFVEnvironment
 from models import MNVGAE
-from agents import HLAgent, LLAgent
 from utils import (
-    custom_dijkstra,
-    compute_path_cost_delay,
-    total_deploy_cost,
-    ParetoScalarizer,
-    ParetoArchive,
     MetricsTracker,
+    ParetoArchive,
+    ParetoScalarizer,
     TrainingLogger,
+    compute_path_cost_delay,
+    custom_dijkstra,
+    total_deploy_cost,
 )
-from data import discover_episodes, parse_episode
 
 
 def set_seeds(seed: int):
@@ -69,9 +68,9 @@ def _build_reward_vec_2obj(r_perf: float, r_cost: float) -> np.ndarray:
 
 def load_pretrained_vgae(
     vgae: MNVGAE, checkpoint_path: str, device: torch.device, cfg: Config = None
-) -> Optional[optim.Optimizer]:
+) -> optim.Optimizer | None:
     ckpt = torch.load(checkpoint_path, map_location=device)
-    state_dict = ckpt["vgae"] if "vgae" in ckpt else ckpt
+    state_dict = ckpt.get("vgae", ckpt)
     vgae.load_state_dict(state_dict)
 
     _STATIC_PREFIXES = ("gcn0.", "skip.", "gcn_mu.", "gcn_logvar.")
@@ -93,15 +92,15 @@ def run_episode(
     vgae: MNVGAE,
     hl_agent: HLAgent,
     ll_agent: LLAgent,
-    vgae_optimizer: Optional[optim.Optimizer],
+    vgae_optimizer: optim.Optimizer | None,
     scalarizer: ParetoScalarizer,
     cfg: Config,
     device: torch.device,
-    pareto_archive: Optional[ParetoArchive] = None,
-    tracker: Optional[MetricsTracker] = None,
+    pareto_archive: ParetoArchive | None = None,
+    tracker: MetricsTracker | None = None,
     train: bool = True,
     verbose: bool = False,
-    fixed_weight: Optional[tuple] = None,
+    fixed_weight: tuple | None = None,
 ) -> dict:
     ep_hl_r, ep_ll_r, ep_r_acc, ep_r_cost = 0.0, 0.0, 0.0, 0.0
     vgae_loss_acc, hl_loss_acc, ll_loss_acc = 0.0, 0.0, 0.0
@@ -132,10 +131,7 @@ def run_episode(
     while not done:
         if not env.queue:
             done = env.step_time()
-            if not done and (
-                graph_dirty
-                or (env._dataset_mode and env._req_cursor < len(env._all_requests))
-            ):
+            if not done and graph_dirty:
                 z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
                 z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
             continue
@@ -181,7 +177,7 @@ def run_episode(
         if hl_res is None:
             done = env.step_time()
             if not done and graph_dirty:
-                z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
+                z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)  # noqa: RUF059
                 z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
             continue
 
@@ -191,10 +187,10 @@ def run_episode(
         )
         ll_records, partial_allocations, embedding_failed = [], [], False
         curr_src = selected_sfc.source
-        ll_masks = [env.build_ll_mask(v.cpu_req) for v in selected_sfc.vnf_sequence]
 
         for i in range(selected_sfc.F_k):
             vnf = selected_sfc.vnf_sequence[i]
+            ll_mask_i = env.build_ll_mask(vnf.cpu_req)
             z_prev = z_nodes[curr_src].detach()
             vnf_feat = build_vnf_feature(vnf, cfg, device)
 
@@ -204,7 +200,7 @@ def run_episode(
                 z_nodes,
                 vnf_feat,
                 sfc_feat,
-                ll_masks[i],
+                ll_mask_i,
                 pareto_w,
                 current_source=curr_src,
                 G=env.G,
@@ -354,7 +350,7 @@ def run_episode(
                                 selected_sfc.vnf_sequence[k + 1], cfg, device
                             ).cpu(),
                             sfc_feat.cpu(),
-                            ll_masks[k + 1],
+                            env.build_ll_mask(selected_sfc.vnf_sequence[k + 1].cpu_req),
                             pareto_w.cpu(),
                         )
                     )
@@ -403,10 +399,9 @@ def run_episode(
 
         sfc_step_count += 1
         done = env.step_time() if not env.queue else done
-        if not env.queue:
-            if not done and graph_dirty:
-                z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
-                z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
+        if not env.queue and not done and graph_dirty:
+            z_nodes, z_global, x, ei, _mu, _logvar = encode_graph(vgae, env, device)
+            z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
 
     if pareto_archive is not None and env.accepted > 0:
         pareto_archive.add(
