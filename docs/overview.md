@@ -61,7 +61,8 @@ Hệ thống DRL-NFV giải quyết bài toán này bằng **học tăng cườn
 │                         │ path                              │
 │  ┌──────────────────────▼───────────────────────────────┐  │
 │  │  Commit / Rollback                                   │  │
-│  │  Thành công → chiếm CPU, băng thông, ghi nhận       │  │
+│  │  Thành công → chiếm CPU/RAM/HDD + băng thông        │  │
+│  │              và lên lịch giải phóng theo operation  │  │
 │  │  Thất bại   → hoàn trả tài nguyên                   │  │
 │  └──────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
@@ -78,24 +79,25 @@ Bước 1  Tại mỗi timestep t:
 
 Bước 2  HL Agent nhìn vào hàng đợi SFC
          Với mỗi SFC hợp lệ (chưa hết hạn):
-           tính Q-set = {q_vec ∈ ℝ⁴}
+           tính Q-set = {q_vec ∈ ℝ²}
          Chọn SFC có HyperVolume(Q-set) lớn nhất
 
 Bước 3  LL Agent đặt từng VNF (k = 1, 2, ..., K):
-         Với mỗi node còn đủ CPU:
-           tính Q-set = {q_vec ∈ ℝ⁴}
+         Với mỗi node còn đủ CPU (và đủ RAM/HDD nếu có yêu cầu):
+           tính Q-set = {q_vec ∈ ℝ²}
          Chọn node có HyperVolume(Q-set) lớn nhất
          Chạy Dijkstra từ node trước → node vừa chọn
 
 Bước 4  Sau khi đặt xong tất cả K VNF:
-         Nếu thành công → commit tài nguyên, nhận reward
-         Nếu thất bại (không đường đi, không đủ CPU)
-           → rollback tất cả, nhận failure penalty
+         Nếu thành công → commit tài nguyên (đưa sự kiện giải phóng
+                          từng operation vào min-heap `_op_heap`), nhận reward
+         Nếu thất bại (không đường đi, không đủ CPU/RAM/HDD)
+           → rollback tất cả, nhận failure penalty [-10, -10]
 
 Bước 5  Cập nhật replay buffer và huấn luyện các mạng
 ```
 
-Lưu ý về đồng hồ: trong `run_episode` (`train.py`), timestep `t` **không** tự tiến sau mỗi SFC — nó chỉ tiến (`env.step_time()`) khi hàng đợi rỗng hoặc mọi SFC còn lại đang bị `blocked_until`. VGAE cũng không encode lại sau mỗi VNF; nó dùng lại cache `z_nodes`/`z_global` cho tới khi `graph_dirty=True` và `step_time()` được gọi (xem `docs/vgae.md` mục 9).
+Lưu ý về đồng hồ: trong `run_episode` (`train.py`), timestep `t` **không** tự tiến sau mỗi SFC — nó chỉ tiến (`env.step_time()`) khi hàng đợi rỗng hoặc mọi SFC còn lại đang bị `blocked_until`. VGAE cũng không encode lại sau mỗi VNF; nó dùng lại cache `z_nodes`/`z_global` cho tới khi `graph_dirty=True` và `step_time()` được gọi (xem `docs/vgae.md` mục 9). Ngay khi `step_time()` chạy, `_release_expired_active_sfcs()` được gọi **trước tiên** để trả tài nguyên cho mọi operation đã hoàn thành — xem mục "Giải phóng tài nguyên theo từng operation" bên dưới.
 
 ---
 
@@ -103,11 +105,11 @@ Lưu ý về đồng hồ: trong `run_episode` (`train.py`), timestep `t` **khô
 
 | Thành phần | File | Vai trò |
 |---|---|---|
-| Môi trường mạng | `env/nfv_env.py` | Quản lý tài nguyên node/link, commit/rollback |
+| Môi trường mạng | `env/nfv_env.py` | Quản lý tài nguyên node (CPU/RAM/HDD) và link (băng thông), commit/rollback, giải phóng theo operation qua min-heap `_op_heap` |
 | Sinh đồ thị & SFC | `utils/graph_generator.py` | Barabási-Albert topology, SFC ngẫu nhiên |
 | Bộ mã hóa đồ thị | `models/vgae.py` | GCN + VAE + GRU temporal |
-| HL Q-network | `models/hl_scorer.py` | 4 output heads, input dim 73 (`cfg.d_hl_input`) |
-| LL Q-network | `models/ll_dqn.py` | 4 output heads, input dim 139 (`cfg.d_ll_input`) |
+| HL Q-network | `models/hl_scorer.py` | 2 output heads (`N_OBJ_HL = 2`), input dim 73 (`cfg.d_hl_input`) |
+| LL Q-network | `models/ll_dqn.py` | 2 output heads (`N_OBJ = 2`), input dim 139 (`cfg.d_ll_input`) |
 | HL Agent | `agents/hl_agent.py` | Q-set, HV selection, replay buffer |
 | LL Agent | `agents/ll_agent.py` | Q-set, HV selection, replay buffer |
 | Routing | `utils/dijkstra.py` | Custom Dijkstra với bandwidth penalty |
@@ -122,20 +124,76 @@ Lưu ý về đồng hồ: trong `run_episode` (`train.py`), timestep `t` **khô
 
 ---
 
-## Các mục tiêu tối ưu (4 objectives)
+## Các mục tiêu tối ưu (2 objectives)
 
-Hệ thống không tối ưu một chỉ số duy nhất mà cùng lúc tối ưu 4 mục tiêu, tất cả được định nghĩa theo hướng **maximize** (giá trị càng cao càng tốt). Vector này được `train.py` dựng qua `_build_reward_vec_4obj(r_cost, r_delay, r_balance, r_success)`:
+**[CẬP NHẬT]** Hệ thống cùng lúc tối ưu **2 mục tiêu**, không phải 4, tất cả theo hướng **maximize** (giá trị càng cao càng tốt). Vector này được `train.py` dựng qua `_build_reward_vec_2obj(r_perf, r_cost)`:
 
 | Index | Tên | Công thức thực tế trong `train.py` | Ý nghĩa |
 |---|---|---|---|
-| 0 | r_cost | `-cfg.reward.mu_deploy_cost * deploy_cost` (SFC thành công) hoặc thành phần tương ứng trong `cost_per_step` cho từng transition LL | Minimize chi phí triển khai |
-| 1 | r_delay | `r_bar_quality` = trung bình `-(α·path_cost + β·path_delay + γ_load·load_std)` trên các đoạn định tuyến | Minimize độ trễ và tắc nghẽn |
-| 2 | r_resource_balance | `-load_std` (độ lệch chuẩn mức sử dụng link toàn mạng) | Cân bằng tải giữa các link |
-| 3 | r_success | `1.0` nếu thành công, `0.0`/`-10` nếu không (transition trung gian LL = 0, thất bại = failure_vec) | Maximize tỷ lệ đặt thành công |
+| 0 | `r_acc_c` (HL) / `r_quality` (LL) | HL: `revenue + θ·urgency + λ_L·r̄_quality`, với `revenue = (μ_cpu·total_cpu + μ_bw·bw·(F_k+1))/F_k`; LL: `r_quality_k = −(α·path_cost + β·path_delay + γ_load·load_std)` | Maximize doanh thu + mức khẩn + chất lượng đường đi (giảm trễ/tắc nghẽn) |
+| 1 | `r_cost_c` | `-cfg.reward.mu_deploy_cost * deploy_cost` (SFC thành công) hoặc `-μ_deploy_cost * cost_per_step` cho từng transition LL, với `cost_per_step = deploy_cost / (F_k + 1)` | Minimize chi phí triển khai |
 
-Khi SFC/VNF thất bại, cả 4 thành phần dùng `cfg.pareto.failure_penalty_vector()` = `[-10, -10, -10, -10]` (mặc định `failure_penalty_* = 10.0`), không phải công thức trên.
+Khi SFC/VNF thất bại, cả 2 thành phần dùng `cfg.pareto.failure_penalty_vector()` = **`[-10, -10]`** (mặc định `failure_penalty_cost = failure_penalty_success = 10.0`), không phải công thức trên.
 
-Không có một "trả lời đúng duy nhất" cho 4 mục tiêu này vì chúng mâu thuẫn nhau (chấp nhận nhiều yêu cầu hơn thường kéo theo chi phí cao hơn). Hệ thống tìm **tập nghiệm Pareto** — tập các giải pháp mà không có giải pháp nào tốt hơn hoàn toàn một giải pháp khác. Việc chọn hành động (HL/LL) dùng **Hypervolume trên vector 4 chiều** này; riêng biến `r_H` (Chebyshev 2 chiều `[r_accept, r_cost]`) chỉ dùng để log/điều chỉnh `w_accept`, `w_cost` — không lan vào loss Q-network (chi tiết ở `docs/hrl.md` mục 7 và `docs/pareto.md`).
+**[CẬP NHẬT] Những gì đã thay đổi so với bản 4 mục tiêu:**
+
+- Số head của mỗi Q-network giảm từ 4 xuống **2**: `N_OBJ_HL = 2` (`models/hl_scorer.py`), `N_OBJ = 2` (`models/ll_dqn.py`).
+- `r̄_quality` **không còn** là mục tiêu độc lập — nó được gộp vào thành phần 0 qua `λ_L` ở tầng HL, và ở tầng LL nó **chính là** thành phần 0.
+- `−load_std` (cân bằng tải) **không còn** là mục tiêu riêng; `load_std` chỉ ảnh hưởng gián tiếp qua `r_quality_seg`.
+- Cờ `r_success = +1.0` **không còn** — tín hiệu "đặt thành công" chỉ còn mã hóa gián tiếp qua `r_acc_c > 0` và `done = 1.0`.
+- `ParetoConfig.hv_ref_delay`, `hv_ref_balance`, `failure_penalty_delay`, `failure_penalty_balance` trở thành **tham số chết** — `hv_reference_point()` chỉ đọc `hv_ref_cost`/`hv_ref_success`.
+- `compute_hypervolume`, `dominates`, `non_dominated_indices` trong `utils/pareto.py` giờ **chỉ đúng cho không gian 2 chiều** (hàm `_hv_wfg` phiên bản N-chiều đã bị xóa).
+
+Không có "trả lời đúng duy nhất" cho 2 mục tiêu này vì chúng mâu thuẫn nhau (chấp nhận nhiều yêu cầu hơn thường kéo theo chi phí cao hơn). Hệ thống tìm **tập nghiệm Pareto** — tập các giải pháp mà không có giải pháp nào tốt hơn hoàn toàn một giải pháp khác. Việc chọn hành động (HL/LL) dùng **Hypervolume trên vector 2 chiều** này; riêng biến `r_H` (Chebyshev 2 chiều `[r_acc_c, r_cost_c]`) chỉ dùng để log/điều chỉnh `w_accept`, `w_cost` — không lan vào loss Q-network (chi tiết ở `docs/hrl.md` mục 7 và `docs/pareto.md`).
+
+---
+
+## Các chế độ ablation
+
+**[BỔ SUNG]** `train.ablation_mode` (mặc định `"HRL-VGAE"`) chọn cách thay thế từng thành phần của pipeline bằng heuristic, để đo đóng góp riêng của DRL ở từng tầng. Chi tiết đầy đủ ở `docs/ABLATION.md`; bảng dưới đây là tổng quan kèm **căn cứ code** cho từng ô.
+
+| Ablation | Request selection | VNF placement | Routing |
+|---|---|---|---|
+| `DefaultBaseline` | By remaining time | Greedy, least-loaded server | Basic Dijkstra |
+| `Random-Fit` | Random request | DRL low-level policy | Weighted Dijkstra |
+| `GreedyFIFO` | Arrival order | DRL low-level policy | Weighted Dijkstra |
+| `GreedyLowLevel` | DRL high-level policy | Greedy, least-loaded server | Weighted Dijkstra |
+| `HRL-VGAE` | DRL high-level policy | DRL low-level policy | Weighted Dijkstra |
+
+**Căn cứ code cho từng cột:**
+
+| Cột | Nơi cài đặt | Logic thực tế |
+|---|---|---|
+| **Request selection** | `agents/hl_agent.py:89-98` (`HLAgent.select_sfc`) | `DefaultBaseline`: `min(valid, key=lambda i: queue[i].deadline − t)` — chọn SFC có **ít thời gian còn lại nhất** (tương đương EDF — earliest deadline first, vì `deadline − t` nhỏ nhất cũng là `deadline` nhỏ nhất). `Random-Fit`: `random.choice(valid)`. `GreedyFIFO`: `min(valid, key=lambda i: queue[i].arrival_time)` — **đến sớm nhất**. `GreedyLowLevel` và `HRL-VGAE`: đi vào nhánh DRL (ε-greedy + Q-network + HV). |
+| **VNF placement** | `agents/ll_agent.py:75-78` (`LLAgent.select_node`) | `DefaultBaseline` **và** `GreedyLowLevel`: `max(valid_nodes, key=lambda n: G.nodes[n].get("cpu_free", 0.0))` — node có **`cpu_free` lớn nhất** ("least-loaded" theo nghĩa tuyệt đối, không phải tỷ lệ %). Yêu cầu thêm `G is not None` (`train.py` luôn truyền `env.G`). Ba mode còn lại đi vào nhánh DRL. |
+| **Routing** | `train.py:232` (đoạn tới node VNF) và `train.py:283` (đoạn cuối tới `dest`) | `lambda_penalty` được đặt thành `0.0` **chỉ** ở `DefaultBaseline`, ngược lại `cfg.reward.lambda_penalty = 1.0`. Với `λ = 0` trọng số Dijkstra rơi về `w = delay` — "Basic Dijkstra". Ràng buộc cứng `bw_free ≥ req_bw` **vẫn được áp dụng** ở mọi mode. |
+
+**Ngoài ra, ablation còn tắt luôn việc huấn luyện của agent bị thay thế** (`train.py:410-420`):
+
+```python
+if sfc_total_count % cfg.train.train_interval_sfc == 0:
+    if cfg.train.ablation_mode in ["HRL-VGAE", "Random-Fit", "GreedyFIFO"]:
+        loss_ll = ll_agent.train_step()      # LL chỉ được train ở 3 mode này
+    if cfg.train.ablation_mode in ["HRL-VGAE", "GreedyLowLevel"]:
+        loss_hl = hl_agent.train_step()      # HL chỉ được train ở 2 mode này
+```
+
+Hệ quả: `DefaultBaseline` **không train cả HL lẫn LL**; `GreedyLowLevel` train HL nhưng không train LL; `Random-Fit`/`GreedyFIFO` train LL nhưng không train HL. Đây chính là nội dung `docs/ABLATION.md` mô tả là "Agents bypass DQN selection and training when their component is overridden by a greedy/random strategy".
+
+Chọn mode khi chạy: `--ablation <mode>` (cả `train.py` lẫn `evaluate.py`, `evaluate.py` khai báo `choices=["DefaultBaseline", "Random-Fit", "GreedyFIFO", "GreedyLowLevel", "HRL-VGAE"]`, mặc định `HRL-VGAE`).
+
+---
+
+## Giải phóng tài nguyên theo từng operation
+
+**[BỔ SUNG]** `env/nfv_env.py` giải phóng tài nguyên **theo từng operation** dựa trên **thời điểm hoàn thành thực**, chứ không phải khi SFC hết `deadline`. Cơ chế dùng một **min-heap** `_op_heap` chứa các tuple `(finish_time, counter, spec)` (`counter` để phá hoà và tránh `heapq` so sánh `spec`):
+
+- **Khi commit** — `commit_sfc(...)` gọi `_schedule_operation_releases(allocations, t, sfc)` để đẩy sự kiện vào heap, với mốc `t` **nhân dần dọc theo embedding**:
+  - `"link"`: `finish = t + Σ delay(link)` trên `path` → giải phóng `bw_free` cho **từng link** trên path (chỉ khi `len(path) > 1`).
+  - `"cpu"`: `finish = t + proc_delay[node] + VNF.delay_at(node)` → giải phóng `cpu_free`, `ram_free`, `hdd_free` của node (chỉ khi `cpu_req > 0`; đoạn cuối tới `dest` có `cpu_req = 0` nên chỉ sinh sự kiện `"link"`).
+- **Khi tiến thời gian** — `step_time()` gọi `_release_expired_active_sfcs()` **đầu tiên**, pop mọi phần tử có `finish_time <= t` và cộng trả tài nguyên tương ứng; nếu có thay đổi thì xóa `_load_std_cache`.
+
+**[BỔ SUNG] Hệ quả:** `deadline` chỉ còn là hạn phải được phục vụ. Một SFC thường **giải phóng tài nguyên sớm hơn hẳn deadline** vì `finish_serve` chỉ là `t + Σ(link delay) + Σ(proc_delay + VNF delay)` (cỡ vài chục đơn vị thời gian) trong khi `deadline ∈ [20, 100]`. Chi tiết ở `docs/hrl.md` mục 2.1.1 và `docs/pareto.md`.
 
 ---
 
@@ -180,7 +238,9 @@ lưu checkpoint sau khi hết toàn bộ epoch
 | `qnet.max_q_vectors_per_action` | 10 | Số vector tối đa trong Q-set |
 | `qnet.hl_buffer_size` | 15 000 | Replay buffer HL |
 | `qnet.ll_buffer_size` | 72 000 | Replay buffer LL |
-| `pareto.hv_ref_*` | -1.0 (×4) | Reference point cho HV |
+| `pareto.hv_ref_cost` / `pareto.hv_ref_success` | -25.0 | Hai thành phần của điểm tham chiếu HV 2 chiều (`hv_reference_point()`); `ref` của LL còn được thích nghi thêm qua `ll_ref_momentum`/`ll_ref_margin` |
+| `train.ablation_mode` | `"HRL-VGAE"` | Chế độ ablation (`DefaultBaseline`, `Random-Fit`, `GreedyFIFO`, `GreedyLowLevel`, `HRL-VGAE`) — xem mục "Các chế độ ablation" |
+| `train.k_hop_explore` | 3 | Bán kính giới hạn node khi LL chọn ngẫu nhiên trong ε-greedy |
 | `sfc.arrival_rate` | 20.0 | Tốc độ đến trung bình (Poisson), dùng ở chế độ ngẫu nhiên |
 | `sfc.arrival_interval` | 100 | Số timestep giữa các đợt arrival ở chế độ ngẫu nhiên |
 | `sfc.vnf_len_min/max` | 2–8 | Độ dài chuỗi VNF |
@@ -201,16 +261,22 @@ python train.py \
   --warmup-epochs 2 \
   --verbose
 
+# Chọn chế độ ablation (mặc định HRL-VGAE)
+python train.py --ablation GreedyFIFO
+python train.py --ablation DefaultBaseline
+
 # Evaluation
 python evaluate.py \
   --checkpoint vgae_hrl_ql_checkpoint.pt \
   --data-dir data/test1
 
+# Đánh giá từng chế độ ablation
+python evaluate.py --ablation GreedyLowLevel
+
 # Pareto front scan (11 weight points)
 python evaluate.py --pareto-scan --pareto-points 11
-
-# Unit tests (không cần GPU)
-python pareto_test.py
 ```
+
+**[CẬP NHẬT] `pareto_test.py` không còn tồn tại trong repo** — lệnh `python pareto_test.py` trong phiên bản trước của tài liệu này là nội dung lỗi thời (xác minh: `find . -name 'pareto_test.py'` không trả về kết quả). Không có bộ unit test nào cho `utils/pareto.py` hiện tại.
 
 `evaluate.py` mặc định đọc `--data-dir data/dataset_01/test` (không phải `data/test1` như ví dụ trên) và `--checkpoint vgae_hrl_ql_checkpoint.pt`; nếu thư mục dataset không tồn tại, nó tự chuyển sang chạy `args.episodes` (mặc định 20) episode ngẫu nhiên thay vì báo lỗi.

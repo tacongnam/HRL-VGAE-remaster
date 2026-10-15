@@ -10,6 +10,17 @@ from config import Config
 class VNF:
     vnf_id: int
     cpu_req: float
+    ram_req: float = 0.0
+    hdd_req: float = 0.0
+    delay_by_node: dict = field(default_factory=dict)
+
+    def delay_at(self, node: int) -> float:
+        dmap = self.delay_by_node
+        if not dmap:
+            return 0.0
+        if node in dmap:
+            return float(dmap[node])
+        return float(dmap.get(str(node), 0.0))
 
 
 @dataclass
@@ -62,10 +73,10 @@ def build_substrate_network(cfg: Config, rng: random.Random = None) -> nx.Graph:
         G.nodes[u]["cpu_total"] = nc.cpu_capacity_mips
         G.nodes[u]["cpu_free"] = nc.cpu_capacity_mips
         G.nodes[u]["is_function_node"] = u in fn_nodes
-        G.nodes[u]["cost_cpu"] = rng.uniform(0.5, 1.5)
-        G.nodes[u]["cost_ram"] = rng.uniform(0.5, 1.5)
-        G.nodes[u]["cost_stor"] = rng.uniform(0.5, 1.5)
-        G.nodes[u]["proc_delay"] = rng.uniform(0.5, 2.0) if u in fn_nodes else 0.0
+        G.nodes[u]["cost_cpu"] = rng.uniform(100.0, 200.0)
+        G.nodes[u]["cost_ram"] = rng.uniform(50.0, 100.0)
+        G.nodes[u]["cost_stor"] = rng.uniform(10.0, 30.0)
+        G.nodes[u]["proc_delay"] = rng.uniform(0.1, 0.5) if u in fn_nodes else 0.0
     for u, v in G.edges():
         bw = rng.uniform(nc.bw_min_mbps, nc.bw_max_mbps)
         delay = rng.uniform(nc.delay_min_ms, nc.delay_max_ms)
@@ -76,18 +87,30 @@ def build_substrate_network(cfg: Config, rng: random.Random = None) -> nx.Graph:
 
 
 def generate_sfc_requests(
-    cfg: Config, current_t: int, next_id_start: int, rng: random.Random = None
+    cfg: Config, current_t: int, next_id_start: int, G: nx.Graph, rng: random.Random = None
 ) -> List[SFCRequest]:
     if rng is None:
         rng = random.Random()
     sc = cfg.sfc
     nc = cfg.network
+
+    switch_nodes = [u for u, d in G.nodes(data=True) if not d.get("is_function_node", False)]
+    if len(switch_nodes) < 2:
+        switch_nodes = list(G.nodes())
+
     num_arrivals = np.random.poisson(sc.arrival_rate / sc.arrival_interval)
     requests = []
     for i in range(num_arrivals):
-        src, dst = rng.sample(range(nc.num_nodes), 2)
+        src, dst = rng.sample(switch_nodes, 2)
         F_k = rng.randint(sc.vnf_len_min, sc.vnf_len_max)
-        vnfs = [VNF(j, rng.uniform(sc.cpu_req_min, sc.cpu_req_max)) for j in range(F_k)]
+        vnfs = []
+        cpu_mean = (sc.cpu_req_min + sc.cpu_req_max) / 2.0
+        cpu_std = (sc.cpu_req_max - sc.cpu_req_min) / 2.0
+        for j in range(F_k):
+            vnf_id = rng.randint(0, 9)
+            if vnfs and vnfs[-1].vnf_id == vnf_id:
+                vnf_id = (vnf_id + 1) % 10
+            vnfs.append(VNF(vnf_id, max(0.0, rng.gauss(cpu_mean, cpu_std)), max(0.0, rng.gauss(cpu_mean, cpu_std)), max(0.0, rng.gauss(cpu_mean, cpu_std))))
         deadline = current_t + rng.randint(sc.deadline_min, sc.deadline_max)
         bw = rng.uniform(sc.bw_req_min, sc.bw_req_max)
         requests.append(

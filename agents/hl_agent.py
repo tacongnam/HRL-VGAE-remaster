@@ -85,6 +85,18 @@ class HLAgent:
         ]
         if not valid_indices:
             return None
+
+        mode = self.cfg.train.ablation_mode
+        if mode == "DefaultBaseline":
+            best_idx = min(valid_indices, key=lambda i: queue[i].deadline - t)
+            return best_idx, queue[best_idx]
+        elif mode == "Random-Fit":
+            chosen = random.choice(valid_indices)
+            return chosen, queue[chosen]
+        elif mode == "GreedyFIFO":
+            best_idx = min(valid_indices, key=lambda i: queue[i].arrival_time)
+            return best_idx, queue[best_idx]
+
         if random.random() < self.epsilon:
             chosen = random.choice(valid_indices)
             return chosen, queue[chosen]

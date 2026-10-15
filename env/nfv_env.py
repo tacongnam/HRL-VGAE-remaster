@@ -1,3 +1,4 @@
+import heapq
 import random
 from typing import Any, Dict, List, Optional, Tuple
 import networkx as nx
@@ -34,6 +35,9 @@ class NFVEnvironment:
         self.total_deploy_cost: float = 0.0
         self._load_std_cache: Optional[float] = None
         self._edge_index_cache: Optional[np.ndarray] = None
+        # P0: operation-level release heap
+        self._op_heap: list = []   # (finish_time, counter, spec)
+        self._op_counter: int = 0
 
     def reset(
         self,
@@ -50,6 +54,9 @@ class NFVEnvironment:
         self.active_embeddings = []
         self._load_std_cache = None
         self._edge_index_cache = None
+        # P0: reset operation heap
+        self._op_heap = []
+        self._op_counter = 0
         if G is not None and requests is not None:
             self._dataset_mode = True
             self.G = G.copy()
@@ -106,7 +113,7 @@ class NFVEnvironment:
             self.queue = valid
 
     def _arrive_sfcs_random(self):
-        new_sfcs = generate_sfc_requests(self.cfg, self.t, self.next_sfc_id, self.rng)
+        new_sfcs = generate_sfc_requests(self.cfg, self.t, self.next_sfc_id, self.G, self.rng)
         self.next_sfc_id += len(new_sfcs)
         self.queue.extend(new_sfcs)
         self._purge_expired_queue()
@@ -122,25 +129,119 @@ class NFVEnvironment:
                 valid.append(q)
         self.queue = valid
 
-    def _release_expired_active_sfcs(self):
-        if not self.active_embeddings:
-            return
-        still_active = []
-        changed = False
-        t = self.t
+    # ------------------------------------------------------------------
+    # P0: schedule per-operation resource releases into heap
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _unpack_alloc(item: Tuple):
+        node, path, cpu_req, bw = item[0], item[1], item[2], item[3]
+        ram_req = item[4] if len(item) > 4 else 0.0
+        hdd_req = item[5] if len(item) > 5 else 0.0
+        return node, path, cpu_req, bw, ram_req, hdd_req
+
+    def _schedule_operation_releases(
+        self, allocations: List[Tuple], t_start: float, sfc: Optional[SFCRequest] = None
+    ):
+        """Push per-operation finish events onto _op_heap.
+
+        For each (node, path, cpu_req, bw) in allocations:
+          1. RoutingOperation: finish = t_current + sum(link delays on path)
+             → schedule BW release for those links
+          2. ServingOperation (if cpu_req > 0): finish = t_after_routing
+             + proc_delay[node] + VNF d_f[node]
+             → schedule CPU/RAM/HDD release for that node
+        """
+        t = float(t_start)
         adj = self.G._adj
-        nodes = self.G.nodes
-        for active in self.active_embeddings:
-            if active["deadline"] <= t:
+        nodes_data = self.G.nodes
+        vnf_iter = iter(sfc.vnf_sequence) if sfc is not None else iter(())
+        for item in allocations:
+            node, path, cpu_req, bw, ram_req, hdd_req = self._unpack_alloc(item)
+            if len(path) > 1:
+                link_delay = sum(
+                    adj[path[i]][path[i + 1]].get("delay", 0.0)
+                    for i in range(len(path) - 1)
+                )
+                finish_route = t + link_delay
+                heapq.heappush(
+                    self._op_heap,
+                    (finish_route, self._op_counter, ("link", tuple(path), bw)),
+                )
+                self._op_counter += 1
+                t = finish_route
+            if cpu_req > 0.0:
+                proc = nodes_data[node].get("proc_delay", 0.0)
+                vnf_d = 0.0
+                try:
+                    vnf_d = next(vnf_iter).delay_at(node)
+                except StopIteration:
+                    pass
+                finish_serve = t + proc + vnf_d
+                heapq.heappush(
+                    self._op_heap,
+                    (
+                        finish_serve,
+                        self._op_counter,
+                        ("cpu", node, cpu_req, ram_req, hdd_req),
+                    ),
+                )
+                self._op_counter += 1
+                t = finish_serve
+
+    def compute_embedding_delay(
+        self, allocations: List[Tuple], sfc: Optional[SFCRequest] = None
+    ) -> float:
+        """Link delays + node proc_delay + VNF d_f along the embedding."""
+        total = 0.0
+        adj = self.G._adj
+        nodes_data = self.G.nodes
+        vnf_iter = iter(sfc.vnf_sequence) if sfc is not None else iter(())
+        for item in allocations:
+            node, path, cpu_req, _, _, _ = self._unpack_alloc(item)
+            for i in range(len(path) - 1):
+                total += adj[path[i]][path[i + 1]].get("delay", 0.0)
+            if cpu_req > 0.0:
+                total += nodes_data[node].get("proc_delay", 0.0)
+                try:
+                    total += next(vnf_iter).delay_at(node)
+                except StopIteration:
+                    pass
+        return total
+
+    def _release_expired_active_sfcs(self):
+        """Release resources for completed operations (P0: per-operation heap).
+
+        Also prune active_embeddings list for SFCs past their deadline.
+        """
+        t_float = float(self.t)
+        adj = self.G._adj
+        nodes_data = self.G.nodes
+        changed = False
+        while self._op_heap and self._op_heap[0][0] <= t_float:
+            _, _, spec = heapq.heappop(self._op_heap)
+            op_type = spec[0]
+            if op_type == "link":
+                _, path, bw = spec
+                for i in range(len(path) - 1):
+                    adj[path[i]][path[i + 1]]["bw_free"] += bw
                 changed = True
-                for node, path, cpu_req, bw in active["allocations"]:
-                    if cpu_req > 0.0:
-                        nodes[node]["cpu_free"] += cpu_req
-                    for i in range(len(path) - 1):
-                        adj[path[i]][path[i + 1]]["bw_free"] += bw
-            else:
-                still_active.append(active)
-        self.active_embeddings = still_active
+            elif op_type == "cpu":
+                node = spec[1]
+                cpu_req = spec[2]
+                ram_req = spec[3] if len(spec) > 3 else 0.0
+                hdd_req = spec[4] if len(spec) > 4 else 0.0
+                nd = nodes_data[node]
+                nd["cpu_free"] += cpu_req
+                if ram_req and "ram_free" in nd:
+                    nd["ram_free"] += ram_req
+                if hdd_req and "hdd_free" in nd:
+                    nd["hdd_free"] += hdd_req
+                changed = True
+        # Keep active_embeddings for lifecycle tracking (deadline-based)
+        self.active_embeddings = [
+            a for a in self.active_embeddings if a["deadline"] > self.t
+        ]
         if changed:
             self._load_std_cache = None
 
@@ -177,16 +278,38 @@ class NFVEnvironment:
             torch.from_numpy(obs["edge_index"]).to(device),
         )
 
-    def build_ll_mask(self, cpu_req: float) -> np.ndarray:
+    def build_ll_mask(
+        self, cpu_req: float, ram_req: float = 0.0, hdd_req: float = 0.0
+    ) -> np.ndarray:
         mask = np.zeros(self.G.number_of_nodes(), dtype=bool)
         for u, nd in self.G.nodes(data=True):
-            if nd.get("is_function_node", True) and nd["cpu_free"] >= cpu_req:
-                mask[u] = True
+            if not nd.get("is_function_node", True):
+                continue
+            if nd["cpu_free"] < cpu_req:
+                continue
+            if ram_req > 0.0 and nd.get("ram_free", float("inf")) < ram_req:
+                continue
+            if hdd_req > 0.0 and nd.get("hdd_free", float("inf")) < hdd_req:
+                continue
+            mask[u] = True
         return mask
 
-    def allocate(self, node: int, path: List[int], cpu_req: float, bw: float):
+    def allocate(
+        self,
+        node: int,
+        path: List[int],
+        cpu_req: float,
+        bw: float,
+        ram_req: float = 0.0,
+        hdd_req: float = 0.0,
+    ):
+        nd = self.G.nodes[node]
         if cpu_req > 0.0:
-            self.G.nodes[node]["cpu_free"] -= cpu_req
+            nd["cpu_free"] -= cpu_req
+            if ram_req and "ram_free" in nd:
+                nd["ram_free"] -= ram_req
+            if hdd_req and "hdd_free" in nd:
+                nd["hdd_free"] -= hdd_req
         adj = self.G._adj
         for i in range(len(path) - 1):
             adj[path[i]][path[i + 1]]["bw_free"] -= bw
@@ -198,9 +321,15 @@ class NFVEnvironment:
             return
         adj = self.G._adj
         nodes = self.G.nodes
-        for node, path, cpu_req, bw in allocations:
+        for item in allocations:
+            node, path, cpu_req, bw, ram_req, hdd_req = self._unpack_alloc(item)
             if cpu_req > 0.0:
-                nodes[node]["cpu_free"] += cpu_req
+                nd = nodes[node]
+                nd["cpu_free"] += cpu_req
+                if ram_req and "ram_free" in nd:
+                    nd["ram_free"] += ram_req
+                if hdd_req and "hdd_free" in nd:
+                    nd["hdd_free"] += hdd_req
             for i in range(len(path) - 1):
                 adj[path[i]][path[i + 1]]["bw_free"] += bw
         self._load_std_cache = None
@@ -219,6 +348,8 @@ class NFVEnvironment:
         self.accepted += 1
         self.total_attempted += 1
         self.total_deploy_cost += deploy_cost
+        # P0: schedule per-operation resource releases
+        self._schedule_operation_releases(allocations, float(self.t), sfc=sfc)
 
     def reject_sfc(
         self, sfc: SFCRequest, allocations: List[Tuple], requeue: bool = True

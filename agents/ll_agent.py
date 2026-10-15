@@ -71,6 +71,12 @@ class LLAgent:
         valid_nodes = np.flatnonzero(cpu_mask)
         if valid_nodes.size == 0:
             return None
+
+        mode = self.cfg.train.ablation_mode
+        if mode in ["DefaultBaseline", "GreedyLowLevel"] and G is not None:
+            best_node = max(valid_nodes, key=lambda n: G.nodes[n].get("cpu_free", 0.0))
+            return int(best_node)
+
         if random.random() < self.epsilon:
             if G is not None and current_source is not None and k_hop > 0:
                 try:

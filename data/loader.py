@@ -51,12 +51,15 @@ def parse_episode(path: str) -> Tuple[nx.Graph, List[SFCRequest], List[Dict], st
         is_server = bool(nd.get("server", False))
         cpu = float(nd["c_v"]) if is_server else 0.0
         ram = float(nd.get("r_v", 0)) if is_server else 0.0
+        hdd = float(nd.get("h_v", 0)) if is_server else 0.0
         G.add_node(
             uid,
             cpu_total=cpu,
             cpu_free=cpu,
             ram_total=ram,
             ram_free=ram,
+            hdd_total=hdd,
+            hdd_free=hdd,
             is_function_node=is_server,
             proc_delay=float(nd.get("d_v", 0.0)) if is_server else 0.0,
             cost_cpu=float(nd.get("cost_c", 1.0)) if is_server else 0.0,
@@ -72,15 +75,25 @@ def parse_episode(path: str) -> Tuple[nx.Graph, List[SFCRequest], List[Dict], st
     requests: List[SFCRequest] = []
     for idx, r in enumerate(R_raw):
         arrival = int(math.floor(r["T"]))
-        d_max = int(r["d_max"])
-        deadline = arrival + d_max
+        d_max = float(r["d_max"])
+        deadline = arrival + int(math.ceil(d_max))
         src = _node_id(r["st_r"])
         dst = _node_id(r["d_r"])
         bw = float(r["b_r"])
         vnf_seq: List[VNF] = []
         for fi, f_idx in enumerate(r["F_r"]):
             ftype = F_raw[f_idx]
-            vnf_seq.append(VNF(vnf_id=fi, cpu_req=float(ftype["c_f"])))
+            raw_df = ftype.get("d_f") or {}
+            delay_by_node = {_node_id(k): float(v) for k, v in raw_df.items()}
+            vnf_seq.append(
+                VNF(
+                    vnf_id=int(f_idx),
+                    cpu_req=float(ftype["c_f"]),
+                    ram_req=float(ftype.get("r_f", 0.0)),
+                    hdd_req=float(ftype.get("h_f", 0.0)),
+                    delay_by_node=delay_by_node,
+                )
+            )
         requests.append(
             SFCRequest(
                 sfc_id=idx,
@@ -185,12 +198,15 @@ def parse_topology(path: str) -> Tuple[nx.Graph, List[Dict], str]:
         is_server = bool(nd.get("server", False))
         cpu = float(nd["c_v"]) if is_server else 0.0
         ram = float(nd.get("r_v", 0)) if is_server else 0.0
+        hdd = float(nd.get("h_v", 0)) if is_server else 0.0
         G.add_node(
             uid,
             cpu_total=cpu,
             cpu_free=cpu,
             ram_total=ram,
             ram_free=ram,
+            hdd_total=hdd,
+            hdd_free=hdd,
             is_function_node=is_server,
             proc_delay=float(nd.get("d_v", 0.0)) if is_server else 0.0,
             cost_cpu=float(nd.get("cost_c", 1.0)) if is_server else 0.0,
@@ -218,7 +234,7 @@ def save_topology(path: str, G: nx.Graph, F_raw: List[Dict]):
                 "server": True,
                 "c_v": nd["cpu_total"],
                 "r_v": nd.get("ram_total", 0.0),
-                "h_v": 0.0,
+                "h_v": nd.get("hdd_total", 0.0),
                 "d_v": nd.get("proc_delay", 0.0),
                 "cost_c": nd.get("cost_cpu", 1.0),
                 "cost_r": nd.get("cost_ram", 1.0),

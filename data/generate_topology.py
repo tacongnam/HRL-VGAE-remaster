@@ -70,7 +70,8 @@ def _file_to_graph_nsf(node_csv: str, edge_txt: str) -> nx.Graph:
             if len(parts) < 2:
                 continue
             u, v = int(parts[0]), int(parts[1])
-            G.add_edge(u, v)
+            dist = float(parts[2]) if len(parts) >= 3 else 1.0
+            G.add_edge(u, v, distance=dist)
     return G
 
 
@@ -94,21 +95,25 @@ def _assign_network_attrs(
     G: nx.Graph,
     server_nodes: set,
     rng: random.Random,
-    bw_range=(80, 120),
+    bw_range=(30, 120),
     cpu_range=(30, 50),
     ram_range=(30, 50),
     cpu_cost_range=(100, 200),
     ram_cost_range=(50, 100),
     hdd_cost_range=(10, 30),
     delay_node_range=(0.1, 0.5),
+    hdd_range=(30, 50),
 ):
     """Assign resource capacities and costs to nodes and edges."""
-    max_dist = 1.0
-    # Try to use node positions for link delay (not always available)
     edges = list(G.edges())
+    dists = []
+    for u, v, d in G.edges(data=True):
+        dists.append(float(d.get("distance", 1.0)))
+    max_dist = max(dists) if dists else 1.0
     for u, v in edges:
         bw = rng.uniform(*bw_range)
-        dl = rng.uniform(0.01, 0.3)
+        dist = float(G[u][v].get("distance", 1.0))
+        dl = 0.3 * dist / max_dist
         G[u][v]["bw_total"] = bw
         G[u][v]["bw_free"] = bw
         G[u][v]["delay"] = dl
@@ -120,6 +125,8 @@ def _assign_network_attrs(
         G.nodes[u]["cpu_free"] = G.nodes[u]["cpu_total"]
         G.nodes[u]["ram_total"] = rng.uniform(*ram_range) if is_fn else 0.0
         G.nodes[u]["ram_free"] = G.nodes[u]["ram_total"]
+        G.nodes[u]["hdd_total"] = rng.uniform(*hdd_range) if is_fn else 0.0
+        G.nodes[u]["hdd_free"] = G.nodes[u]["hdd_total"]
         G.nodes[u]["proc_delay"] = rng.uniform(*delay_node_range) if is_fn else 0.0
         G.nodes[u]["cost_cpu"] = rng.uniform(*cpu_cost_range) if is_fn else 0.0
         G.nodes[u]["cost_ram"] = rng.uniform(*ram_cost_range) if is_fn else 0.0
@@ -132,14 +139,24 @@ def _generate_vnfs(
     vnf_types: int,
     rng: random.Random,
     cpu_range=(1, 5),
-    delay_range=(0.1, 1.0),
+    delay_range=(0.1, 0.5),
 ):
     """Generate VNF type catalog as list of dicts compatible with old/new JSON schema."""
     vnfs = []
+    limits = {
+        "cpu": max([G.nodes[u]["cpu_total"] for u in server_nodes]) if server_nodes else 1000.0,
+        "ram": max([G.nodes[u].get("ram_total", 0.0) for u in server_nodes]) if server_nodes else 1000.0,
+        "hdd": max([G.nodes[u].get("hdd_total", 0.0) for u in server_nodes]) if server_nodes else 1000.0,
+    }
+    cpu_mean = (cpu_range[0] + cpu_range[1]) / 2.0
+    cpu_std = (cpu_range[1] - cpu_range[0]) / 2.0
     for _ in range(vnf_types):
-        cpu = rng.uniform(*cpu_range)
-        ram = rng.uniform(*cpu_range)  # simplified: same range
-        hdd = rng.uniform(*cpu_range)
+        cpu = rng.gauss(cpu_mean, cpu_std)
+        cpu = max(0.0, min(cpu, limits["cpu"]))
+        ram = rng.gauss(cpu_mean, cpu_std)
+        ram = max(0.0, min(ram, limits["ram"]))
+        hdd = rng.gauss(cpu_mean, cpu_std)
+        hdd = max(0.0, min(hdd, limits["hdd"]))
         df = {str(u): rng.uniform(*delay_range) for u in server_nodes}
         vnfs.append({"c_f": cpu, "r_f": ram, "h_f": hdd, "d_f": df})
     return vnfs
@@ -155,7 +172,7 @@ def _graph_to_json(G: nx.Graph, F_raw: list) -> dict:
                 "server": True,
                 "c_v": nd["cpu_total"],
                 "r_v": nd.get("ram_total", 0.0),
-                "h_v": 0.0,
+                "h_v": nd.get("hdd_total", 0.0),
                 "d_v": nd.get("proc_delay", 0.0),
                 "cost_c": nd.get("cost_cpu", 1.0),
                 "cost_r": nd.get("cost_ram", 1.0),

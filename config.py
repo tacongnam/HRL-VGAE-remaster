@@ -124,6 +124,7 @@ class TrainConfig:
     max_sfc_per_timestep: Optional[int] = None
     train_interval_sfc: int = 4
     k_hop_explore: int = 3
+    ablation_mode: str = "HRL-VGAE"
 
 
 @dataclass

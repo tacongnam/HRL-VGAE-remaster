@@ -15,9 +15,11 @@ Difficulty: easy, normal, hard
 Usage:
   python run_kaggle_experiments.py
   python run_kaggle_experiments.py --topology nsf
-  python run_kaggle_experiments.py --topology nsf --allocation centers
+  python run_kaggle_experiments.py --topology nsf --allocation centers --difficulty easy
   python run_kaggle_experiments.py --topology nsf --allocation centers --difficulty hard
   python run_kaggle_experiments.py --skip-train --skip-generate
+  python run_kaggle_experiments.py --ablation GreedyLowLevel
+  python run_kaggle_experiments.py --ablation Random-Fit --topology nsf
 """
 
 from __future__ import annotations
@@ -38,8 +40,22 @@ TOPOLOGIES = ("nsf", "cogent", "conus")
 ALLOCATIONS = ("centers", "uniform", "rural", "urban")
 DIFFICULTIES = ("easy", "normal", "hard")
 
+# Ablation modes — keep in sync with the `choices` in train.py and evaluate.py.
+ABLATIONS = ("DefaultBaseline", "Random-Fit", "GreedyFIFO", "GreedyLowLevel", "HRL-VGAE")
+DEFAULT_ABLATION = "HRL-VGAE"
+
 NUM_TEST_EPISODES = 10
 DEFAULT_SEED = 42
+
+
+def ablation_suffix(ablation: str) -> str:
+    """Output-name suffix for non-default ablations.
+
+    The default ``HRL-VGAE`` keeps the historical paths (no suffix) so existing
+    results / checkpoints / logs remain valid. Every other mode gets ``_<ablation>``
+    appended so ablations never overwrite one another.
+    """
+    return "" if ablation == DEFAULT_ABLATION else f"_{ablation}"
 
 
 # ---------------------------------------------------------------------------
@@ -60,16 +76,34 @@ def test_out_dir(test_root: Path, topology: str, allocation: str, difficulty: st
     return test_root / topology / allocation / difficulty
 
 
-def result_dir(results_root: Path, topology: str, allocation: str, difficulty: str) -> Path:
-    return results_root / f"{topology}_{allocation}_{difficulty}"
+def result_dir(
+    results_root: Path,
+    topology: str,
+    allocation: str,
+    difficulty: str,
+    suffix: str = "",
+) -> Path:
+    return results_root / f"{topology}_{allocation}_{difficulty}{suffix}"
 
 
-def checkpoint_path(ckpt_root: Path, topology: str, allocation: str, difficulty: str) -> Path:
-    return ckpt_root / f"{topology}_{allocation}_{difficulty}.pt"
+def checkpoint_path(
+    ckpt_root: Path,
+    topology: str,
+    allocation: str,
+    difficulty: str,
+    suffix: str = "",
+) -> Path:
+    return ckpt_root / f"{topology}_{allocation}_{difficulty}{suffix}.pt"
 
 
-def log_csv_path(log_root: Path, topology: str, allocation: str, difficulty: str) -> Path:
-    return log_root / f"{topology}_{allocation}_{difficulty}.csv"
+def log_csv_path(
+    log_root: Path,
+    topology: str,
+    allocation: str,
+    difficulty: str,
+    suffix: str = "",
+) -> Path:
+    return log_root / f"{topology}_{allocation}_{difficulty}{suffix}.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +128,7 @@ def train_one(
     passes_per_file: int,
     warmup_epochs: int,
     pretrained_vgae: str,
+    ablation: str,
     dry_run: bool,
 ) -> int:
     ensure_dir(checkpoint.parent)
@@ -106,6 +141,7 @@ def train_one(
         "--epochs", str(epochs),
         "--passes-per-file", str(passes_per_file),
         "--warmup-epochs", str(warmup_epochs),
+        "--ablation", ablation,
     ]
     if pretrained_vgae:
         cmd.extend(["--pretrained-vgae", pretrained_vgae])
@@ -135,6 +171,7 @@ def evaluate_screen_all(
     checkpoint: Path,
     data_dir: Path,
     screen_out: Path,
+    ablation: str,
     dry_run: bool,
 ) -> int:
     """
@@ -148,6 +185,7 @@ def evaluate_screen_all(
         "--checkpoint", str(checkpoint),
         "--data-dir", str(data_dir),
         "--ar-cost-out", str(screen_out),
+        "--ablation", ablation,
     ]
     return run_cmd(cmd, dry_run=dry_run)
 
@@ -158,6 +196,7 @@ def evaluate_pareto_single(
     pareto_out: Path,
     hv_out: Path,
     pareto_points: int,
+    ablation: str,
     dry_run: bool,
 ) -> int:
     """Full Pareto scan on one episode only, then compute HV metrics."""
@@ -172,6 +211,7 @@ def evaluate_pareto_single(
         "--pareto-out", str(pareto_out),
         "--compute-hv",
         "--hv-out", str(hv_out),
+        "--ablation", ablation,
     ]
     return run_cmd(cmd, dry_run=dry_run)
 
@@ -328,6 +368,7 @@ def run_experiment(
     seed: int,
     pareto_points: int,
     pretrained_vgae: str,
+    ablation: str,
     skip_train: bool,
     skip_generate: bool,
     skip_evaluate: bool,
@@ -338,8 +379,12 @@ def run_experiment(
       train → generate 10 tests
       → screen AR/cost on all 10 (checkpoint weights via --ar-cost-only)
       → pick highest-AR episode → full Pareto + HV on that episode only.
+
+    `ablation` is shared by train.py and evaluate.py so both use the same mode.
+    Non-default ablations get a `_<ablation>` suffix on checkpoint/csv/results.
     """
-    name = f"{topology}_{allocation}_{difficulty}"
+    suffix = ablation_suffix(ablation)
+    name = f"{topology}_{allocation}_{difficulty}{suffix}"
     tc = testcase_path(testcase_dir, topology, allocation, difficulty)
 
     if not tc.is_file():
@@ -347,13 +392,13 @@ def run_experiment(
         return False
 
     print(f"\n{'=' * 60}", flush=True)
-    print(f" EXPERIMENT: {name}", flush=True)
+    print(f" EXPERIMENT: {name}  [ablation={ablation}]", flush=True)
     print(f"{'=' * 60}", flush=True)
 
-    ckpt = checkpoint_path(ckpt_root, topology, allocation, difficulty)
-    csv_path = log_csv_path(log_root, topology, allocation, difficulty)
+    ckpt = checkpoint_path(ckpt_root, topology, allocation, difficulty, suffix)
+    csv_path = log_csv_path(log_root, topology, allocation, difficulty, suffix)
     out_test = test_out_dir(test_root, topology, allocation, difficulty)
-    res_dir = result_dir(results_root, topology, allocation, difficulty)
+    res_dir = result_dir(results_root, topology, allocation, difficulty, suffix)
 
     screen_out = res_dir / "screen_ar_cost.json"       # all 10 tests, 1 weight
     pareto_out = res_dir / "pareto_front.json"         # full Pareto on best AR
@@ -376,6 +421,7 @@ def run_experiment(
             passes_per_file=passes_per_file,
             warmup_epochs=warmup_epochs,
             pretrained_vgae=pretrained_vgae,
+            ablation=ablation,
             dry_run=dry_run,
         )
         if rc != 0:
@@ -416,6 +462,7 @@ def run_experiment(
                 checkpoint=ckpt,
                 data_dir=out_test,
                 screen_out=screen_out,
+                ablation=ablation,
                 dry_run=dry_run,
             )
             if rc != 0:
@@ -449,6 +496,7 @@ def run_experiment(
                         pareto_out=pareto_out,
                         hv_out=hv_out,
                         pareto_points=pareto_points,
+                        ablation=ablation,
                         dry_run=dry_run,
                     )
                     if rc != 0:
@@ -501,6 +549,14 @@ def main():
              "Screening of all 10 tests uses checkpoint weights (--ar-cost-only).",
     )
     parser.add_argument("--pretrained-vgae", type=str, default="")
+    parser.add_argument(
+        "--ablation",
+        type=str,
+        default=DEFAULT_ABLATION,
+        choices=list(ABLATIONS),
+        help="Ablation mode shared by train.py and evaluate.py (default HRL-VGAE). "
+             "Non-default modes get a '_<ablation>' suffix on checkpoint/csv/results.",
+    )
 
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--skip-generate", action="store_true")
@@ -532,6 +588,7 @@ def main():
         f"screen AR/cost (ckpt weights) → Pareto ({args.pareto_points} pts) on best-AR only",
         flush=True,
     )
+    print(f"Ablation: {args.ablation}", flush=True)
 
     succeeded, failed, skipped = [], [], []
 
@@ -556,12 +613,13 @@ def main():
             seed=args.seed,
             pareto_points=args.pareto_points,
             pretrained_vgae=args.pretrained_vgae,
+            ablation=args.ablation,
             skip_train=args.skip_train,
             skip_generate=args.skip_generate,
             skip_evaluate=args.skip_evaluate,
             dry_run=args.dry_run,
         )
-        name = f"{topology}_{allocation}_{difficulty}"
+        name = f"{topology}_{allocation}_{difficulty}{ablation_suffix(args.ablation)}"
         if ok:
             succeeded.append(name)
         else:

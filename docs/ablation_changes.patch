@@ -1,0 +1,139 @@
+--- config.py
++++ config.py
+@@ -58,6 +58,7 @@
+         max_sfc_per_timestep: Optional[int] = None
+         train_interval_sfc: int = 4
+         k_hop_explore: int = 3
++        ablation_mode: str = "HRL-VGAE"
+ 
+ 
+ @dataclass
+--- hl_agent.py
++++ hl_agent.py
+@@ -87,6 +87,16 @@
+         ]
+         if not valid_indices:
+             return None
++
++        mode = self.cfg.train.ablation_mode
++        if mode == "DefaultBaseline":
++            best_idx = min(valid_indices, key=lambda i: queue[i].deadline - t)
++            return best_idx, queue[best_idx]
++        elif mode == "Random-Fit":
++            chosen = random.choice(valid_indices)
++            return chosen, queue[chosen]
++        elif mode == "GreedyFIFO":
++            best_idx = min(valid_indices, key=lambda i: queue[i].arrival_time)
++            return best_idx, queue[best_idx]
++
+         if random.random() < self.epsilon:
+             chosen = random.choice(valid_indices)
+             return chosen, queue[chosen]
+--- ll_agent.py
++++ ll_agent.py
+@@ -74,6 +74,11 @@
+         valid_nodes = np.flatnonzero(cpu_mask)
+         if valid_nodes.size == 0:
+             return None
++
++        mode = self.cfg.train.ablation_mode
++        if mode in ["DefaultBaseline", "GreedyLowLevel"] and G is not None:
++            best_node = max(valid_nodes, key=lambda n: G.nodes[n].get("cpu_free", 0.0))
++            return int(best_node)
++
+         if random.random() < self.epsilon:
+             if G is not None and current_source is not None and k_hop > 0:
+                 try:
+--- train.py
++++ train.py
+@@ -148,7 +148,7 @@
+                 chosen_node,
+                 selected_sfc.bandwidth,
+                 cfg.reward.omega_bw,
+-                cfg.reward.lambda_penalty,
++                0.0 if cfg.train.ablation_mode == "DefaultBaseline" else cfg.reward.lambda_penalty,
+             )
+             if path is None or env.G.nodes[chosen_node]["cpu_free"] < vnf.cpu_req:
+                 embedding_failed = True
+@@ -197,7 +197,7 @@
+                     selected_sfc.dest,
+                     selected_sfc.bandwidth,
+                     cfg.reward.omega_bw,
+-                    cfg.reward.lambda_penalty,
++                    0.0 if cfg.train.ablation_mode == "DefaultBaseline" else cfg.reward.lambda_penalty,
+                 )
+                 if dest_path is None:
+                     embedding_failed = True
+@@ -298,12 +298,14 @@
+ 
+         if train and (sfc_total_count % cfg.train.train_interval_sfc == 0):
+-            loss_ll = ll_agent.train_step()
+-            if loss_ll is not None:
+-                ll_loss_acc += loss_ll
+-                ll_updates += 1
+-            loss_hl = hl_agent.train_step()
+-            if loss_hl is not None:
+-                hl_loss_acc += loss_hl
+-                hl_updates += 1
++            if cfg.train.ablation_mode in ["HRL-VGAE", "Random-Fit", "GreedyFIFO"]:
++                loss_ll = ll_agent.train_step()
++                if loss_ll is not None:
++                    ll_loss_acc += loss_ll
++                    ll_updates += 1
++            if cfg.train.ablation_mode in ["HRL-VGAE", "GreedyLowLevel"]:
++                loss_hl = hl_agent.train_step()
++                if loss_hl is not None:
++                    hl_loss_acc += loss_hl
++                    hl_updates += 1
+ 
+@@ -432,6 +434,7 @@
+     parser.add_argument("--archive-size", type=int, default=200)
+     parser.add_argument("--train-file", type=str, default="")
+     parser.add_argument("--pretrained-vgae", type=str, default="")
++    parser.add_argument("--ablation", type=str, default="HRL-VGAE", choices=["DefaultBaseline", "Random-Fit", "GreedyFIFO", "GreedyLowLevel", "HRL-VGAE"])
+     args = parser.parse_args()
+ 
+     cfg = Config()
++    cfg.train.ablation_mode = args.ablation
+     set_seeds(cfg.train.seed)
+     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+--- evaluate.py
++++ evaluate.py
+@@ -102,6 +102,7 @@
+     from train import run_episode
+ 
+     cfg = Config()
++    cfg.train.ablation_mode = args.ablation
+     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+     vgae, hl_agent, ll_agent, scalarizer = _load_checkpoint(
+@@ -166,6 +167,7 @@
+     from train import run_episode
+ 
+     cfg = Config()
++    cfg.train.ablation_mode = args.ablation
+     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+     vgae, hl_agent, ll_agent, scalarizer = _load_checkpoint(
+@@ -254,6 +256,7 @@
+     parser.add_argument("--compute-hv", action="store_true")
+     parser.add_argument("--hv-out", type=str, default="hv_result.json")
+     parser.add_argument("--hv-eps", type=float, default=1e-2)
++    parser.add_argument("--ablation", type=str, default="HRL-VGAE", choices=["DefaultBaseline", "Random-Fit", "GreedyFIFO", "GreedyLowLevel", "HRL-VGAE"])
+     args = parser.parse_args()
+ 
+     if args.ar_cost_only:
+--- /dev/null
++++ ABLATION.md
+@@ -0,0 +1,12 @@
++# Ablation Study Configurations
++
++| Ablation | Request selection | VNF placement | Routing |
++|---|---|---|---|
++| `DefaultBaseline` | By remaining time | Greedy, least-loaded server | Basic Dijkstra |
++| `Random-Fit` | Random request | DRL low-level policy | Weighted Dijkstra |
++| `GreedyFIFO` | Arrival order | DRL low-level policy | Weighted Dijkstra |
++| `GreedyLowLevel` | DRL high-level policy | Greedy, least-loaded server | Weighted Dijkstra |
++| `HRL-VGAE` | DRL high-level policy | DRL low-level policy | Weighted Dijkstra |
++
++Implementation details:
++- DefaultBaseline: Basic Dijkstra ignores link utilization penalties (`lambda_p = 0.0`).
++- Agents bypass DQN selection and training when their component is overridden by a greedy/random strategy.

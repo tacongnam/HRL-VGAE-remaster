@@ -149,6 +149,7 @@ def _eval_ar_cost(args):
     from train import run_episode
 
     cfg = Config()
+    cfg.train.ablation_mode = args.ablation
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vgae, hl_agent, ll_agent, scalarizer = _load_checkpoint(
         args.checkpoint, cfg, device
@@ -222,6 +223,7 @@ def _scan_pareto(args):
     from train import run_episode
 
     cfg = Config()
+    cfg.train.ablation_mode = args.ablation
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vgae, hl_agent, ll_agent, scalarizer = _load_checkpoint(
         args.checkpoint, cfg, device
@@ -308,6 +310,7 @@ def main():
     parser.add_argument("--compute-hv", action="store_true")
     parser.add_argument("--hv-out", type=str, default="hv_result.json")
     parser.add_argument("--hv-eps", type=float, default=1e-2)
+    parser.add_argument("--ablation", type=str, default="HRL-VGAE", choices=["DefaultBaseline", "Random-Fit", "GreedyFIFO", "GreedyLowLevel", "HRL-VGAE"])
     args = parser.parse_args()
 
     if args.ar_cost_only:

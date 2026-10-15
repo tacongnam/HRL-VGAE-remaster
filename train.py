@@ -135,9 +135,9 @@ def run_episode(
     last_printed_t = None
 
     while not done:
-        if env.t != last_printed_t and env.t % 25 == 0:
-            print(f"[Timestep: {env.t}] Queue size: {len(env.queue)} | Active: {len(env.active_embeddings)}", flush=True)
-            last_printed_t = env.t
+#        if env.t != last_printed_t and env.t % 25 == 0:
+#            print(f"[Timestep: {env.t}] Queue size: {len(env.queue)} | Active: {len(env.active_embeddings)}", flush=True)
+#            last_printed_t = env.t
 
         if not env.queue:
             done = env.step_time()
@@ -193,7 +193,7 @@ def run_episode(
 
         for i in range(selected_sfc.F_k):
             vnf = selected_sfc.vnf_sequence[i]
-            ll_mask_i = env.build_ll_mask(vnf.cpu_req)
+            ll_mask_i = env.build_ll_mask(vnf.cpu_req, vnf.ram_req, vnf.hdd_req)
             z_prev = z_nodes[curr_src].detach()
             vnf_feat = build_vnf_feature(vnf, cfg, device)
 
@@ -229,7 +229,7 @@ def run_episode(
                 chosen_node,
                 selected_sfc.bandwidth,
                 cfg.reward.omega_bw,
-                cfg.reward.lambda_penalty,
+                0.0 if cfg.train.ablation_mode == "DefaultBaseline" else cfg.reward.lambda_penalty,
             )
             if path is None or env.G.nodes[chosen_node]["cpu_free"] < vnf.cpu_req:
                 embedding_failed = True
@@ -243,8 +243,24 @@ def run_episode(
                 )
                 break
 
-            env.allocate(chosen_node, path, vnf.cpu_req, selected_sfc.bandwidth)
-            partial_allocations.append((chosen_node, path, vnf.cpu_req, selected_sfc.bandwidth))
+            env.allocate(
+                chosen_node,
+                path,
+                vnf.cpu_req,
+                selected_sfc.bandwidth,
+                ram_req=vnf.ram_req,
+                hdd_req=vnf.hdd_req,
+            )
+            partial_allocations.append(
+                (
+                    chosen_node,
+                    path,
+                    vnf.cpu_req,
+                    selected_sfc.bandwidth,
+                    vnf.ram_req,
+                    vnf.hdd_req,
+                )
+            )
             p_cost, p_delay = compute_path_cost_delay(env.G, path)
             ll_records.append(
                 {
@@ -264,7 +280,7 @@ def run_episode(
                 selected_sfc.dest,
                 selected_sfc.bandwidth,
                 cfg.reward.omega_bw,
-                cfg.reward.lambda_penalty,
+                0.0 if cfg.train.ablation_mode == "DefaultBaseline" else cfg.reward.lambda_penalty,
             )
             if dest_path is None:
                 embedding_failed = True
@@ -274,6 +290,12 @@ def run_episode(
                     (selected_sfc.dest, dest_path, 0.0, selected_sfc.bandwidth)
                 )
                 dest_cost, dest_delay = compute_path_cost_delay(env.G, dest_path)
+            if not embedding_failed:
+                total_delay = env.compute_embedding_delay(
+                    partial_allocations, selected_sfc
+                )
+                if float(env.t) + total_delay > selected_sfc.deadline:
+                    embedding_failed = True
 
         sfc_total_count += 1
 
@@ -349,7 +371,11 @@ def run_episode(
                             z_nodes_cpu,
                             build_vnf_feature(selected_sfc.vnf_sequence[k + 1], cfg, device).cpu(),
                             sfc_feat.cpu(),
-                            env.build_ll_mask(selected_sfc.vnf_sequence[k + 1].cpu_req),
+                            env.build_ll_mask(
+                                selected_sfc.vnf_sequence[k + 1].cpu_req,
+                                selected_sfc.vnf_sequence[k + 1].ram_req,
+                                selected_sfc.vnf_sequence[k + 1].hdd_req,
+                            ),
                             pareto_w.cpu(),
                         )
                     )
@@ -382,14 +408,16 @@ def run_episode(
             )
 
         if train and (sfc_total_count % cfg.train.train_interval_sfc == 0):
-            loss_ll = ll_agent.train_step()
-            if loss_ll is not None:
-                ll_loss_acc += loss_ll
-                ll_updates += 1
-            loss_hl = hl_agent.train_step()
-            if loss_hl is not None:
-                hl_loss_acc += loss_hl
-                hl_updates += 1
+            if cfg.train.ablation_mode in ["HRL-VGAE", "Random-Fit", "GreedyFIFO"]:
+                loss_ll = ll_agent.train_step()
+                if loss_ll is not None:
+                    ll_loss_acc += loss_ll
+                    ll_updates += 1
+            if cfg.train.ablation_mode in ["HRL-VGAE", "GreedyLowLevel"]:
+                loss_hl = hl_agent.train_step()
+                if loss_hl is not None:
+                    hl_loss_acc += loss_hl
+                    hl_updates += 1
 
         sfc_step_count += 1
         done = env.step_time() if not env.queue else done
@@ -444,16 +472,18 @@ def main():
     parser.add_argument("--checkpoint", type=str, default="vgae_hrl_ql_checkpoint.pt")
     parser.add_argument("--log-dir", type=str, default="runs")
     parser.add_argument("--csv", type=str, default="training_log.csv")
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--passes-per-file", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--passes-per-file", type=int, default=1)
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--archive-size", type=int, default=200)
     parser.add_argument("--train-file", type=str, default="")
     parser.add_argument("--pretrained-vgae", type=str, default="")
+    parser.add_argument("--ablation", type=str, default="HRL-VGAE", choices=["DefaultBaseline", "Random-Fit", "GreedyFIFO", "GreedyLowLevel", "HRL-VGAE"])
     args = parser.parse_args()
 
     cfg = Config()
+    cfg.train.ablation_mode = args.ablation
     set_seeds(cfg.train.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

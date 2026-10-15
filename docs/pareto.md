@@ -1,6 +1,12 @@
 # DRL đa mục tiêu: Q-learning vector, Pareto và Hypervolume
 
-> **Ghi chú xác thực (checkpoint rà soát):** Toàn bộ nội dung dưới đây đã được đối chiếu với source thật `utils/pareto.py`, `train.py`, `agents/hl_agent.py`, `agents/ll_agent.py`, `models/hl_scorer.py`, `models/ll_dqn.py`, `utils/dijkstra.py`, `utils/deploy_cost.py`, `env/nfv_env.py`. Các công thức, bug `_hv_wfg`, và mô tả luồng transition đều khớp code thực tế; các sửa/bổ sung được đánh dấu **[SỬA]** hoặc **[BỔ SUNG]** inline.
+> **Ghi chú xác thực (checkpoint rà soát):** Toàn bộ nội dung dưới đây đã được đối chiếu với source thật `utils/pareto.py`, `train.py`, `agents/hl_agent.py`, `agents/ll_agent.py`, `models/hl_scorer.py`, `models/ll_dqn.py`, `utils/dijkstra.py`, `utils/deploy_cost.py`, `env/nfv_env.py`, `config.py`.
+>
+> **[CẬP NHẬT — 2 objectives]** Kiến trúc hiện tại dùng **2 mục tiêu**, không phải 4: `N_OBJ_HL = 2` (`models/hl_scorer.py`), `N_OBJ = 2` (`models/ll_dqn.py`), và `train.py::_build_reward_vec_2obj(r_perf, r_cost)` trả về `np.array([r_perf, r_cost])`. Ở tầng HL hai thành phần là `r_acc_c` (thành phần chấp nhận) và `r_cost_c` (chi phí triển khai); ở tầng LL là `r_quality` và `−μ_deploy_cost × cost_per_step`.
+>
+> **[CẬP NHẬT — bỏ WFG]** Hàm `_hv_wfg` **không còn tồn tại** trong `utils/pareto.py` (đã xác minh: `grep -rn 'hv_wfg' --include='*.py'` không có kết quả). `compute_hypervolume` hiện chỉ xử lý không gian **2 chiều**: lọc `(pts[:,0] > ref[0]) & (pts[:,1] > ref[1])` rồi gọi `_hv_2d`. `dominates` và `non_dominated_indices` cũng được viết cứng cho 2 chiều (lexsort trên 2 cột). Mọi nội dung về "3 mục tiêu trở lên", nhánh `_hv_wfg`, và lỗi lát cắt của `_hv_wfg` (mục 4.3 phiên bản trước) do đó **không còn giá trị** và đã được loại bỏ.
+>
+> Các sửa/bổ sung được đánh dấu **[SỬA]** / **[BỔ SUNG]** / **[CẬP NHẬT]** inline.
 
 Tài liệu này giải thích ba lớp kiến thức xếp chồng lên nhau trong dự án, đi từ nền tảng đến chi tiết cài đặt:
 
@@ -63,35 +69,41 @@ Khi chọn hành động, tất cả `m` ứng viên được chấm trong **m�
 
 ### 2.1. Vì sao không gộp thành một số?
 
-Bốn mục tiêu của hệ thống (chi phí, trễ/tắc nghẽn, cân bằng tải, thành công) **mâu thuẫn nhau**, và thang đo khác nhau. Nếu cộng có trọng số `Σ wᵢ·rᵢ` ngay từ đầu:
+Hai mục tiêu của hệ thống — **thành phần chấp nhận** `r_acc_c` (doanh thu + urgency + chất lượng đường đi) và **chi phí triển khai** `r_cost_c` — **mâu thuẫn nhau**, và thang đo khác nhau. Nếu cộng có trọng số `Σ wᵢ·rᵢ` ngay từ đầu:
 
 - Phải chọn `w` trước, mà không ai biết `w` nào là đúng.
 - Weighted sum chỉ tìm được các nghiệm nằm trên phần **lồi** của mặt Pareto.
 - Mỗi lần đổi ưu tiên lại phải huấn luyện lại.
 
-**Hướng tiếp cận của dự án:** giữ nguyên **vector** phần thưởng `r ∈ ℝ⁴` và học **vector** giá trị:
+**Hướng tiếp cận của dự án:** giữ nguyên **vector** phần thưởng `r ∈ ℝ²` và học **vector** giá trị:
 
 ```
-Q(s, a) = [ Q_cost, Q_delay, Q_balance, Q_success ] ∈ ℝ⁴
+Q(s, a) = [ Q_acc, Q_cost ] ∈ ℝ²
 ```
 
-Mạng có **một thân chung và 4 head tuyến tính** (mỗi head ước lượng một mục tiêu) — xác nhận đúng `models/hl_scorer.py::HLSharedQScorer` và `models/ll_dqn.py::LLNodeScorer`:
+Ở tầng HL: `Q(s,a) = [Q_acc, Q_cost]` với `r = [r_acc_c, r_cost_c]` (`train.py`:
+`r_acc_c = revenue + θ·urgency + λ_L·r̄_quality`, `r_cost_c = −μ_deploy_cost·deploy_cost`).
+Ở tầng LL: `r = [r_quality, −μ_deploy_cost·cost_per_step]` với `cost_per_step = deploy_cost / (F_k + 1)`.
+
+Mạng có **một thân chung và 2 head tuyến tính** (mỗi head ước lượng một mục tiêu) — xác nhận đúng `models/hl_scorer.py::HLSharedQScorer` (`N_OBJ_HL = 2`) và `models/ll_dqn.py::LLNodeScorer` (`N_OBJ = 2`):
 
 ```python
 h = self.trunk(x)                                           # [batch, 128]
-return torch.cat([head(h) for head in self.q_heads], -1)    # [batch, 4]
+return torch.cat([head(h) for head in self.q_heads], -1)    # [batch, 2]
 ```
 
 Bellman dạng vector (cộng vector, nhân vô hướng `γ`) vẫn hợp lệ theo từng thành phần:
 
 ```
-Q(s, a) = r + γ · Q(s', a*)         với r, Q ∈ ℝ⁴
+Q(s, a) = r + γ · Q(s', a*)         với r, Q ∈ ℝ²
 ```
 
-Nhưng phép `max_{a'}` **không xác định** với vector — không có thứ tự toàn phần trên ℝ⁴. Hai câu hỏi cần trả lời:
+Nhưng phép `max_{a'}` **không xác định** với vector — không có thứ tự toàn phần trên ℝ². Hai câu hỏi cần trả lời:
 
 1. Khi *chọn hành động*, so sánh `Q(s, a₁)` với `Q(s, a₂)` thế nào? → **Pareto dominance + Hypervolume** (mục 3–5).
 2. Khi *tính target*, "hành động tốt nhất kế tiếp" là gì? → **tập Pareto các Q-vector kế tiếp** (mục 6).
+
+**[CẬP NHẬT]** Ngoài vector Q 2 chiều này, `train.py` còn duy trì một tầng scalarization 2 chiều riêng cho phía "admission" (`r_acc_c`, `r_cost_c` → `r_H` qua `ParetoScalarizer`). Hai tầng này dùng **cùng cặp** `(r_acc_c, r_cost_c)` — khác với phiên bản 4 mục tiêu trước đây, nơi tầng scalarization dùng một cặp khác với vector Q. Chi tiết ở mục 7.
 
 ---
 
@@ -109,24 +121,37 @@ Hai vector mà không cái nào trội hơn cái kia là **không so sánh đư�
 
 ### 3.2. Cài đặt (`utils/pareto.py`)
 
+**[CẬP NHẬT]** Code thật viết **cứng cho 2 mục tiêu**, không phải bản `O(n²·d)` tổng quát như tài liệu phiên bản trước từng mô tả:
+
 ```python
 def dominates(a, b):
-    return bool(np.all(a >= b) and np.any(a > b))
+    return bool((a[0] >= b[0] and a[1] >= b[1]) and (a[0] > b[0] or a[1] > b[1]))
 
-def non_dominated_indices(points):           # O(n² · d)
-    keep = []
+def non_dominated_2d_fast(points):          # O(n log n)
+    order = np.lexsort((-points[:, 1], -points[:, 0]))   # x giảm dần, rồi y giảm dần
+    pts = points[order]
+    keep, max_y = np.zeros(n, dtype=bool), -np.inf
     for i in range(n):
-        dominated = any(j != i and dominates(points[j], points[i]) for j in range(n))
-        if not dominated:
-            keep.append(i)
-    return keep
+        if pts[i, 1] > max_y:               # y lớn hơn mọi y đã thấy → không bị trội
+            keep[i] = True
+            max_y = pts[i, 1]
+    return pts[keep]
+
+def non_dominated_indices(points):          # trả về chỉ số gốc, đã sort
+    order = np.lexsort((-points[:, 1], -points[:, 0]))
+    ...                                     # cùng logic quét max_y, giữ order[idx]
+
+def non_dominated(vectors):                 # dùng bởi LLAgent
+    return [res[i] for i in range(res.shape[0])]   # bọc non_dominated_2d_fast
 ```
 
-Điểm cần lưu ý:
+Điểm cần lưu ý (đã xác minh bằng code):
 
-- Độ phức tạp `O(n²·d)`; với `n` ≤ vài chục ứng viên là chấp nhận được.
-- Hai vector **bằng nhau** không trội nhau (cần `np.any(a > b)`), nên **cả hai đều được giữ** trong tập không bị trội.
-- Có thêm hàm phụ: `pareto_rank` (đếm số vector trội mình), `pareto_front` (cho danh sách điểm 2D) và `select_by_pareto_dominance` (lựa chọn cũ dựa trên tích vô hướng với `w`, giữ lại để tương thích ngược — **không được `train.py` hay hai agent gọi tới ở đường chạy chính**, chỉ tồn tại như API dự phòng).
+- Độ phức tạp `O(n log n)` nhờ `lexsort` + quét một lượt, **không** còn `O(n²·d)`; với `n` ≤ vài chục ứng viên là rất rẻ.
+- Hai vector **bằng nhau** không trội nhau (cần `a[0] > b[0] or a[1] > b[1]`), nên **cả hai đều được giữ** trong tập không bị trội.
+- Cả `dominates` lẫn hai hàm `non_dominated*` chỉ đọc `[:, 0]` và `[:, 1]` — **chỉ đúng với không gian 2 mục tiêu**; nếu sau này nâng `N_OBJ` lên ≥ 3 thì các hàm này phải được viết lại.
+- `pareto_front(points)` (2D) vẫn tồn tại và được `evaluate.py::scan_pareto_front` dùng cho mặt Pareto theo episode. Các hàm `coverage_metric`, `spacing_metric`, `spread_metric`, `normalize_objectives` cũng giả định 2 chiều (`np.empty((0, 2))`), tuy **không** nằm trên đường chạy training.
+- **[CẬP NHẬT]** Hai tên `pareto_rank` và `select_by_pareto_dominance` mà tài liệu phiên bản trước có nhắc **không tồn tại** trong `utils/pareto.py` hiện tại và cũng không được export trong `utils/__init__.py` — đã bỏ khỏi mô tả.
 
 ---
 
@@ -146,85 +171,56 @@ Tính chất khiến HV lý tưởng cho việc này:
 - **Nhạy với chất lượng lẫn độ phủ:** cho phép so sánh cả *tập* vector, không chỉ một vector.
 - **Không cần trọng số** giữa các mục tiêu (nhưng có phụ thuộc vào `ref`, xem 4.5).
 
-### 4.2. Các trường hợp cài đặt (`compute_hypervolume`)
+### 4.2. Cài đặt (`compute_hypervolume`) — chỉ 2 chiều
+
+**[CẬP NHẬT]** Code thật **không còn** nhánh phân nhánh theo số chiều mục tiêu. Toàn bộ `utils/pareto.py` hiện chỉ phục vụ không gian **2 chiều**:
 
 ```python
-valid = np.all(points > ref, axis=1)     # điểm không vượt hoàn toàn ref đóng góp 0 → bỏ
-if n_obj == 1: return max(points) − ref
-if n_obj == 2: return _hv_2d(points, ref)
-else:          return _hv_wfg(points, ref)
+def compute_hypervolume(points, reference_point):
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim == 1:
+        pts = pts.reshape(1, -1)
+    ref = np.asarray(reference_point, dtype=np.float64)
+    valid_mask = (pts[:, 0] > ref[0]) & (pts[:, 1] > ref[1])   # cần > ref ở CẢ HAI chiều
+    pts = pts[valid_mask]
+    if pts.shape[0] == 0:
+        return 0.0
+    return _hv_2d(pts, ref)
+```
+
+Điểm có một thành phần `≤ ref` tương ứng bị loại khỏi tập trước khi tính.
+
+**Quét (sweep) 2 chiều** `_hv_2d` — sắp `x` giảm dần, duy trì `prev_y` là chiều cao đã được phủ; mỗi điểm có `y > prev_y` cộng thêm dải `(x − ref_x) × (y − prev_y)`:
+
+```python
+def _hv_2d(points, ref):
+    order = np.argsort(-points[:, 0])
+    pts = points[order]
+    hv, prev_y = 0.0, ref[1]
+    for i in range(pts.shape[0]):
+        y = pts[i, 1]
+        if y > prev_y:
+            hv += (pts[i, 0] - ref[0]) * (y - prev_y)
+            prev_y = y
+    return float(hv)
 ```
 
 **Trường hợp một điểm** (quan trọng nhất trong dự án, xem mục 5.1): HV là thể tích một hộp
 
 ```
-HV({q}) = Π_i (qᵢ − refᵢ)          nếu qᵢ > refᵢ ∀i,  ngược lại 0
+HV({q}) = (q₀ − ref₀) × (q₁ − ref₁)     nếu q₀ > ref₀ và q₁ > ref₁,  ngược lại 0
 ```
 
-**Hai mục tiêu — quét (sweep)** `_hv_2d`: sắp theo `x` giảm dần, duy trì `prev_y` là chiều cao đã được phủ; mỗi điểm có `y > prev_y` cộng thêm dải `(x − ref_x) × (y − prev_y)` — khớp code `_hv_2d`.
+### 4.3. ~~Lỗi trong hàm `_hv_wfg`~~ — **[CẬP NHẬT] đã loại bỏ cùng với hàm**
 
-**Ba mục tiêu trở lên — cắt lát:** đệ quy theo từng chiều qua `_hv_wfg`.
+**[CẬP NHẬT]** Hàm `_hv_wfg` **không còn tồn tại** trong `utils/pareto.py`. Xác minh: `grep -rn 'hv_wfg' --include='*.py' .` trả về rỗng (exit code 1); các định nghĩa còn lại trong file là `dominates`, `non_dominated_2d_fast`, `non_dominated_indices`, `non_dominated`, `_hv_2d`, `compute_hypervolume`, `hypervolume_contribution`, `prune_by_hypervolume_fast`, `prune_by_hypervolume`, `hv_score_for_action`, `select_by_hypervolume`, `build_target_q_set_fast`, `build_target_q_set`, `ParetoArchive`, `ParetoScalarizer`, `pareto_front`, `normalize_objectives`, `coverage_metric`, `spacing_metric`, `spread_metric`.
 
-### 4.3. ⚠ Lỗi trong hàm `_hv_wfg` — đã xác nhận đúng bằng code thật
+Hệ quả:
 
-Tên hàm gợi tới thuật toán WFG nhưng thực tế cài đặt kiểu cắt lát, và **độ rộng lát bị tính lệch chỉ số**. Code thật (`utils/pareto.py`):
-
-```python
-def _hv_wfg(points: np.ndarray, ref: np.ndarray) -> float:
-    if len(points) == 0:
-        return 0.0
-    if points.shape[1] == 2:
-        return _hv_2d(points, ref)
-    nd_idx = non_dominated_indices(points)
-    points = points[nd_idx]
-    if len(points) == 1:
-        return float(np.prod(points[0] - ref))
-    order = np.argsort(points[:, 0])[::-1]
-    points = points[order]
-    hv = 0.0
-    for i, p in enumerate(points):
-        x_width = p[0] - (points[i - 1][0] if i > 0 else ref[0])
-        hv += abs(x_width) * _hv_wfg(points[:i + 1][:, 1:], ref[1:])
-    return float(hv)
-```
-
-Dùng `p_i.x − p_{i−1}.x` (với `i = 0` dùng `p₀.x − ref`) thay vì `p_i.x − p_{i+1}.x`, và lát cắt dùng `points[:i+1]` (tích lũy từ đầu, tức các điểm có `x` **lớn hơn hoặc bằng** `p_i`) thay vì phần còn lại phía sau. Kết quả là **sai khi có ≥ 2 điểm không bị trội và ≥ 3 mục tiêu**. Ví dụ phản chứng:
-
-```
-P = {(2,1,1), (1,2,2)},  ref = (0,0,0)
-  Đúng (bao hàm-loại trừ):  2 + 4 − 1 = 5
-  Code hiện tại:                                6
-```
-
-**[BỔ SUNG]** Có `n_obj == 1` được xử lý riêng ở `compute_hypervolume` (không đi vào `_hv_wfg`), nhưng bản thân `_hv_wfg` **không** có nhánh xử lý `points.shape[1] == 1` — nếu bị gọi đệ quy tới khi còn 1 chiều mục tiêu (trường hợp 4 mục tiêu ban đầu, đệ quy 3 lần), nó rơi vào nhánh chung `order = argsort(...)`, `points[:i+1][:, 1:]` sẽ có shape `(i+1, 0)` ở lần đệ quy cuối — `_hv_wfg` gọi tiếp với `points` rỗng theo trục cột, trả về từ nhánh `len(points) == 0`? Không: `len(points)` đếm theo hàng nên vẫn `> 0`, dẫn tới đệ quy xuống `points.shape[1] == 0`, lúc đó `np.argsort(points[:, 0])` sẽ lỗi vì không có cột 0. Đây là một rủi ro runtime tiềm ẩn (`IndexError`) với đầu vào ≥ 2 điểm không bị trội ở 4 mục tiêu khi đệ quy chạm đáy — **cần kiểm tra thực nghiệm ở checkpoint sửa logic**, chưa chắc có xảy ra vì `non_dominated_indices` có thể rút gọn `points` về 1 hàng trước khi hết chiều.
-
-Ảnh hưởng thực tế tới dự án được giới hạn vì:
-
-- Chọn hành động (HL/LL) chỉ tính HV cho tập **một điểm** (`hv_score_for_action` gọi `compute_hypervolume` trên `nd_pts` sau `non_dominated_indices`, nhưng trong luồng chọn hành động mỗi `q_sets[i]` luôn có đúng 1 phần tử vì mạng chỉ trả 1 Q-vector/ứng viên — xác nhận qua `HLAgent._get_q_sets` và `LLAgent.select_node`) → công thức tích, **đúng**.
-- Nhánh sai chỉ chạy khi `prune_by_hypervolume` phải loại bớt vector khỏi tập target có > `max_q_vectors_per_action = 10` phần tử (mục 6): hệ quả là vài vector bị loại "không tối ưu", không làm hỏng chọn hành động trực tiếp — nhưng **có ảnh hưởng gián tiếp tới target Bellman** vì `build_target_q_set` gọi `prune_by_hypervolume` khi `len(targets) > max_size`.
-
-Phiên bản đã sửa (giữ nguyên đề xuất từ tài liệu gốc, **chưa áp dụng vào code** — việc sửa logic để ở checkpoint sau):
-
-```python
-def _hv_wfg(points: np.ndarray, ref: np.ndarray) -> float:
-    if len(points) == 0:
-        return 0.0
-    if points.shape[1] == 1:
-        return float(points[:, 0].max() - ref[0])
-    if points.shape[1] == 2:
-        return _hv_2d(points, ref)
-    points = points[non_dominated_indices(points)]
-    if len(points) == 1:
-        return float(np.prod(points[0] - ref))
-    points = points[np.argsort(points[:, 0])[::-1]]      # x giảm dần
-    n, hv = len(points), 0.0
-    for i in range(n):
-        x_next = points[i + 1][0] if i + 1 < n else ref[0]
-        width = points[i][0] - x_next
-        if width > 0:
-            hv += width * _hv_wfg(points[:i + 1, 1:], ref[1:])
-    return float(hv)
-```
+- **Không còn** đường đệ quy N-chiều nào có thể sinh lỗi "lát cắt lệch chỉ số" hay `IndexError` khi đệ quy chạm đáy — hai cảnh báo ở mục 4.3 phiên bản trước **không còn áp dụng**.
+- Bù lại, toàn bộ code Pareto hiện **chỉ đúng cho 2 mục tiêu**. Nếu `N_OBJ_HL`/`N_OBJ` được nâng lên ≥ 3, cả `compute_hypervolume`, `dominates` lẫn `non_dominated_indices` đều phải được thay bằng bản N-chiều, và `ParetoConfig.hv_reference_point()` phải trả về vector cùng số chiều.
+- `hypervolume_contribution` và `prune_by_hypervolume_fast` cũng chỉ gọi `_hv_2d` trên 2 cột, nên cũng chỉ đúng trong không gian 2 chiều.
+- Trong luồng chọn hành động (HL/LL) mỗi `q_sets[i]` luôn có **đúng 1 phần tử** vì mạng chỉ trả 1 Q-vector/ứng viên (xác nhận `HLAgent.select_sfc` dựng `q_sets` bằng `prune_by_hypervolume_fast(non_dominated_2d_fast(q_np[j:j+1]), …)[0]`, và `LLAgent.select_node` tương tự) → HV rơi vào công thức tích 2 chiều ở mục 4.2, **đúng**.
 
 ### 4.4. Hypervolume contribution và cắt tỉa
 
@@ -246,7 +242,26 @@ Hàm ném `ValueError` nếu `max_size ≤ 0` và trả `[]` cho tập rỗng �
 
 ### 4.5. Điểm tham chiếu (reference point)
 
-`ref` là "điểm tệ nhất chấp nhận được", đặt bởi `ParetoConfig.hv_ref_*` = `(−1, −1, −1, −1)` (`hv_reference_point()`, xác nhận trong `config.py`). Bất kỳ vector nào có **một thành phần ≤ ref** có HV = 0.
+`ref` là "điểm tệ nhất chấp nhận được", đặt bởi `ParetoConfig.hv_reference_point()` = **`[hv_ref_cost, hv_ref_success]` = `[−25.0, −25.0]`** (xác nhận trong `config.py`; cả hai mặc định `-25.0`). Bất kỳ vector nào có **một thành phần ≤ ref** có HV = 0.
+
+**[CẬP NHẬT] Hai điểm tham chiếu, một tĩnh một động:**
+
+| Tầng | Giá trị khởi tạo | Có thích nghi? | Căn cứ code |
+|---|---|---|---|
+| **HL** | `[-25.0, -25.0]` (`hv_reference_point()`) | **Không** — `self._ref_point` gán một lần trong `HLAgent.__init__` (dòng 63) và không bao giờ cập nhật | `agents/hl_agent.py:63` |
+| **LL** | `[-25.0, -25.0]` (khởi tạo) rồi bị **ghi đè ngay** ở lần chọn node đầu tiên | **Có** — `LLAgent._update_ref_point(q_np)` | `agents/ll_agent.py:34, 46-55, 104` |
+
+Cơ chế thích nghi của LL (chỉ LL có):
+
+```
+batch_min = q_np.min(axis=0)                                  # min theo từng mục tiêu trên batch ứng viên
+obs_min   = min(obs_min_trước đó, momentum·obs_min + (1−momentum)·batch_min)   # lần đầu: lấy batch_min
+ref       = obs_min − ll_ref_margin
+```
+
+với `ll_ref_momentum = 0.99` (trượt chậm) và `ll_ref_margin = 1.0` (`ParetoConfig`). Vì `ref` của LL phụ thuộc phân phối Q thực tế quan sát được, nó **không** còn là hằng số so sánh được giữa các episode — khác với `ref` của HL.
+
+**[CẬP NHẬT]** `ParetoConfig` vẫn còn khai báo `hv_ref_delay` và `hv_ref_balance` (cùng với `failure_penalty_delay`, `failure_penalty_balance`) nhưng **cả 4 trường này hiện là tham số chết**: `hv_reference_point()` và `failure_penalty_vector()` chỉ đọc `hv_ref_cost`/`hv_ref_success` và `failure_penalty_cost`/`failure_penalty_success` tương ứng, nên hai giá trị kia không bao giờ được dùng (xác nhận `config.py:82-100`).
 
 ---
 
@@ -261,10 +276,14 @@ Hàm ném `ValueError` nếu `max_size ≤ 0` và trả `[]` cho tập rỗng �
 2. hv[i] = HV( non_dominated(q_sets[i]), ref )   ∀ i ∈ valid
 3. tied  = { i | hv[i] ≥ max(hv) − 1e-12 }        # dung sai số học
 4. nếu |tied| = 1 → trả về.
-5. Tie-break 1: với mỗi i ∈ tied, tính trung bình thành phần 0 (r_cost) của q_sets[i];
-                chọn nhóm có giá trị lớn nhất (r_cost lớn hơn = chi phí thấp hơn),
-                sau đó thu hẹp `tied` xuống `cost_winners` — các phần tử có mean_cost_obj
-                trong sai số 1e-12 so với giá trị lớn nhất đó.
+5. Tie-break 1: với mỗi i ∈ tied, tính trung bình thành phần 0 của q_sets[i]; chọn nhóm có giá trị
+                lớn nhất, sau đó thu hẹp `tied` xuống `cost_winners` — các phần tử có giá trị đó
+                trong sai số 1e-12. **[CẬP NHẬT]** Thành phần 0 trong vector 2 mục tiêu hiện tại là
+                **`r_acc_c`** (HL) / **`r_quality`** (LL) — tức là mục tiêu *maximize*, **không** còn là
+                `r_cost` như ở bản 4 mục tiêu trước đây. Vì vậy tie-break 1 bây giờ ưu tiên ứng viên có
+                thành phần chấp nhận/chất lượng **cao hơn**, chứ không phải "chi phí thấp hơn"
+                (xác nhận `utils/pareto.py::select_by_hypervolume`, dòng `mco = float(np.mean([v[0] for v in q_sets[idx]]))`
+                và điều kiện `if mco > best_cost`).
 6. nếu |cost_winners| = 1 → trả về.
 7. Tie-break 2: chọn ngẫu nhiên bằng RNG có seed (HL: `cfg.train.seed`, LL: `cfg.train.seed + 1`)
                 để tái lập được.
@@ -273,30 +292,45 @@ Hàm ném `ValueError` nếu `max_size ≤ 0` và trả `[]` cho tập rỗng �
 Trong dự án mỗi hành động chỉ có **một** Q-vector (một lần truyền xuôi), nên:
 
 ```
-HV(q_sets[i]) = Π_k ( q_i,k − ref_k )         (nếu mọi q_i,k > ref_k, ngược lại 0)
+HV(q_sets[i]) = (q_i,0 − ref_0) × (q_i,1 − ref_1)     (nếu cả hai > ref, ngược lại 0)
 ```
 
 Hệ quả cần hiểu rõ:
 
-- **Chọn theo HV ≡ argmax của tích các "biên độ" so với ref.** Tương đương cực đại hóa `Σ_k log(q_k − ref_k)` — ưu tiên vector **cân bằng** giữa các mục tiêu hơn vector cực đoan ở một chiều và sát ref ở chiều khác.
+- **Chọn theo HV ≡ argmax của tích hai "biên độ" so với ref.** Tương đương cực đại hóa `log(q_0 − ref_0) + log(q_1 − ref_1)` — ưu tiên vector **cân bằng** giữa hai mục tiêu hơn vector cực đoan ở một chiều và sát ref ở chiều kia.
 - Không cần trọng số `w` để so sánh hành động.
 
 ### 5.2. Code trong hai agent — xác nhận khớp
 
+**[CẬP NHẬT]** Hai agent dùng hai bộ hàm khác nhau (HL dùng biến thể `_fast`, LL dùng bản trả list):
+
 ```python
-q_sets = [prune(non_dominated([q_np[j]]), max_q_vecs, ref) for j in valid]   # mỗi tập 1 phần tử
-best   = select_by_hypervolume(q_sets, valid_mask, ref, tie_break_rng=self._tie_rng)
+# HLAgent.select_sfc  (agents/hl_agent.py:113-116)
+q_sets = [[prune_by_hypervolume_fast(
+              non_dominated_2d_fast(q_np[j:j+1]), self._max_q_vecs, self._ref_point)[0]]
+          for j in range(m)]
+best   = select_by_hypervolume(q_sets, np.ones(m, dtype=bool), self._ref_point,
+                               tie_break_rng=self._tie_rng)
+
+# LLAgent.select_node  (agents/ll_agent.py:105-112)
+self._update_ref_point(q_np)                                   # chỉ LL thích nghi ref
+for local_j, global_i in enumerate(valid_nodes):
+    nd_set = non_dominated([q_np[local_j]])
+    q_sets[global_i] = prune_by_hypervolume(nd_set, self._max_q_vecs, self._ref_point)
+chosen = select_by_hypervolume(q_sets, cpu_mask, self._ref_point, tie_break_rng=self._tie_rng)
 ```
+
+Nhánh ablation của `select_node` chạy **trước** khối này: với `ablation_mode ∈ {DefaultBaseline, GreedyLowLevel}` và `G is not None`, agent trả về ngay node có `cpu_free` lớn nhất (`max(valid_nodes, key=lambda n: G.nodes[n].get("cpu_free", 0.0))`), bỏ qua hoàn toàn Q-network/HV (`agents/ll_agent.py:75-78`).
 
 ### 5.3. ⚠ Nhạy cảm với thang đo của reference point
 
-Vì `ref = −1` cố định và HV = 0 khi bất kỳ thành phần nào ≤ ref, **thang đo phần thưởng phải nằm trong tầm** của `ref`. Với cấu hình mặc định (xác nhận qua `config.py`):
+**[CẬP NHẬT]** `ref` của HL là hằng số `[−25, −25]` (không còn `−1`), và HV = 0 khi bất kỳ thành phần nào `≤ ref`. Với ngưỡng `−25` này, phần thưởng thành phần phải nằm **trên** `−25` mới đóng góp HV. Thang đo thực tế (xác nhận qua `config.py` + `train.py`):
 
-- `r_cost = −0.001 × deploy_cost` (`cfg.reward.mu_deploy_cost = 0.001`): mỗi VNF (CPU 100–500) tốn cỡ vài trăm đơn vị cho CPU + RAM (trọng số `w_cpu=w_ram=w_storage=w_bw=w_init=1.0` mặc định), cả SFC cỡ hàng nghìn → `r_cost` mỗi SFC cỡ **−1 đến −5**.
-- `r_delay = −(α·path_cost + β·path_delay + γ·load_std)` với `α=1.0, β=0.5, γ_load=0.5` và trễ link 2–5 ms → mỗi hop đã đóng góp đáng kể.
-- Q là tổng chiết khấu của nhiều bước (`γ = 0.95`) nên còn âm hơn phần thưởng một bước.
+- `r_cost_c = −μ_deploy_cost × deploy_cost` với `μ_deploy_cost = 0.001`: mỗi VNF (CPU 100–500) tốn cỡ vài trăm đơn vị cho CPU + RAM + storage (`w_cpu=w_ram=w_storage=w_bw=w_init=1.0` mặc định, `ram_per_cpu_unit=1.0`, `storage_per_vnf=1.0`), cả SFC cỡ hàng nghìn → `r_cost_c` mỗi SFC cỡ **−1 đến −5**, tức **trên** ngưỡng `−25`.
+- `r_acc_c = revenue + θ·urgency + λ_L·r̄_quality`: `revenue = (μ_cpu·total_cpu + μ_bw·bw·(F_k+1)) / F_k` với `μ_cpu = μ_bw = 0.001` cho giá trị dương cỡ vài đơn vị; `θ·urgency` (`θ = 2.0`, `urgency = 1/max(1, deadline − t)`) đóng góp dương; `λ_L·r̄_quality` (`λ_L = 1.0`) là phần **âm** đến từ `−(α·path_cost + β·path_delay + γ_load·load_std)` với `α=1.0, β=0.5, γ_load=0.5` và trễ link 2–5 ms.
+- Q là tổng chiết khấu nhiều bước (`γ = 0.95`) nên có thể âm hơn phần thưởng một bước, nhưng với `|Q|` cỡ vài chục thì vẫn xa trên `−25`.
 
-Do đó **rất có thể Q_cost và Q_delay nằm dưới −1** ở nhiều (thậm chí mọi) ứng viên → `HV = 0` cho tất cả → tie-break 1 (chọn theo `Q_cost` lớn nhất) quyết định → chính sách có thể suy biến thành "tham lam theo chi phí" mà không còn cân nhắc đa mục tiêu.
+**[CẬP NHẬT]** Rủi ro "mọi HV = 0" do đó **thấp hơn đáng kể** so với bản `ref = −1` trước đây — ngưỡng `−25` cho dư địa rất lớn so với thang đo phần thưởng quan sát được. Tuy vậy, nếu `μ_deploy_cost` được tăng hoặc topology/`bw` lớn hơn nhiều, `r_cost_c` vẫn có thể chạm `−25`; khi đó HV về 0 đồng loạt và **tie-break 1** (theo thành phần 0, tức `r_acc_c`/`r_quality`) sẽ quyết định → chính sách suy biến thành "tham lam theo thành phần chấp nhận". Ở tầng LL, `ref` thích nghi (`mục 4.5`) nên nguy cơ này tự nhiên được giảm.
 
 Cách kiểm tra: chạy với `verbose=True` (tham số của `run_episode`, `select_sfc`, `select_node`) và quan sát `hv_scores` in ra — nếu đồng loạt `0.0000` là dấu hiệu suy biến. **[BỔ SUNG]** `train.py::main()` không truyền `--verbose` xuống `run_episode` theo per-step mà chỉ bật `verbose_this = args.verbose and (global_ep <= 2)` — tức chỉ 2 episode đầu tiên in chi tiết dù `--verbose` được bật cho cả quá trình training.
 
@@ -307,32 +341,45 @@ Cách kiểm tra: chạy với `verbose=True` (tham số của `run_episode`, `s
 Trong DQN vô hướng: `target = r + γ · max_{a'} Q_target(s', a')`. Bản đa mục tiêu thay `max` bằng **tập Pareto**:
 
 ```
-1. Với mỗi hành động kế tiếp a', lấy Q-vector từ target_net:   Q_target(s', a')  ∈ ℝ⁴
+1. Với mỗi hành động kế tiếp a', lấy Q-vector từ target_net:   Q_target(s', a')  ∈ ℝ²
 2. ND      = non_dominated( { Q_target(s', a') } )
 3. targets = non_dominated( { r + γ·q  |  q ∈ ND } )
 4. nếu |targets| > max_q_vectors_per_action (10):  targets = prune_by_hypervolume(targets)
 ```
 
-Các trường hợp đầu cuối trả `[r]`: `done = True`, hoặc `next_q_sets` rỗng/toàn tập rỗng.
+**[CẬP NHẬT]** Có hai đường cài đặt song song, mỗi agent dùng một đường:
 
-**Từ tập về hồi quy.** Mạng chỉ xuất **một** vector nên không thể khớp cả tập; cả hai agent nén tập target thành **trung bình** — xác nhận đúng trong `HLAgent.train_step` (`rep = pts.mean(axis=0)`) và `LLAgent.train_step` (`rep = np.mean(target_sets, axis=0)`):
+| Hàm | Dùng bởi | Ghi chú |
+|---|---|---|
+| `build_target_q_set_fast(r_vec, cand_q_matrix, …)` | `HLAgent.train_step` | nhận **ma trận** ứng viên `[k × 2]`, gom `non_dominated_2d_fast` + `prune_by_hypervolume_fast`, trả về `np.ndarray` |
+| `build_target_q_set(reward_vec, next_q_sets, …)` | `LLAgent.train_step` | nhận **list các list**, bọc `build_target_q_set_fast` bên trong và trả về `list` |
+
+Cả hai đều trả `[r]` khi `done = True`, `cand_q_matrix.size == 0`, hoặc không có ứng viên kế tiếp hợp lệ (`slices[i] = (cursor, cursor)` nên `st == ed`).
+
+**Từ tập về hồi quy.** Mạng chỉ xuất **một** vector nên không thể khớp cả tập; cả hai agent nén tập target thành **trung bình** — xác nhận đúng trong `HLAgent.train_step` (`target_q_vecs[i] = np.mean(t_set, axis=0)`) và `LLAgent.train_step` (`rep = np.mean(target_sets, axis=0)`):
 
 ```python
-rep = np.mean(target_sets, axis=0)              # [4]
+rep = np.mean(target_sets, axis=0)              # [2]
 loss = MSE(q_net(state, action), rep)
 ```
+
+**[CẬP NHẬT] LL có thêm một bước co giãn mục tiêu trong loss.** `LLAgent.__init__` đặt `self._obj_scale = torch.tensor([1.0, 1000.0])` và `train_step` tính `loss = nn.MSELoss()(current_q * self._obj_scale, target_t * self._obj_scale)` (`agents/ll_agent.py:44, 203`) — tức thành phần 1 (`r_quality`) bị nhân trọng số **1000×** so với thành phần 0 (`r_cost_c`). `HLAgent.train_step` **không** có cơ chế này (`nn.MSELoss()(current_q, target_t)`). Đây là khác biệt thực tế giữa hai tầng mà phiên bản tài liệu trước chưa nêu.
+
+**[BỔ SUNG]** Tại `HLAgent.train_step`, `valid_action_mask` được áp dụng bằng cách **lọc hàng** của ma trận ứng viên trước khi vào `build_target_q_set_fast` (`cand_np = cand_np[mask]`, chỉ khi `len(mask) == cand_np.shape[0]`). Vì `train.py` luôn truyền `np.ones(len(next_feats))`, điều kiện độ dài luôn đúng và mask hiện là no-op — nhưng nếu sau này lọc theo `blocked_until` thì cơ chế này đã sẵn sàng.
 
 ---
 
 ## 7. Hai tầng "Pareto" trong dự án
 
-| | Tầng A: Q-vector 4 chiều + HV | Tầng B: Scalarizer / Archive 2 chiều |
+| | Tầng A: Q-vector 2 chiều + HV | Tầng B: Scalarizer / Archive 2 chiều |
 |---|---|---|
-| Mục tiêu | `[cost, delay, balance, success]` | `[r_accept, r_cost]` |
+| Mục tiêu | `[r_acc_c, r_cost_c]` | `[r_accept, r_cost]` — **cùng cặp giá trị** `(r_acc_c, r_cost_c)` |
 | Dùng để | **Chọn hành động** (SFC, node) và tạo target học | **Điều khiển & theo dõi** (weights, utopia/nadir, mặt Pareto theo episode) |
 | Cơ chế | Dominance + Hypervolume | Chebyshev tăng cường + `ParetoArchive` |
 | Ảnh hưởng tới loss Q | Có | Không (chỉ `r_H` để log và cập nhật trọng số) |
 | Code | `utils/pareto.py`: `dominates`, `compute_hypervolume`, `select_by_hypervolume`, `build_target_q_set` | `ParetoScalarizer`, `ParetoArchive` (cùng file `utils/pareto.py`) |
+
+**[CẬP NHẬT]** Ở bản 4 mục tiêu trước đây, hai tầng dùng **hai cặp giá trị khác nhau**: tầng A dùng `[r_cost, r_delay, r_balance, r_success]` còn tầng B dùng `[r_accept_component, r_cost_component]`. Hiện tại `train.py` chỉ tính một cặp `(r_acc_c, r_cost_c)` và dùng nó cho **cả hai**: `_build_reward_vec_2obj(r_acc_c, r_cost_c)` cho replay buffer, và `scalarizer.scalarize(r_acc_c, r_cost_c, …)` cho `r_H`. Hai tầng vẫn tách biệt về mặt *cơ chế* (HV vs Chebyshev) nhưng không còn khác biệt về *đầu vào số*.
 
 ### 7.1. `ParetoScalarizer` — xác nhận khớp `utils/pareto.py`
 
@@ -368,9 +415,9 @@ Kết quả lưu vào `--pareto-out` (mặc định `pareto_front.json`) — xá
 
 ## 8. Kiểm thử (`pareto_test.py`)
 
-Chạy bằng `python pareto_test.py` (không cần GPU). Các nhóm kiểm tra tương ứng các phần đã xác nhận ở trên: `dominates`/`non_dominated`, `compute_hypervolume`/`hypervolume_contribution`, `prune_by_hypervolume`, `select_by_hypervolume` (tie-break theo seed và theo `r_cost`), `build_target_q_set`, `ParetoArchive`, `Config` (ref point, failure vector, `N_OBJ=4` ở cả `hl_scorer.py` và `ll_dqn.py`), replay buffer HL (vector thưởng + mask), `epsilon=0` khi suy luận, `pareto_front` helper.
+**[CẬP NHẬT] Lưu ý về `pareto_test.py`:** file kiểm thử này **không còn tồn tại** trong repo. Xác minh: `find . -name 'pareto_test.py'` không trả về kết quả nào; `overview.md` và `hrl.md` cũng đang nhắc lệnh `python pareto_test.py` trong phần "Cách chạy" — **đây là nội dung lỗi thời cần loại bỏ hoặc thay bằng bộ test thực tế**. Các nhóm kiểm thử mà tài liệu phiên bản trước liệt kê (`dominates`/`non_dominated`, `compute_hypervolume`/`hypervolume_contribution`, `prune_by_hypervolume`, `select_by_hypervolume` (tie-break theo seed và theo thành phần 0), `build_target_q_set`, `ParetoArchive`, `Config` (ref point, failure vector, `N_OBJ=2` ở cả `hl_scorer.py` và `ll_dqn.py`), replay buffer HL (vector thưởng + mask), `epsilon=0` khi suy luận, `pareto_front`) là các mục *nên* được phủ nếu viết lại test — không phải mô tả test đang chạy.
 
-**Điểm chưa được kiểm thử:** giá trị chính xác của HV khi ≥ 3 mục tiêu và ≥ 2 điểm không bị trội (đây là lý do lỗi `_hv_wfg` ở mục 4.3 không bị phát hiện bởi `pareto_test.py` hiện tại — file test chỉ kiểm HV 4D "dương", không đối chiếu giá trị đúng).
+**[CẬP NHẬT]** Không còn "điểm chưa được kiểm thử" liên quan tới `_hv_wfg` (mục 4.3) vì hàm đó đã bị xóa. Với cấu hình 2 mục tiêu, `compute_hypervolume` đi qua `_hv_2d` — đường code duy nhất — nên rủi ro HV sai giá trị do đệ quy N-chiều không còn.
 
 ---
 
@@ -384,8 +431,11 @@ Chạy bằng `python pareto_test.py` (không cần GPU). Các nhóm kiểm tra 
 | `qnet.target_update_freq` | 50 | Số bước train giữa hai lần sao chép target |
 | `qnet.max_q_vectors_per_action` | 10 | Cỡ tối đa của tập target sau khi cắt tỉa HV |
 | `qnet.hl_buffer_size` / `ll_buffer_size` | 15 000 / 72 000 | Dung lượng replay |
-| `pareto.hv_ref_{cost,delay,balance,success}` | −1.0 | Điểm tham chiếu HV |
-| `pareto.failure_penalty_*` | 10.0 | Thưởng −10 cho từng mục tiêu khi thất bại |
+| `pareto.hv_ref_cost` / `pareto.hv_ref_success` | −25.0 | Hai thành phần của điểm tham chiếu HV 2 chiều (`hv_reference_point()`) |
+| `pareto.hv_ref_delay`, `pareto.hv_ref_balance` | −25.0 | **[CẬP NHẬT] tham số chết** — không được `hv_reference_point()` đọc |
+| `pareto.ll_ref_momentum` / `pareto.ll_ref_margin` | 0.99 / 1.0 | Thích nghi `ref` của LL (`LLAgent._update_ref_point`) |
+| `pareto.failure_penalty_cost` / `pareto.failure_penalty_success` | 10.0 | Thưởng −10 cho từng thành phần khi thất bại → `failure_penalty_vector()` = `[-10, -10]` |
+| `pareto.failure_penalty_delay`, `pareto.failure_penalty_balance` | 10.0 | **[CẬP NHẬT] tham số chết** — không được `failure_penalty_vector()` đọc |
 | `pareto.num_weight_bins` | 11 | Số điểm trọng số `w` |
 | `pareto.chebyshev_rho` | 0.05 | Hệ số tăng cường Chebyshev |
 | `pareto.utopia_momentum` | 0.98 | Trượt utopia |
@@ -399,15 +449,15 @@ Chạy bằng `python pareto_test.py` (không cần GPU). Các nhóm kiểm tra 
 | Khái niệm | File | Hàm / lớp |
 |---|---|---|
 | Trội, lọc không bị trội | `utils/pareto.py` | `dominates`, `non_dominated_indices`, `non_dominated` |
-| Hypervolume | `utils/pareto.py` | `compute_hypervolume`, `_hv_2d`, `_hv_wfg` |
-| Đóng góp HV, cắt tỉa | `utils/pareto.py` | `hypervolume_contribution`, `prune_by_hypervolume` |
+| Hypervolume (2 chiều) | `utils/pareto.py` | `compute_hypervolume`, `_hv_2d` |
+| Đóng góp HV, cắt tỉa | `utils/pareto.py` | `hypervolume_contribution`, `prune_by_hypervolume`, `prune_by_hypervolume_fast` |
 | Chọn hành động | `utils/pareto.py` | `hv_score_for_action`, `select_by_hypervolume` |
-| Target Bellman dạng tập | `utils/pareto.py` | `build_target_q_set` |
+| Target Bellman dạng tập | `utils/pareto.py` | `build_target_q_set`, `build_target_q_set_fast` |
 | Scalarizer, archive | `utils/pareto.py` | `ParetoScalarizer`, `ParetoArchive` |
-| Q-network 4 head | `models/hl_scorer.py`, `models/ll_dqn.py` | `HLSharedQScorer`, `LLNodeScorer` |
+| Q-network 2 head | `models/hl_scorer.py`, `models/ll_dqn.py` | `HLSharedQScorer` (`N_OBJ_HL = 2`), `LLNodeScorer` (`N_OBJ = 2`) |
 | Học Q (HL / LL) | `agents/hl_agent.py`, `agents/ll_agent.py` | `train_step` |
 | Quét mặt Pareto | `evaluate.py` | `scan_pareto_front` |
-| Kiểm thử | `pareto_test.py` | — |
+| Kiểm thử | `pareto_test.py` | **[CẬP NHẬT] file không tồn tại trong repo** |
 
 ---
 
@@ -459,10 +509,81 @@ Môi trường rời rạc theo timestep `t`. Có hai chế độ:
 Các quy tắc quan trọng (đã xác nhận trong `env/nfv_env.py`):
 
 - Một SFC **hết hạn** khi `deadline ≤ t` (`SFCRequest.is_expired`). SFC hết hạn còn trong hàng đợi bị đếm là `rejected` (qua `_purge_expired_queue`/`_flush_arrivals`).
-- **Deadline đóng hai vai trò**: hạn phải được phục vụ, đồng thời thời điểm tài nguyên đã commit được giải phóng (`_release_expired_active_sfcs` trả CPU/băng thông khi `deadline ≤ t`).
+- **[CẬP NHẬT] Tài nguyên giải phóng theo từng operation, không theo deadline.** Xem mục 2.1.1 bên dưới — đây là thay đổi lớn nhất so với bản mô tả trước ("deadline đóng hai vai trò").
 - `acceptance_ratio = accepted / total_attempted`, với `total_attempted = accepted + rejected` (property `acceptance_ratio()`).
 
 **Đồng hồ chỉ tiến khi cần.** Trong `run_episode`, `t` **không** tăng sau mỗi SFC. Time chỉ tiến (`env.step_time()`) khi hàng đợi rỗng, hoặc HL không tìm được SFC hợp lệ nào (`hl_result is None` — mọi SFC còn lại bị `blocked_until` hoặc đã hết hạn).
+
+#### 2.1.1. Giải phóng tài nguyên theo từng operation (min-heap `_op_heap`)
+
+**[CẬP NHẬT]** `deadline` **chỉ còn** là hạn phải được phục vụ — nó **không còn** là thời điểm giải phóng tài nguyên. Thay vào đó, `NFVEnvironment` giải phóng tài nguyên theo **từng operation**, dựa trên **thời điểm hoàn thành thực tế** của operation đó, quản lý bằng một **min-heap** `_op_heap`.
+
+**Cấu trúc dữ liệu** (`env/nfv_env.py:38-40`, khởi tạo/reset ở `__init__` và `reset`):
+
+```python
+self._op_heap: list = []   # mỗi phần tử: (finish_time, counter, spec)
+self._op_counter: int = 0  # bộ đếm đơn điệu, phá hoà khi finish_time bằng nhau
+```
+
+`counter` là bắt buộc: `heapq` so sánh tuple theo thứ tự, và nếu hai `finish_time` bằng nhau nó sẽ cố so sánh `spec` (dict/tuple chứa node id) — gây lỗi hoặc thứ tự không xác định.
+
+**Đưa sự kiện vào heap** — `_schedule_operation_releases(allocations, t_start, sfc)` được gọi **một lần duy nhất** từ `commit_sfc(...)` (dòng 352), với `t_start = float(self.t)`. Hàm duyệt tuần tự các allocation, **nhân thời gian t tích lũy dọc theo embedding** (routing rồi mới tới serving của cùng một hop):
+
+```python
+t = float(t_start)
+for (node, path, cpu_req, bw, ram_req, hdd_req) in allocations:
+    # (1) RoutingOperation — chỉ khi path có ≥ 2 node
+    if len(path) > 1:
+        link_delay  = sum(adj[path[i]][path[i+1]]["delay"] for i in range(len(path)-1))
+        finish_route = t + link_delay
+        heappush(_op_heap, (finish_route, counter++, ("link", tuple(path), bw)))
+        t = finish_route                                  # mốc sau cho operation kế tiếp
+
+    # (2) ServingOperation — chỉ khi cpu_req > 0 (đoạn cuối tới dest có cpu_req = 0)
+    if cpu_req > 0.0:
+        proc   = nodes[node].get("proc_delay", 0.0)
+        vnf_d  = next(vnf_iter).delay_at(node)            # VNF thứ k trên node này
+        finish_serve = t + proc + vnf_d
+        heappush(_op_heap, (finish_serve, counter++, ("cpu", node, cpu_req, ram_req, hdd_req)))
+        t = finish_serve
+```
+
+Hai loại `spec` và tài nguyên giải phóng tương ứng:
+
+| Loại | `spec` | Thời điểm hoàn thành | Tài nguyên giải phóng |
+|---|---|---|---|
+| `"link"` | `("link", tuple(path), bw)` | `t + Σ delay(link)` trên `path` | `bw_free` **cộng lại** `bw` cho **từng link** `(path[i], path[i+1])` |
+| `"cpu"` | `("cpu", node, cpu_req, ram_req, hdd_req)` | `t + proc_delay[node] + VNF.delay_at(node)` | `cpu_free` cộng `cpu_req`; `ram_free` cộng `ram_req` và `hdd_free` cộng `hdd_req` **nếu node có các key đó** |
+
+Lưu ý thứ tự nhân `t`: vì routing của hop thứ `k+1` bắt đầu từ `finish` của serving hop thứ `k`, các thời điểm trong heap phản ánh đúng **thứ tự tuần tự dọc theo SFC**, không phải song song.
+
+**Rút sự kiện khỏi heap** — `_release_expired_active_sfcs()`, được gọi **đầu tiên** trong `step_time()` (ngay sau `self.t += 1`):
+
+```python
+t_float = float(self.t)
+while self._op_heap and self._op_heap[0][0] <= t_float:    # lấy hết mọi op đã xong
+    _, _, spec = heapq.heappop(self._op_heap)
+    if spec[0] == "link":
+        _, path, bw = spec
+        for i in range(len(path) - 1):
+            adj[path[i]][path[i+1]]["bw_free"] += bw
+        changed = True
+    elif spec[0] == "cpu":
+        _, node, cpu_req, ram_req, hdd_req = spec
+        nd = nodes[node]
+        nd["cpu_free"] += cpu_req
+        if ram_req and "ram_free" in nd: nd["ram_free"] += ram_req
+        if hdd_req and "hdd_free" in nd: nd["hdd_free"] += hdd_req
+        changed = True
+if changed:
+    self._load_std_cache = None                          # vô hiệu hóa cache độ lệch tải
+```
+
+Vì `t` là số nguyên còn `finish_time` là float, điều kiện `<=` nghĩa là operation được giải phóng ở **timestep nguyên đầu tiên lớn hơn hoặc bằng** thời điểm hoàn thành thực của nó (hiệu ứng `ceil`).
+
+**Vòng đời `active_embeddings`** — sau khi xử lý heap, `_release_expired_active_sfcs` vẫn làm một việc **khác**: lọc `active_embeddings` chỉ giữ các SFC còn `deadline > t`. Nhưng danh sách này **không còn** giữ bản ghi `allocations` dùng để giải phóng tài nguyên (tài nguyên đã do heap lo) — nó chỉ còn là công cụ theo dõi vòng đời/deadline. `commit_sfc` vẫn ghi `{"sfc_id", "deadline", "allocations"}` vào đó, và `step_time()` ở chế độ dataset còn dùng `active_embeddings` để tính `next_event = min(deadline)` khi nhảy thời gian.
+
+**[SỬA] Hệ quả so với mô tả trước:** SFC **không còn** "sống trên mạng tới hết deadline". Một SFC đặt xong thường **giải phóng CPU/bandwidth sớm hơn hẳn deadline** vì `finish_serve` chỉ là `t + Σ(link delay) + Σ(proc_delay + VNF delay)` — cỡ vài chục đơn vị thời gian, trong khi `deadline_min = 20`, `deadline_max = 100`. Trong chế độ ngẫu nhiên, do đồng hồ chỉ tiến khi hàng đợi rỗng, một SFC thường được giải phóng trong vài timestep sau khi commit.
 
 ### 2.2. Đặc trưng SFC — `to_feature_vector` (7 chiều, khớp `utils/graph_generator.py::SFCRequest`)
 
@@ -474,16 +595,18 @@ với `urgency = 1 / max(1, deadline - t)`. Các chiều **chưa được chuẩ
 
 Đặc trưng VNF (`train.py::build_vnf_feature`, 2 chiều): `[vnf.cpu_req / cfg.network.cpu_capacity_mips, 1.0]`.
 
-### 2.3. Vector phần thưởng 4 mục tiêu (xác nhận khớp `train.py`)
+### 2.3. Vector phần thưởng 2 mục tiêu (xác nhận khớp `train.py`)
+
+**[CẬP NHẬT]** Mọi Q-network dự đoán vector **2 chiều**, tất cả theo hướng **maximize**:
 
 | Index | Tên | Giá trị khi SFC thành công | Giá trị khi thất bại |
 |---|---|---|---|
-| 0 | `r_cost` | `-mu_deploy_cost × deploy_cost` | −10 |
-| 1 | `r_delay` | `r̄_quality` | −10 |
-| 2 | `r_balance` | `-load_std` | −10 |
-| 3 | `r_success` | `+1.0` | −10 |
+| 0 | `r_acc_c` (HL) / `r_quality` (LL) | HL: `revenue + θ·urgency + λ_L·r̄_quality`; LL: `r_quality_k` | −10 |
+| 1 | `r_cost_c` | HL: `−μ_deploy_cost × deploy_cost`; LL: `−μ_deploy_cost × cost_per_step` | −10 |
 
-Thất bại dùng `cfg.pareto.failure_penalty_vector()` = `[-10, -10, -10, -10]`.
+Thất bại dùng `failure_penalty_vector()` = **`[-10, -10]`** (`ParetoConfig.failure_penalty_cost = failure_penalty_success = 10.0`).
+
+`r̄_quality` **không còn** là một mục tiêu riêng trong vector thưởng — nó được **gộp vào** thành phần 0 (`r_acc_c`) qua `λ_L` ở tầng HL, và ở tầng LL nó **chính là** thành phần 0. Tương tự `−load_std` không còn là mục tiêu riêng: `load_std` chỉ còn ảnh hưởng gián tiếp qua `r_quality_seg` (thành phần `γ_load·load_std`) và qua `r_H`. Xây dựng vector qua `train.py::_build_reward_vec_2obj(r_perf, r_cost)` → `np.array([r_perf, r_cost], dtype=np.float32)`.
 
 **Thành phần chất lượng đường đi:**
 
@@ -497,7 +620,15 @@ tính **sau khi đã allocate** đoạn đó — xác nhận đúng thứ tự t
 - `path_delay = Σ delay_link`;
 - `load_std` (`env.get_load_std()`, có cache `_load_std_cache`) — tính **một lần sau khi commit** rồi dùng chung cho mọi đoạn của SFC (xác nhận: `load_std = env.get_load_std()` gọi 1 lần trước vòng `for rec in ll_records`).
 
-`r̄_quality = (Σ r_quality_seg) / (F_k + 1)`.
+**[CẬP NHẬT] `r̄_quality` xuất hiện ở 3 chỗ, với 3 vai trò khác nhau** (`train.py:328-345, 362-364`):
+
+| Biến | Công thức | Vai trò trong vector thưởng |
+|---|---|---|
+| `rec["r_quality"]` | `r_quality_seg` của từng đoạn | **Chính là thành phần 0** của transition LL (`r_quality`) |
+| `r̄_quality` | `(Σ rec["r_quality"] + r_dest) / n_steps`, `n_steps = F_k + 1` | Vào **bên trong** `r_acc_c` qua `λ_L` (tầng HL) — không phải một mục tiêu độc lập |
+| `r_dest` | `−(α·dest_cost + β·dest_delay + γ_load·load_std)` | Đoạn cuối tới `dest`: **không** có transition LL riêng, chỉ đóng góp vào `r̄_quality` |
+
+**[CẬP NHẬT]** Cả `r_quality` (LL) và `r_acc_c` (HL) đều **không còn** thành phần `r_success = +1.0` — vector chỉ còn 2 chiều nên không còn slot cho cờ "thành công". Tín hiệu thành công hiện chỉ được mã hóa gián tiếp qua `r_acc_c > 0` (có `revenue`) và qua `done = 1.0` ở transition LL cuối. Đây là thay đổi có hệ quả cho credit assignment: mô hình không còn nhận tín hiệu trực tiếp "+1 khi đặt thành công".
 
 **Chi phí triển khai** (`utils/deploy_cost.py::total_deploy_cost`), cộng theo từng allocation `(node, path, cpu_req, bw)` — công thức khớp code, xác nhận `path_len = max(0, len(path) - 1)`.
 
@@ -531,10 +662,10 @@ embedding_failed khi:
 ```python
 x = torch.cat([z_global, sfc_features, pareto_w], dim=-1)
 h = self.trunk(x)
-return torch.cat([head(h) for head in self.q_heads], dim=-1)   # [batch, 4]
+return torch.cat([head(h) for head in self.q_heads], dim=-1)   # [batch, 2]
 ```
 
-Toàn bộ `m` SFC hợp lệ được chấm trong **một batch duy nhất**. Tổng tham số: `d_in=73 → 256 → 128` + 4 head `128→1` ≈ 73×256 + 256×128 + 4×128 + biases ≈ **52K** (ước tính, chưa có công cụ đếm tham số chính xác trong phiên làm việc này).
+**[CẬP NHẬT]** `N_OBJ_HL = 2` nên chỉ có **2 head** `128→1`. Toàn bộ `m` SFC hợp lệ được chấm trong **một batch duy nhất** (`z_global` và `pareto_w` được `expand` thành `m` hàng — xác nhận `agents/hl_agent.py:110-112`). Tổng tham số: `d_in = 73 → 256 → 128` + 2 head `128→1` ≈ 73×256 + 256 + 256×128 + 128 + 2×128 + 2 ≈ **52K** (ước tính, chưa có công cụ đếm tham số chính xác trong phiên làm việc này — giá trị gần như không đổi so với bản 4 head vì phần thân `256→128` chi phối).
 
 ### 3.2. Chọn hành động (`select_sfc`) — khớp `agents/hl_agent.py`
 
@@ -542,9 +673,14 @@ Toàn bộ `m` SFC hợp lệ được chấm trong **một batch duy nhất**. 
 valid = [i | SFC i chưa hết hạn  VÀ  blocked_until.get(sfc_id, t) ≤ t]
 nếu valid rỗng → trả về None  (→ step_time)
 
+# [CẬP NHẬT] nhánh ablation chạy TRƯỚC ε-greedy (agents/hl_agent.py:89-98):
+#   DefaultBaseline → min(valid, key=lambda i: queue[i].deadline - t)   # ít thời gian còn lại nhất
+#   Random-Fit      → random.choice(valid)
+#   GreedyFIFO      → min(valid, key=lambda i: queue[i].arrival_time)   # đến sớm nhất
+
 với xác suất ε:      chọn ngẫu nhiên trong valid
 ngược lại:
-    Q_i = q_net(z_global, sfc_i, w)              # vector 4 chiều cho mỗi SFC
+    Q_i = q_net(z_global, sfc_i, w)              # vector 2 chiều cho mỗi SFC
     Q-set_i = prune(non_dominated({Q_i}))         # luôn là tập 1 phần tử
     chọn SFC có Hypervolume(Q-set_i) lớn nhất     # hòa → tie-break
 ```
@@ -559,7 +695,7 @@ Mỗi lần HL xử lý một SFC (thành công hoặc thất bại) sinh đúng
 | `sfc_feat` | Đặc trưng của SFC **đã chọn** |
 | `pareto_w` | Vector trọng số của episode |
 | `action_idx` | Chỉ số SFC trong hàng đợi (chỉ tham khảo) |
-| `reward_vec` | `[r_cost, r_delay, r_balance, 1.0]` nếu thành công; `failure_vec` nếu thất bại |
+| `reward_vec` | **[CẬP NHẬT]** `[r_acc_c, r_cost_c]` nếu thành công (2 chiều, dựng qua `_build_reward_vec_2obj(r_acc_c, r_cost_c)`); `failure_vec` = `[-10, -10]` nếu thất bại |
 | `next_z_global` | **Cùng `z_global`** hiện tại (`z_global.cpu()` — không encode lại trước khi lưu) |
 | `next_sfc_feats` | Đặc trưng SFC còn hạn (`not q.is_expired(env.t)`) trong hàng đợi sau bước này — **không lọc `blocked_until`** |
 | `done` | `1.0` nếu `not env.queue` và `env._req_cursor >= len(env._all_requests)` |
@@ -608,15 +744,53 @@ mỗi cfg.qnet.target_update_freq (=50) bước: target_net ← q_net
 | `pareto_w` | 2 | Vector trọng số |
 | **Tổng** | **139** | `cfg.d_ll_input` |
 
-Hành động = "đặt VNF lên node `i`". Mask hợp lệ (`env.build_ll_mask`): `nd.get('is_function_node', True) and nd['cpu_free'] >= cpu_req` — mask **không kiểm tra đường đi**, có thể chọn phải node không định tuyến được (→ thất bại loại (b)/(c) mục 2.4).
+Hành động = "đặt VNF lên node `i`".
+
+**[CẬP NHẬT] Mask hợp lệ — `env.build_ll_mask(cpu_req, ram_req, hdd_req)` kiểm tra cả CPU, RAM và HDD** (không chỉ CPU như mô tả trước). Code thật (`env/nfv_env.py:281-296`):
+
+```python
+def build_ll_mask(self, cpu_req, ram_req=0.0, hdd_req=0.0) -> np.ndarray:
+    mask = np.zeros(self.G.number_of_nodes(), dtype=bool)
+    for u, nd in self.G.nodes(data=True):
+        if not nd.get("is_function_node", True):        # (1) phải là function node
+            continue
+        if nd["cpu_free"] < cpu_req:                    # (2) đủ CPU
+            continue
+        if ram_req > 0.0 and nd.get("ram_free", float("inf")) < ram_req:   # (3) đủ RAM
+            continue
+        if hdd_req > 0.0 and nd.get("hdd_free", float("inf")) < hdd_req:   # (4) đủ HDD
+            continue
+        mask[u] = True
+    return mask
+```
+
+Bốn điều kiện lọc, **tất cả đều phải thỏa mãn**:
+
+| # | Điều kiện | Mặc định khi thiếu dữ liệu |
+|---|---|---|
+| 1 | `nd.get("is_function_node", True)` phải truthy | **`True`** — nếu node không có key này thì vẫn được coi là function node |
+| 2 | `nd["cpu_free"] >= cpu_req` | key bắt buộc, dùng `nd["cpu_free"]` trực tiếp (không `.get`) |
+| 3 | `ram_req > 0` thì `nd.get("ram_free", inf) >= ram_req` | **`inf`** — nếu node không có `ram_free`, điều kiện **luôn đúng** (coi như vô hạn) |
+| 4 | `hdd_req > 0` thì `nd.get("hdd_free", inf) >= hdd_req` | **`inf`** — tương tự |
+
+**[CẬP NHẬT] Điểm quan trọng về tác dụng thực tế của điều kiện RAM/HDD:** hai điều kiện (3) và (4) chỉ *có hiệu lực* khi `ram_req > 0` / `hdd_req > 0` **và** node thực sự có key `ram_free` / `hdd_free`. Trong **chế độ ngẫu nhiên**, `build_substrate_network` (`utils/graph_generator.py:64-88`) **không** tạo `ram_free`/`hdd_free`, còn `VNF` mặc định `ram_req = hdd_req = 0.0` (`generate_sfc_requests` khởi tạo `VNF(vnf_id, cpu, cpu, cpu)` nên `ram_req`/`hdd_req` nhận giá trị CPU — nhưng node không có `ram_free` để so) → hai điều kiện này **không loại node nào**. Chúng chỉ thực sự lọc ở **chế độ dataset**, nơi `data/loader.py:56-62` gán `ram_total/ram_free/hdd_total/hdd_free` cho node server và `VNF` đọc `r_f`/`h_f` thành `ram_req`/`hdd_req` (dòng 92-93).
+
+Mask **không kiểm tra đường đi** tới node, nên vẫn có thể chọn phải node không định tuyến được (→ thất bại loại (b)/(c) mục 2.4). Lưu ý `train.py` gọi mask với đủ 3 tham số: `env.build_ll_mask(vnf.cpu_req, vnf.ram_req, vnf.hdd_req)` (dòng 196 khi chọn, và dòng 374-378 khi dựng `next_state`).
 
 ### 4.2. Chọn hành động (`select_node`) — khớp `agents/ll_agent.py`
 
 ```
 valid_nodes = {i | cpu_mask[i]}       rỗng → None (SFC thất bại)
+
+# [CẬP NHẬT] nhánh ablation chạy TRƯỚC ε-greedy (agents/ll_agent.py:75-78):
+#   ablation_mode ∈ {DefaultBaseline, GreedyLowLevel} và G is not None:
+#     → max(valid_nodes, key=lambda n: G.nodes[n].get("cpu_free", 0.0))  # node rảnh CPU nhiều nhất
+
 với xác suất ε: chọn ngẫu nhiên trong valid_nodes
+                (nếu G và current_source khả dụng và k_hop > 0: chỉ chọn trong các node
+                 nằm trong bán kính k_hop = cfg.train.k_hop_explore = 3 hop từ current_source)
 ngược lại:
-    Q_i = q_net(z_global, z_prev, z_i, vnf_feat, sfc_feat, w)  ∀ i
+    Q_i = q_net(z_global, z_prev, z_i, vnf_feat, sfc_feat, w)  ∀ i     # vector 2 chiều
     Q-set_i = prune(non_dominated({Q_i})) nếu i hợp lệ, ngược lại ∅
     chọn node có HV(Q-set_i) lớn nhất (mask loại node không hợp lệ)
 ```
@@ -628,11 +802,13 @@ Sau mỗi SFC **thành công**, K transition LL được lưu:
 | Trường | Giá trị |
 |---|---|
 | state | `(z_global, z_prev, z_cand, vnf_feat, sfc_feat, w)` |
-| reward | `[ -mu_deploy_cost × cost_per_step, r_quality_k, -load_std, 1.0 nếu k cuối else 0.0 ]` với `cost_per_step = deploy_cost / n_steps`, `n_steps = F_k + 1` |
+| reward | **[CẬP NHẬT]** `[ r_quality_k, −μ_deploy_cost × cost_per_step ]` (2 chiều, dựng qua `_build_reward_vec_2obj(cur_rec["r_quality"], −μ_deploy_cost × cost_per_step)`), với `cost_per_step = deploy_cost / n_steps`, `n_steps = F_k + 1`. **Không còn** cờ `r_success` ở transition cuối — chỉ có `done = 1.0`. |
 | next state | `None` nếu k cuối; ngược lại `(z_global, z_prev'=z_nodes[node vừa chọn], toàn bộ z_nodes, vnf_feat kế, sfc_feat, mask kế, w)` |
 | done | `1.0` nếu k cuối |
 
 Chi phí triển khai chia đều cho `n_steps = F_k + 1` (kể cả đoạn tới `dest` không có transition riêng), nên tổng thưởng chi phí trên K transition là `F_k/(F_k+1)` tổng chi phí.
+
+**[CẬP NHẬT] Loss của LL có co giãn mục tiêu:** `LLAgent.train_step` tính `loss = nn.MSELoss()(current_q * self._obj_scale, target_t * self._obj_scale)` với `self._obj_scale = torch.tensor([1.0, 1000.0])` (`agents/ll_agent.py:44, 203`) — thành phần 1 (`r_quality`) được nhân **1000×**. `HLAgent.train_step` **không** có bước này (`nn.MSELoss()(current_q, target_t)`). Chi tiết ở mục 6 phần Pareto/HV của file này.
 
 Khi SFC **thất bại**: mọi transition đã tạo được lưu với `reward = failure_vec / max(1, J)` (J = số VNF đã đặt tạm trước điểm fail), `done = 1`, `next = None`.
 
@@ -655,6 +831,14 @@ w = delay + λ × ( exp(ρ · ln Ω) − 1 ) = delay + λ × ( Ω^ρ − 1 )
 
 với `Ω = cfg.reward.omega_bw = 100`, `λ = cfg.reward.lambda_penalty = 1`.
 
+**[CẬP NHẬT] `λ` bị vô hiệu hóa ở `DefaultBaseline`.** `train.py` (dòng 232 cho đoạn tới node VNF và dòng 283 cho đoạn cuối tới `dest`) truyền:
+
+```python
+0.0 if cfg.train.ablation_mode == "DefaultBaseline" else cfg.reward.lambda_penalty
+```
+
+Nên ở `DefaultBaseline`, `w = delay` (Dijkstra thuần delay, không phạt tắc nghẽn) — đúng như `docs/ABLATION.md` mô tả ("Basic Dijkstra ignores link utilization penalties"). Cả 4 mode còn lại (`Random-Fit`, `GreedyFIFO`, `GreedyLowLevel`, `HRL-VGAE`) đều dùng `λ = lambda_penalty = 1`. Lưu ý ràng buộc `bw_free ≥ req_bw` **vẫn được áp dụng** ở mọi mode, kể cả `DefaultBaseline` — chỉ có *hệ số phạt mềm* bị đặt về 0.
+
 `source == target` trả về `[source]` ngay (không có cạnh, `path_len=0`).
 
 Dijkstra gọi `K + 1` lần mỗi SFC; mỗi đoạn được `env.allocate()` ngay trước khi tính đoạn kế tiếp, nên các đoạn cùng SFC "nhìn thấy" băng thông các đoạn trước đã chiếm. `PathCache` tồn tại trong `utils/dijkstra.py` nhưng **`train.py` không sử dụng** (xác nhận: không có lời gọi `PathCache` nào trong `train.py`).
@@ -667,9 +851,13 @@ Dijkstra gọi `K + 1` lần mỗi SFC; mỗi đoạn được `env.allocate()` 
 
 | Thao tác | Tác dụng |
 |---|---|
-| `allocate(node, path, cpu, bw)` | Trừ `cpu_free` node, trừ `bw_free` mọi link trên path; xóa `_load_std_cache` nếu `len(path)>1` |
-| `_rollback_resources(allocations)` | Cộng trả đúng giá trị trên; xóa `_load_std_cache` nếu có allocation |
-| `commit_sfc(sfc, allocations, deploy_cost)` | Ghi vào `active_embeddings` (kèm `deadline`), `accepted += 1`, `total_attempted += 1`, cộng dồn `total_deploy_cost` |
+| `allocate(node, path, cpu, bw, ram_req=0.0, hdd_req=0.0)` | Nếu `cpu_req > 0`: trừ `cpu_free`, trừ `ram_free` (nếu key tồn tại), trừ `hdd_free` (nếu key tồn tại). Luôn trừ `bw_free` mỗi link trên path; xóa `_load_std_cache` nếu `len(path) > 1` |
+| `_rollback_resources(allocations)` | Cộng trả đúng các giá trị trên (dùng `_unpack_alloc` để đọc `ram_req`/`hdd_req` ở vị trí 4/5 khi allocation có dài hơn 4); xóa `_load_std_cache` |
+| `commit_sfc(sfc, allocations, deploy_cost)` | Ghi vào `active_embeddings` (kèm `deadline`), `accepted += 1`, `total_attempted += 1`, cộng dồn `total_deploy_cost`, **và** gọi `_schedule_operation_releases(allocations, float(self.t), sfc)` để đưa sự kiện giải phóng vào `_op_heap` |
+
+**[CẬP NHẬT]** `commit_sfc` **không còn** trực tiếp giữ `allocations` để giải phóng sau — nó chuyển chúng cho min-heap `_op_heap` (mục 2.1.1). `active_embeddings` vẫn lưu `allocations` trong dict nhưng chỉ phục vụ theo dõi vòng đời/deadline, không dùng để trả tài nguyên.
+
+**[CẬP NHẬT]** `allocate` có thêm hai tham số `ram_req` và `hdd_req` (mặc định `0.0`), và `train.py` truyền đủ 5 giá trị. `_rollback_resources` dùng `_unpack_alloc` nên tương thích cả tuple 4-phần-tử (định dạng cũ) và 6-phần-tử.
 
 Cơ chế "allocate tạm rồi rollback nếu thất bại" đảm bảo tính **nguyên tử**. `partial_allocations` gồm cả K allocation VNF và allocation cuối tới `dest`.
 
@@ -677,7 +865,7 @@ Cơ chế "allocate tạm rồi rollback nếu thất bại" đảm bảo tính 
 
 ## 7. Điều khiển đa mục tiêu: trọng số `w` và scalarizer
 
-Xem chi tiết công thức ở mục 7 tài liệu Pareto/HV phía trên (cùng file này). Tóm tắt vai trò: `r_H` (Chebyshev 2 chiều) chỉ dùng để log (`episode_hl_reward`) và cập nhật `utopia`/`nadir`/`w_accept`/`w_cost` — **không** tham gia loss Q-network (Q-network học từ vector 4 chiều qua `hl_reward_vec`/`ll reward_vec`).
+Xem chi tiết công thức ở mục 7 tài liệu Pareto/HV phía trên (cùng file này). Tóm tắt vai trò: `r_H` (Chebyshev 2 chiều) chỉ dùng để log (`episode_hl_reward`) và cập nhật `utopia`/`nadir`/`w_accept`/`w_cost` — **không** tham gia loss Q-network (Q-network học từ vector 2 chiều qua `hl_reward_vec`/LL `reward_vec`).
 
 `w = (w_accept, w_cost)` được ghép vào đầu vào của cả hai Q-network (2 chiều cuối). Train: mỗi episode lấy ngẫu nhiên 1 trong 11 điểm qua `scalarizer.sample_weight()`. Evaluate mặc định: dùng `scalarizer.w_accept/w_cost` lưu trong checkpoint. Evaluate `--pareto-scan`: quét tuần tự cố định mỗi điểm cho cả episode.
 
@@ -721,28 +909,31 @@ lưu checkpoint: vgae, hl_q, ll_q, hl_eps, ll_eps, w_accept, w_cost, hv_ref_poin
 Giả sử `t = 40`, hàng đợi có 3 SFC hợp lệ, `w = (0.7, 0.3)`.
 
 1. **Encode.** `z_nodes [50×32]`, `z_global [64]` lấy từ cache.
-2. **HL.** Chấm 3 SFC bằng 3 vector Q ∈ ℝ⁴; chọn SFC có HV lớn nhất, gọi là **S** (hoặc ngẫu nhiên nếu trúng ε).
+2. **HL.** Chấm 3 SFC bằng 3 vector Q ∈ ℝ²; chọn SFC có HV lớn nhất, gọi là **S** (hoặc ngẫu nhiên nếu trúng ε).
 3. **VNF₁.** `current_source = S.source`. `cpu_mask` cho biết N node đủ CPU. LL chấm các node hợp lệ → chọn node `v₁`. Dijkstra `S.source → v₁`. `allocate` CPU node `v₁` và băng thông đường đi. Ghi record.
 4. **VNF₂, VNF₃.** Lặp tương tự; `current_source` cập nhật thành node vừa chọn.
 5. **Đoạn cuối.** Dijkstra `v₃ → S.dest`, `allocate` với `cpu = 0`.
-6. **Thành công** → tính `deploy_cost`, `load_std`; `commit_sfc`; dựng vector thưởng HL; lưu 3 transition LL; mỗi transition lưu xong gọi `ll_agent.train_step()`. `graph_dirty = True`.
-   **Thất bại** → `rollback` mọi allocation tạm; HL nhận `failure_vec`; transition LL đã có được lưu với `failure_vec/J`; SFC bị chặn tới `t + 1`.
+6. **Thành công** → tính `deploy_cost`, `load_std`; `commit_sfc` (giải phóng operation được **đưa vào `_op_heap`**, mục 2.1.1); dựng `hl_reward_vec = [r_acc_c, r_cost_c]`; lưu 3 transition LL với `reward_vec = [r_quality_k, −μ·cost_per_step]`; mỗi transition lưu xong gọi `ll_agent.train_step()`. `graph_dirty = True`.
+   **Thất bại** → `rollback` mọi allocation tạm (heap **không** bị đụng tới vì `commit_sfc` không chạy); HL nhận `failure_vec = [-10, -10]`; transition LL đã có được lưu với `failure_vec/J`; SFC bị chặn tới `t + 1`.
 7. **HL transition** được lưu và `hl_agent.train_step()` chạy một lần.
-8. **Chuyển timestep** khi hàng đợi rỗng/HL không còn hành động hợp lệ: `step_time()` giải phóng SFC hết hạn, nhận SFC mới, encode lại nếu `graph_dirty`.
+8. **Chuyển timestep** khi hàng đợi rỗng/HL không còn hành động hợp lệ: `step_time()` gọi `_release_expired_active_sfcs()` (giải phóng tài nguyên của mọi operation đã hoàn thành trước `t`), nhận SFC mới, encode lại nếu `graph_dirty`.
 
 ---
 
 ## 10. Hạn chế đã biết của triển khai hiện tại
 
-1. **`w` chỉ là đầu vào, không đi vào target.** Vector thưởng 4 chiều không phụ thuộc `w`; `w` chủ yếu ảnh hưởng qua `r_H` (chỉ log) và qua phân bố dữ liệu training.
+1. **`w` chỉ là đầu vào, không đi vào target.** Vector thưởng 2 chiều không phụ thuộc `w`; `w` chủ yếu ảnh hưởng qua `r_H` (chỉ log) và qua phân bố dữ liệu training.
 2. **Trạng thái kế tiếp của HL không được encode lại.** `next_z_global` bằng `z_global` hiện tại — target HL xấp xỉ.
 3. **`valid_action_mask` của HL luôn toàn `True`**, kể cả SFC đang bị `blocked_until` (không bị lọc khỏi `next_sfc_feats`) — target có thể tính trên ứng viên mà thực tế chưa được chọn.
 4. **Thất bại tại VNF đầu tiên không tạo transition LL**.
 5. **Thang đo đặc trưng SFC chưa chuẩn hóa** (mục 2.2).
-6. **Ngưỡng tham chiếu HV cố định = −1** trong khi thang đo mục tiêu có thể vượt −1 — ảnh hưởng trực tiếp chọn hành động (mục 5.3 phần Pareto/HV phía trên).
+6. **[CẬP NHẬT] Ngưỡng tham chiếu HV của HL cố định = −25** (không còn −1); với thang đo mục tiêu hiện tại, ngưỡng này cho dư địa lớn nên rủi ro HV = 0 đồng loạt thấp — nhưng vẫn tồn tại nếu `μ_deploy_cost`/băng thông tăng mạnh (mục 5.3 phần Pareto/HV phía trên). Ngược lại, `ref` của **LL** thích nghi theo Q quan sát được nên không còn là hằng số so sánh được giữa các episode.
 7. **`sfc_quota_per_timestep` trong config không được sử dụng** ở bất kỳ đâu trong `train.py`/`env/nfv_env.py`.
 8. **[BỔ SUNG] `cfg.qnet.eps_decay` là tham số chết**, không ảnh hưởng lịch epsilon thực tế (mục 8).
-9. **[BỔ SUNG] Bug `_hv_wfg`** ở ≥3 mục tiêu, ≥2 điểm không bị trội (chi tiết mục 4.3 phần Pareto/HV) — ảnh hưởng gián tiếp tới việc cắt tỉa tập target khi `|targets| > 10`.
+9. **[BỔ SUNG] Tham số chết trong `ParetoConfig`**: `hv_ref_delay`, `hv_ref_balance`, `failure_penalty_delay`, `failure_penalty_balance` đều không được `hv_reference_point()`/`failure_penalty_vector()` đọc (mục 4.5 phần Pareto/HV) — di sản của bản 4 mục tiêu.
+10. **[CẬP NHẬT] ~~Bug `_hv_wfg`~~ đã không còn** — hàm `_hv_wfg` đã bị xóa khỏi `utils/pareto.py`, nên không còn rủi ro cắt tỉa target sai. Thay vào đó, toàn bộ code Pareto giờ **chỉ đúng cho 2 mục tiêu**: nếu nâng `N_OBJ` lên ≥ 3 thì `compute_hypervolume`, `dominates`, `non_dominated_indices` và `hv_reference_point()` đều phải được viết lại.
+11. **[BỔ SUNG] Hai tầng LL/HL bất đối xứng về huấn luyện**: (a) LL có `_obj_scale = [1.0, 1000.0]` trong loss còn HL không có; (b) `ref` của LL thích nghi còn của HL cố định; (c) HL dùng biến thể `_fast` (`non_dominated_2d_fast`, `prune_by_hypervolume_fast`, `build_target_q_set_fast`) còn LL dùng bản trả list.
+12. **[CẬP NHẬT] Bỏ qua cờ `r_success`**: vector 2 chiều không còn mục tiêu "tỷ lệ đặt thành công" riêng, nên mô hình chỉ nhận tín hiệu thành công gián tiếp qua `r_acc_c > 0` và `done = 1.0`.
 
 ---
 
@@ -756,10 +947,12 @@ Giả sử `t = 40`, hàng đợi có 3 SFC hợp lệ, `w = (0.7, 0.3)`.
 | Cập nhật Q của HL | `agents/hl_agent.py` | `HLAgent.train_step` |
 | Chọn node | `agents/ll_agent.py` | `LLAgent.select_node` |
 | Cập nhật Q của LL | `agents/ll_agent.py` | `LLAgent.train_step` |
-| Mạng HL / LL | `models/hl_scorer.py` / `models/ll_dqn.py` | `HLSharedQScorer` / `LLNodeScorer` |
-| Mask node hợp lệ | `env/nfv_env.py` | `build_ll_mask` |
+| Thích nghi `ref` (chỉ LL) | `agents/ll_agent.py` | `LLAgent._update_ref_point` |
+| Mạng HL / LL | `models/hl_scorer.py` / `models/ll_dqn.py` | `HLSharedQScorer` (`N_OBJ_HL = 2`) / `LLNodeScorer` (`N_OBJ = 2`) |
+| Mask node hợp lệ (CPU/RAM/HDD) | `env/nfv_env.py` | `build_ll_mask` |
 | Allocate / rollback / commit | `env/nfv_env.py` | `allocate`, `_rollback_resources`, `commit_sfc` |
-| Đồng hồ và hàng đợi | `env/nfv_env.py` | `step_time`, `_flush_arrivals`, `_purge_expired_queue` |
+| **[CẬP NHẬT]** Lịch giải phóng theo operation | `env/nfv_env.py` | `_schedule_operation_releases`, `_release_expired_active_sfcs`, `_unpack_alloc`, `compute_embedding_delay` |
+| Đồng hồ và hàng đợi | `env/nfv_env.py` | `step_time`, `_flush_arrivals`, `_purge_expired_queue`, `_flush_arrivals_initial` |
 | Định tuyến | `utils/dijkstra.py` | `custom_dijkstra` |
 | Chất lượng đường đi, `load_std` | `utils/dijkstra.py` | `compute_path_cost_delay`, `compute_load_std` |
 | Chi phí triển khai | `utils/deploy_cost.py` | `total_deploy_cost` |
