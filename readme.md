@@ -105,7 +105,7 @@ each of the 36 testcases (see §7).
 ```bash
 # 1) Train on a single testcase
 python train.py \
-    --train-file data/testcase/nsf_centers_easy.json \
+    --train-file data/cogent_centers_hard_s3.json \
     --checkpoint checkpoints/nsf_centers_easy.pt \
     --csv logs/nsf_centers_easy.csv \
     --epochs 5 --passes-per-file 1 --warmup-epochs 1

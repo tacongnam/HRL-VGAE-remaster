@@ -35,7 +35,6 @@ class LiveProfiler:
         self.t_last = now
         if self.step % self.print_every == 0:
             pass
-            #print(f"[LIVE STEP {self.step:4d}] {stage_name:<22} : {elapsed:8.2f} ms", flush=True)
 
     def inc(self):
         self.step += 1
@@ -130,15 +129,11 @@ def run_episode(
     pareto_w = torch.tensor([w_accept, w_cost], dtype=torch.float32, device=device)
 
     z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
+    # graph_dirty: True when allocations were made and VGAE needs re-encode
     graph_dirty = False
     z_nodes_cpu = z_nodes.cpu()
-    last_printed_t = None
 
     while not done:
-#        if env.t != last_printed_t and env.t % 25 == 0:
-#            print(f"[Timestep: {env.t}] Queue size: {len(env.queue)} | Active: {len(env.active_embeddings)}", flush=True)
-#            last_printed_t = env.t
-
         if not env.queue:
             done = env.step_time()
             if not done and graph_dirty:
@@ -272,6 +267,21 @@ def run_episode(
             )
             curr_src = chosen_node
 
+            # Update VGAE embedding after each VNF placement to reflect
+            # current residual resources for next VNF decision
+            if i < selected_sfc.F_k - 1:
+                vgae.eval()
+                x_cur, ei_cur = env.get_node_features_tensor(device)
+                with torch.inference_mode():
+                    z_nodes, z_global, _, _ = vgae(
+                        x_cur, ei_cur, graph_id=env.topology_id, update_temporal=False
+                    )
+                z_nodes = z_nodes.detach()
+                z_global = z_global.detach()
+                z_nodes_cpu = z_nodes.cpu()
+                # Update x, ei for potential VGAE training later
+                x, ei = x_cur, ei_cur
+
         dest_cost, dest_delay = 0.0, 0.0
         if not embedding_failed:
             dest_path = custom_dijkstra(
@@ -301,6 +311,19 @@ def run_episode(
 
         if embedding_failed:
             env._rollback_resources(partial_allocations)
+            # After rollback, re-encode to reflect restored resources
+            vgae.eval()
+            x_rb, ei_rb = env.get_node_features_tensor(device)
+            with torch.inference_mode():
+                z_nodes, z_global, _, _ = vgae(
+                    x_rb, ei_rb, graph_id=env.topology_id, update_temporal=False
+                )
+            z_nodes = z_nodes.detach()
+            z_global = z_global.detach()
+            z_nodes_cpu = z_nodes.cpu()
+            x, ei = x_rb, ei_rb
+            graph_dirty = False  # resources restored, embedding is fresh
+
             hl_reward_vec = failure_vec.copy()
             r_H = scalarizer.scalarize(-cfg.reward.r_fail, 0.0, w_accept, w_cost)
             env.remove_sfc_from_queue(selected_sfc)
@@ -322,6 +345,18 @@ def run_episode(
             env.commit_sfc(selected_sfc, partial_allocations, deploy_cost=deploy_cost)
             env.remove_sfc_from_queue(selected_sfc)
             graph_dirty, sfc_vgae_count = True, sfc_vgae_count + 1
+
+            # Update embedding after commit to reflect final state
+            vgae.eval()
+            x_new, ei_new = env.get_node_features_tensor(device)
+            with torch.inference_mode():
+                z_nodes, z_global, _, _ = vgae(
+                    x_new, ei_new, graph_id=env.topology_id, update_temporal=False
+                )
+            z_nodes = z_nodes.detach()
+            z_global = z_global.detach()
+            z_nodes_cpu = z_nodes.cpu()
+            x, ei = x_new, ei_new
 
             load_std = env.get_load_std()
             n_steps = selected_sfc.F_k + 1

@@ -24,7 +24,8 @@ class NFVEnvironment:
         self._all_requests: List[SFCRequest] = []
         self.queue: List[SFCRequest] = []
         self.active_embeddings: List[Dict[str, Any]] = []
-        self.t: int = 0
+        # t is float to support fractional timestamps
+        self.t: float = 0.0
         self.next_sfc_id: int = 0
         self.accepted: int = 0
         self.rejected: int = 0
@@ -35,8 +36,8 @@ class NFVEnvironment:
         self.total_deploy_cost: float = 0.0
         self._load_std_cache: Optional[float] = None
         self._edge_index_cache: Optional[np.ndarray] = None
-        # P0: operation-level release heap
-        self._op_heap: list = []   # (finish_time, counter, spec)
+        # Per-operation release heap: (finish_time, counter, spec)
+        self._op_heap: list = []
         self._op_counter: int = 0
 
     def reset(
@@ -49,12 +50,11 @@ class NFVEnvironment:
         self.rejected = 0
         self.total_attempted = 0
         self.total_deploy_cost = 0.0
-        self.t = 0
+        self.t = 0.0
         self.queue = []
         self.active_embeddings = []
         self._load_std_cache = None
         self._edge_index_cache = None
-        # P0: reset operation heap
         self._op_heap = []
         self._op_counter = 0
         if G is not None and requests is not None:
@@ -113,7 +113,7 @@ class NFVEnvironment:
             self.queue = valid
 
     def _arrive_sfcs_random(self):
-        new_sfcs = generate_sfc_requests(self.cfg, self.t, self.next_sfc_id, self.G, self.rng)
+        new_sfcs = generate_sfc_requests(self.cfg, int(self.t), self.next_sfc_id, self.G, self.rng)
         self.next_sfc_id += len(new_sfcs)
         self.queue.extend(new_sfcs)
         self._purge_expired_queue()
@@ -129,10 +129,6 @@ class NFVEnvironment:
                 valid.append(q)
         self.queue = valid
 
-    # ------------------------------------------------------------------
-    # P0: schedule per-operation resource releases into heap
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _unpack_alloc(item: Tuple):
         node, path, cpu_req, bw = item[0], item[1], item[2], item[3]
@@ -140,17 +136,47 @@ class NFVEnvironment:
         hdd_req = item[5] if len(item) > 5 else 0.0
         return node, path, cpu_req, bw, ram_req, hdd_req
 
+    # ------------------------------------------------------------------
+    # Resource reservation: only reserve what's needed NOW for feasibility
+    # checking. Actual time-based release happens via _op_heap.
+    # ------------------------------------------------------------------
+
+    def allocate(
+        self,
+        node: int,
+        path: List[int],
+        cpu_req: float,
+        bw: float,
+        ram_req: float = 0.0,
+        hdd_req: float = 0.0,
+    ):
+        """Reserve resources immediately (for admission feasibility).
+        Release is scheduled per-operation in commit_sfc via _schedule_operation_releases."""
+        nd = self.G.nodes[node]
+        if cpu_req > 0.0:
+            nd["cpu_free"] -= cpu_req
+            if ram_req and "ram_free" in nd:
+                nd["ram_free"] -= ram_req
+            if hdd_req and "hdd_free" in nd:
+                nd["hdd_free"] -= hdd_req
+        adj = self.G._adj
+        for i in range(len(path) - 1):
+            adj[path[i]][path[i + 1]]["bw_free"] -= bw
+        if len(path) > 1:
+            self._load_std_cache = None
+        self._edge_index_cache = None
+
     def _schedule_operation_releases(
         self, allocations: List[Tuple], t_start: float, sfc: Optional[SFCRequest] = None
     ):
-        """Push per-operation finish events onto _op_heap.
+        """Schedule per-operation resource release events.
 
-        For each (node, path, cpu_req, bw) in allocations:
-          1. RoutingOperation: finish = t_current + sum(link delays on path)
-             → schedule BW release for those links
-          2. ServingOperation (if cpu_req > 0): finish = t_after_routing
-             + proc_delay[node] + VNF d_f[node]
-             → schedule CPU/RAM/HDD release for that node
+        For each allocation (node, path, cpu_req, bw):
+          - RoutingOperation: occupies links for link_delay duration starting at t_start.
+            Release BW at t_start + link_delay.
+          - ServingOperation (cpu_req > 0): occupies node for proc_delay + vnf_d starting
+            after routing. Release CPU at that finish time.
+        t advances sequentially through operations (pipeline model).
         """
         t = float(t_start)
         adj = self.G._adj
@@ -192,7 +218,6 @@ class NFVEnvironment:
     def compute_embedding_delay(
         self, allocations: List[Tuple], sfc: Optional[SFCRequest] = None
     ) -> float:
-        """Link delays + node proc_delay + VNF d_f along the embedding."""
         total = 0.0
         adj = self.G._adj
         nodes_data = self.G.nodes
@@ -210,9 +235,8 @@ class NFVEnvironment:
         return total
 
     def _release_expired_active_sfcs(self):
-        """Release resources for completed operations (P0: per-operation heap).
-
-        Also prune active_embeddings list for SFCs past their deadline.
+        """Release resources for completed operations from _op_heap.
+        Processes all events with finish_time <= self.t (float comparison).
         """
         t_float = float(self.t)
         adj = self.G._adj
@@ -224,7 +248,9 @@ class NFVEnvironment:
             if op_type == "link":
                 _, path, bw = spec
                 for i in range(len(path) - 1):
-                    adj[path[i]][path[i + 1]]["bw_free"] += bw
+                    u, v = path[i], path[i + 1]
+                    e = adj[u][v]
+                    e["bw_free"] = min(e["bw_free"] + bw, e["bw_total"])
                 changed = True
             elif op_type == "cpu":
                 node = spec[1]
@@ -232,18 +258,18 @@ class NFVEnvironment:
                 ram_req = spec[3] if len(spec) > 3 else 0.0
                 hdd_req = spec[4] if len(spec) > 4 else 0.0
                 nd = nodes_data[node]
-                nd["cpu_free"] += cpu_req
+                nd["cpu_free"] = min(nd["cpu_free"] + cpu_req, nd["cpu_total"])
                 if ram_req and "ram_free" in nd:
-                    nd["ram_free"] += ram_req
+                    nd["ram_free"] = min(nd["ram_free"] + ram_req, nd.get("ram_total", nd["ram_free"] + ram_req))
                 if hdd_req and "hdd_free" in nd:
-                    nd["hdd_free"] += hdd_req
+                    nd["hdd_free"] = min(nd["hdd_free"] + hdd_req, nd.get("hdd_total", nd["hdd_free"] + hdd_req))
                 changed = True
-        # Keep active_embeddings for lifecycle tracking (deadline-based)
         self.active_embeddings = [
             a for a in self.active_embeddings if a["deadline"] > self.t
         ]
         if changed:
             self._load_std_cache = None
+            self._edge_index_cache = None
 
     def _get_obs(self) -> Dict[str, Any]:
         return {
@@ -294,28 +320,6 @@ class NFVEnvironment:
             mask[u] = True
         return mask
 
-    def allocate(
-        self,
-        node: int,
-        path: List[int],
-        cpu_req: float,
-        bw: float,
-        ram_req: float = 0.0,
-        hdd_req: float = 0.0,
-    ):
-        nd = self.G.nodes[node]
-        if cpu_req > 0.0:
-            nd["cpu_free"] -= cpu_req
-            if ram_req and "ram_free" in nd:
-                nd["ram_free"] -= ram_req
-            if hdd_req and "hdd_free" in nd:
-                nd["hdd_free"] -= hdd_req
-        adj = self.G._adj
-        for i in range(len(path) - 1):
-            adj[path[i]][path[i + 1]]["bw_free"] -= bw
-        if len(path) > 1:
-            self._load_std_cache = None
-
     def _rollback_resources(self, allocations):
         if not allocations:
             return
@@ -325,14 +329,17 @@ class NFVEnvironment:
             node, path, cpu_req, bw, ram_req, hdd_req = self._unpack_alloc(item)
             if cpu_req > 0.0:
                 nd = nodes[node]
-                nd["cpu_free"] += cpu_req
+                nd["cpu_free"] = min(nd["cpu_free"] + cpu_req, nd["cpu_total"])
                 if ram_req and "ram_free" in nd:
-                    nd["ram_free"] += ram_req
+                    nd["ram_free"] = min(nd["ram_free"] + ram_req, nd.get("ram_total", nd["ram_free"] + ram_req))
                 if hdd_req and "hdd_free" in nd:
-                    nd["hdd_free"] += hdd_req
+                    nd["hdd_free"] = min(nd["hdd_free"] + hdd_req, nd.get("hdd_total", nd["hdd_free"] + hdd_req))
             for i in range(len(path) - 1):
-                adj[path[i]][path[i + 1]]["bw_free"] += bw
+                u, v = path[i], path[i + 1]
+                e = adj[u][v]
+                e["bw_free"] = min(e["bw_free"] + bw, e["bw_total"])
         self._load_std_cache = None
+        self._edge_index_cache = None
 
     def get_load_std(self) -> float:
         if self._load_std_cache is None:
@@ -342,14 +349,16 @@ class NFVEnvironment:
     def commit_sfc(
         self, sfc: SFCRequest, allocations: List[Tuple], deploy_cost: float = 0.0
     ):
+        # Schedule per-operation resource releases FIRST, then drop allocations.
+        # After scheduling, the op_heap owns the release responsibility;
+        # active_embeddings only needs sfc_id + deadline for lifecycle tracking.
+        self._schedule_operation_releases(allocations, float(self.t), sfc=sfc)
         self.active_embeddings.append(
-            {"sfc_id": sfc.sfc_id, "deadline": sfc.deadline, "allocations": allocations}
+            {"sfc_id": sfc.sfc_id, "deadline": sfc.deadline}
         )
         self.accepted += 1
         self.total_attempted += 1
         self.total_deploy_cost += deploy_cost
-        # P0: schedule per-operation resource releases
-        self._schedule_operation_releases(allocations, float(self.t), sfc=sfc)
 
     def reject_sfc(
         self, sfc: SFCRequest, allocations: List[Tuple], requeue: bool = True
@@ -368,28 +377,55 @@ class NFVEnvironment:
             rc.mu_cpu * sfc.total_cpu_req() + rc.mu_bw * sfc.bandwidth * (sfc.F_k + 1)
         ) / max(1, sfc.F_k)
 
+    def _next_event_time(self) -> Optional[float]:
+        """Return the earliest float time of next op-heap event or request arrival."""
+        times = []
+        if self._op_heap:
+            times.append(self._op_heap[0][0])
+        if self._dataset_mode and self._req_cursor < len(self._all_requests):
+            times.append(float(self._all_requests[self._req_cursor].arrival_time))
+        return min(times) if times else None
+
     def step_time(self) -> bool:
-        self.t += 1
-        self._release_expired_active_sfcs()
+        """Advance time to next meaningful event (float-aware)."""
         if self._dataset_mode:
+            # Advance to next integer tick for request arrivals, but also
+            # process any op_heap events at fractional times in between.
+            next_int_t = float(int(self.t) + 1)
+            # Process any op events that fire before next integer tick
+            if self._op_heap and self._op_heap[0][0] < next_int_t:
+                # Advance to fractional event time
+                self.t = self._op_heap[0][0]
+                self._release_expired_active_sfcs()
+                return False
+
+            self.t = next_int_t
+            self._release_expired_active_sfcs()
             self._flush_arrivals()
+
             if self._req_cursor >= len(self._all_requests):
                 unexpired = [q for q in self.queue if q.deadline > self.t]
                 if unexpired:
-                    next_event = (
-                        min(e["deadline"] for e in self.active_embeddings)
-                        if self.active_embeddings
-                        else min(q.deadline for q in unexpired)
-                    )
-                    if next_event > self.t:
-                        self.t = next_event
-                        self._release_expired_active_sfcs()
-                        self._purge_expired_queue()
+                    # Jump to next op event or deadline
+                    candidates = []
+                    if self._op_heap:
+                        candidates.append(self._op_heap[0][0])
+                    if self.active_embeddings:
+                        candidates.append(float(min(e["deadline"] for e in self.active_embeddings)))
+                    if candidates:
+                        next_t = min(candidates)
+                        if next_t > self.t:
+                            self.t = next_t
+                            self._release_expired_active_sfcs()
+                            self._purge_expired_queue()
             return self._req_cursor >= len(self._all_requests) and not any(
                 q.deadline > self.t for q in self.queue
             )
         else:
-            if self.t % self.cfg.sfc.arrival_interval == 0:
+            # Random mode: integer ticks
+            self.t = float(int(self.t) + 1)
+            self._release_expired_active_sfcs()
+            if int(self.t) % self.cfg.sfc.arrival_interval == 0:
                 self._arrive_sfcs_random()
             else:
                 self._purge_expired_queue()
