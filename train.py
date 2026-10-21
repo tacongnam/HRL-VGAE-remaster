@@ -31,7 +31,6 @@ class LiveProfiler:
 
     def hit(self, stage_name: str):
         now = time.perf_counter()
-        elapsed = (now - self.t_last) * 1000.0
         self.t_last = now
         if self.step % self.print_every == 0:
             pass
@@ -129,7 +128,6 @@ def run_episode(
     pareto_w = torch.tensor([w_accept, w_cost], dtype=torch.float32, device=device)
 
     z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
-    # graph_dirty: True when allocations were made and VGAE needs re-encode
     graph_dirty = False
     z_nodes_cpu = z_nodes.cpu()
 
@@ -267,8 +265,6 @@ def run_episode(
             )
             curr_src = chosen_node
 
-            # Update VGAE embedding after each VNF placement to reflect
-            # current residual resources for next VNF decision
             if i < selected_sfc.F_k - 1:
                 vgae.eval()
                 x_cur, ei_cur = env.get_node_features_tensor(device)
@@ -279,7 +275,6 @@ def run_episode(
                 z_nodes = z_nodes.detach()
                 z_global = z_global.detach()
                 z_nodes_cpu = z_nodes.cpu()
-                # Update x, ei for potential VGAE training later
                 x, ei = x_cur, ei_cur
 
         dest_cost, dest_delay = 0.0, 0.0
@@ -311,7 +306,6 @@ def run_episode(
 
         if embedding_failed:
             env._rollback_resources(partial_allocations)
-            # After rollback, re-encode to reflect restored resources
             vgae.eval()
             x_rb, ei_rb = env.get_node_features_tensor(device)
             with torch.inference_mode():
@@ -322,18 +316,17 @@ def run_episode(
             z_global = z_global.detach()
             z_nodes_cpu = z_nodes.cpu()
             x, ei = x_rb, ei_rb
-            graph_dirty = False  # resources restored, embedding is fresh
+            graph_dirty = False
 
             hl_reward_vec = failure_vec.copy()
             r_H = scalarizer.scalarize(-cfg.reward.r_fail, 0.0, w_accept, w_cost)
+
             env.remove_sfc_from_queue(selected_sfc)
-            if not selected_sfc.is_expired(env.t + 1):
+            can_retry = not selected_sfc.is_expired(env.t + 1)
+            env.reject_sfc(selected_sfc, [], requeue=can_retry)
+            if can_retry and any(q.sfc_id == selected_sfc.sfc_id for q in env.queue):
                 blocked_until[selected_sfc.sfc_id] = env.t + 1
-                if not any(q.sfc_id == selected_sfc.sfc_id for q in env.queue):
-                    env.queue.append(selected_sfc)
             else:
-                env.rejected += 1
-                env.total_attempted += 1
                 blocked_until.pop(selected_sfc.sfc_id, None)
 
             if train and ll_records:
@@ -344,9 +337,9 @@ def run_episode(
             deploy_cost = total_deploy_cost(env.G, partial_allocations, cfg)
             env.commit_sfc(selected_sfc, partial_allocations, deploy_cost=deploy_cost)
             env.remove_sfc_from_queue(selected_sfc)
+            blocked_until.pop(selected_sfc.sfc_id, None)
             graph_dirty, sfc_vgae_count = True, sfc_vgae_count + 1
 
-            # Update embedding after commit to reflect final state
             vgae.eval()
             x_new, ei_new = env.get_node_features_tensor(device)
             with torch.inference_mode():
@@ -495,6 +488,7 @@ def run_episode(
         "epsilon_hl": hl_agent.epsilon,
         "epsilon_ll": ll_agent.epsilon,
         "total_deploy_cost": env.total_deploy_cost,
+        "total_node_placement_cost": env.total_node_placement_cost,
         "w_accept": w_accept,
         "w_cost": w_cost,
         "pareto_archive_size": len(pareto_archive) if pareto_archive else 0,
@@ -582,7 +576,8 @@ def main():
                         f"AccRatio={m.acceptance_ratio:.3f} | acc={m.accepted} rej={m.rejected} | "
                         f"HL_R={m.hl_reward:.2f} LL_R={m.ll_reward:.2f} | "
                         f"HL_L={m.hl_loss:.4f} LL_L={m.ll_loss:.4f} VGAE_L={m.vgae_loss:.4f} | "
-                        f"eps={m.epsilon:.3f} | DeployCost={m.total_deploy_cost:.2f} | "
+                        f"eps={m.epsilon:.3f} | DeployCost={m.total_deploy_cost:.2f} "
+                        f"NodeCost={stats.get('total_node_placement_cost', 0.0):.2f} | "
                         f"Archive={stats['pareto_archive_size']} | time={time.perf_counter() - ep_start:.1f}s",
                         flush=True,
                     )
