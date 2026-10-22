@@ -302,7 +302,7 @@ def run_episode(
                 partial_allocations.append(
                     (selected_sfc.dest, dest_path, 0.0, selected_sfc.bandwidth)
                 )
-                dest_cost, dest_delay = compute_path_cost_delay(env.G, dest_path)
+
             if not embedding_failed:
                 dest_cost, dest_delay = compute_path_cost_delay(env.G, dest_path, env.t)
                 total_delay = env.compute_embedding_delay(
