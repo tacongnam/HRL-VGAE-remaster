@@ -110,8 +110,7 @@ def evaluate_pareto_single(
     ablation: str,
     dry_run: bool,
     ref_acc: Optional[float] = None,
-    ref_cost: Optional[float] = None,
-    **kwargs: Any,
+    ref_cost: Optional[float] = None
 ) -> int:
     ensure_dir(pareto_out.parent)
     ensure_dir(hv_out.parent)
@@ -265,33 +264,6 @@ def evaluate_screen_all(
         "--ablation", ablation,
     ]
     return run_cmd(cmd, dry_run=dry_run)
-
-
-def evaluate_pareto_single(
-    checkpoint: Path,
-    episode_path: Path,
-    pareto_out: Path,
-    hv_out: Path,
-    pareto_points: int,
-    ablation: str,
-    dry_run: bool,
-) -> int:
-    """Full Pareto scan on one episode only, then compute HV metrics."""
-    ensure_dir(pareto_out.parent)
-    ensure_dir(hv_out.parent)
-    cmd = [
-        sys.executable, "evaluate.py",
-        "--pareto-scan",
-        "--checkpoint", str(checkpoint),
-        "--single-episode", str(episode_path),
-        "--pareto-points", str(pareto_points),
-        "--pareto-out", str(pareto_out),
-        "--compute-hv",
-        "--hv-out", str(hv_out),
-        "--ablation", ablation,
-    ]
-    return run_cmd(cmd, dry_run=dry_run)
-
 
 # ---------------------------------------------------------------------------
 # Select best-AR episode from screening JSON
