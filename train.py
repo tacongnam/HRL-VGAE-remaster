@@ -29,25 +29,6 @@ from utils import (
     total_deploy_cost,
 )
 
-class LiveProfiler:
-    def __init__(self, print_every: int = 1):
-        self.print_every = print_every
-        self.step = 0
-        self.t_last = time.perf_counter()
-
-    def hit(self, stage_name: str):
-        now = time.perf_counter()
-        self.t_last = now
-        if self.step % self.print_every == 0:
-            pass
-
-    def inc(self):
-        self.step += 1
-
-
-live_prof = LiveProfiler(print_every=1)
-
-
 def set_seeds(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -55,17 +36,14 @@ def set_seeds(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-
 def encode_graph(vgae, env, device, update_temporal=True):
     x, ei = env.get_node_features_tensor(device)
     with torch.inference_mode():
         z_nodes, z_global, mu, logvar = vgae(x, ei, graph_id=env.topology_id, update_temporal=update_temporal)
     return z_nodes.detach(), z_global.detach(), x, ei, mu, logvar
 
-
 def build_vnf_feature(vnf, cfg, device):
     return torch.tensor([vnf.cpu_req / cfg.network.cpu_capacity_mips, 1.0], dtype=torch.float32, device=device)
-
 
 def _compute_recon_loss_sampled(z_nodes, edge_index, num_nodes, neg_ratio, device):
     num_pos = edge_index.shape[1]
@@ -79,10 +57,8 @@ def _compute_recon_loss_sampled(z_nodes, edge_index, num_nodes, neg_ratio, devic
     return F.binary_cross_entropy_with_logits(pos_score, torch.ones_like(pos_score)) + \
            F.binary_cross_entropy_with_logits(neg_score, torch.zeros_like(neg_score))
 
-
 def _build_reward_vec_2obj(r_perf: float, r_cost: float) -> np.ndarray:
     return np.array([r_perf, r_cost], dtype=np.float32)
-
 
 def load_pretrained_vgae(vgae: MNVGAE, checkpoint_path: str, device: torch.device, cfg: Config = None) -> optim.Optimizer | None:
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -99,7 +75,6 @@ def load_pretrained_vgae(vgae: MNVGAE, checkpoint_path: str, device: torch.devic
     print(f"[pretrain] Loaded VGAE from {checkpoint_path} | Trainable temporal params: {len(temporal_params)}")
     return optim.Adam(temporal_params, lr=1e-3) if temporal_params else None
 
-
 def run_episode(
     env: NFVEnvironment,
     vgae: MNVGAE,
@@ -115,6 +90,7 @@ def run_episode(
     verbose: bool = False,
     fixed_weight: tuple | None = None,
 ) -> dict:
+    # Initialize episode statistics
     ep_hl_r, ep_ll_r, ep_r_acc, ep_r_cost = 0.0, 0.0, 0.0, 0.0
     vgae_loss_acc, hl_loss_acc, ll_loss_acc = 0.0, 0.0, 0.0
     vgae_updates, hl_updates, ll_updates = 0, 0, 0
@@ -137,6 +113,7 @@ def run_episode(
     z_nodes_cpu = z_nodes.cpu()
 
     while not done:
+        # If the queue is empty, step time forward and re-encode the graph
         if not env.queue:
             done = env.step_time()
             if not done:
@@ -144,7 +121,9 @@ def run_episode(
                 z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
             continue
 
+        # If the graph has changed due to previous allocations, re-encode the graph
         if train and vgae_optimizer is not None and sfc_vgae_count >= cfg.vgae.train_every_steps:
+            # Train the VGAE on the current graph state
             vgae_optimizer.zero_grad()
             vgae.train()
             _is_pretrained = not any(
@@ -172,6 +151,7 @@ def run_episode(
             z_nodes, z_global = z_nodes.detach(), z_global.detach()
             z_nodes_cpu, sfc_vgae_count = z_nodes.cpu(), 0
 
+        # Select the next SFC to embed using the high-level agent
         hl_res = hl_agent.select_sfc(
             z_global, env.queue, env.t, pareto_w
         )
@@ -182,6 +162,7 @@ def run_episode(
                 z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
             continue
 
+        # Unpack the selected SFC and prepare for low-level embedding
         prev_hl_z_global = z_global.detach().cpu()
         sfc_idx, selected_sfc = hl_res
         sfc_feat = torch.tensor(
@@ -189,6 +170,7 @@ def run_episode(
         )
         ll_records, partial_allocations, embedding_failed = [], [], False
         curr_src = selected_sfc.source
+        cur_t = float(env.t)
 
         for i in range(selected_sfc.F_k):
             vnf = selected_sfc.vnf_sequence[i]
@@ -243,6 +225,12 @@ def run_episode(
                 )
                 break
 
+            # Tính toán chính xác thời gian bắt đầu và kết thúc của VNF này
+            link_delay = sum(env.G[path[k]][path[k + 1]]["delay"] for k in range(len(path) - 1)) if len(path) > 1 else 0.0
+            serve_start = cur_t + link_delay
+            proc_delay = env.G.nodes[chosen_node].get("proc_delay", 0.0) + vnf.delay_at(chosen_node)
+            serve_end = serve_start + proc_delay
+
             env.allocate(
                 chosen_node,
                 path,
@@ -250,6 +238,8 @@ def run_episode(
                 selected_sfc.bandwidth,
                 ram_req=vnf.ram_req,
                 hdd_req=vnf.hdd_req,
+                t_start=cur_t,
+                t_end=serve_end,
             )
             partial_allocations.append(
                 (
@@ -259,6 +249,8 @@ def run_episode(
                     selected_sfc.bandwidth,
                     vnf.ram_req,
                     vnf.hdd_req,
+                    cur_t,
+                    serve_end,
                 )
             )
             p_cost, p_delay = compute_path_cost_delay(env.G, path, env.t)
@@ -271,6 +263,7 @@ def run_episode(
                 }
             )
             curr_src = chosen_node
+            cur_t = serve_end
 
             if i < selected_sfc.F_k - 1:
                 vgae.eval()
@@ -298,20 +291,23 @@ def run_episode(
             if dest_path is None:
                 embedding_failed = True
             else:
-                env.allocate(selected_sfc.dest, dest_path, 0.0, selected_sfc.bandwidth)
+                dest_delay_val = sum(env.G[dest_path[k]][dest_path[k + 1]]["delay"] for k in range(len(dest_path) - 1)) if len(dest_path) > 1 else 0.0
+                dest_end = cur_t + dest_delay_val
+                env.allocate(selected_sfc.dest, dest_path, 0.0, selected_sfc.bandwidth, t_start=cur_t, t_end=dest_end)
                 partial_allocations.append(
-                    (selected_sfc.dest, dest_path, 0.0, selected_sfc.bandwidth)
+                    (selected_sfc.dest, dest_path, 0.0, selected_sfc.bandwidth, 0.0, 0.0, cur_t, dest_end)
                 )
-
-            if not embedding_failed:
                 dest_cost, dest_delay = compute_path_cost_delay(env.G, dest_path, env.t)
+            if not embedding_failed:
                 total_delay = env.compute_embedding_delay(
                     partial_allocations, selected_sfc
                 )
                 if float(env.t) + total_delay > selected_sfc.deadline:
                     embedding_failed = True
+                    
         sfc_total_count += 1
 
+        # If embedding failed, remove the SFC from the queue and reject it, updating the low-level agent with the failure information
         if embedding_failed:
             env.remove_sfc_from_queue(selected_sfc)
             env.reject_sfc(selected_sfc, partial_allocations)
@@ -336,6 +332,8 @@ def run_episode(
                 ll_fail_vec = failure_vec / max(1, len(ll_records))
                 for rec in ll_records:
                     ll_agent.store_transition(rec["state"], None, ll_fail_vec, 1.0)
+
+        # If embedding succeeded, commit the SFC to the environment and update the low-level agent with the success information
         else:
             deploy_cost = total_deploy_cost(env.G, partial_allocations, cfg)
             env.commit_sfc(selected_sfc, partial_allocations, deploy_cost=deploy_cost)
@@ -385,6 +383,8 @@ def run_episode(
             if tracker:
                 tracker.record_sfc_success(selected_sfc.F_k + 1, revenue)
 
+
+            # Update the low-level agent with the rewards for each step in the SFC embedding process
             if train:
                 cost_per_step = deploy_cost / n_steps
                 for k, cur_rec in enumerate(ll_records):
@@ -411,11 +411,13 @@ def run_episode(
                     )
                     ll_agent.store_transition(cur_rec["state"], next_s, r_vec, float(is_term))
 
+        # Update episode-level statistics
         ep_hl_r += r_H
         if env._dataset_mode:
             env._flush_arrivals()
 
         if train:
+            # Store the transition for the high-level agent, including the next state features and whether the episode is done
             next_sfcs = [q for q in env.queue if not q.is_expired(env.t)]
             next_feats = [
                 torch.tensor(q.to_feature_vector(env.t), dtype=torch.float32, device=device)
@@ -437,6 +439,7 @@ def run_episode(
                 valid_action_mask=np.ones(len(next_feats), dtype=bool),
             )
 
+        # Train the high-level and low-level agents at specified intervals, accumulating losses for reporting
         if train and (sfc_total_count % cfg.train.train_interval_sfc == 0):
             if cfg.train.ablation_mode in ["HRL-VGAE", "Random-Fit", "GreedyFIFO"]:
                 loss_ll = ll_agent.train_step()
@@ -456,6 +459,7 @@ def run_episode(
                 z_nodes, z_global, x, ei, _mu, _logvar = encode_graph(vgae, env, device)
                 z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
 
+    # Finalize episode statistics and update the Pareto archive if applicable
     if pareto_archive is not None and env.accepted > 0:
         pareto_archive.add(
             np.array(
@@ -469,6 +473,7 @@ def run_episode(
             total_deploy_cost=env.total_deploy_cost,
         )
 
+    # Update the scalarizer weights based on the acceptance ratio and average cost per accepted SFC if training and not using fixed weights
     if train and not fixed_weight:
         scalarizer.adapt_weights(
             env.acceptance_ratio(),

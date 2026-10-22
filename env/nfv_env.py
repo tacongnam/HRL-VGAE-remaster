@@ -42,7 +42,7 @@ class NFVEnvironment:
 
     @staticmethod
     def _res_query(times: List[float], values: List[float], t: float) -> float:
-        idx = bisect.bisect_right(times, t) - 1
+        idx = bisect.bisect_right(times, float(t)) - 1
         if idx < 0:
             idx = 0
         return float(values[idx])
@@ -55,24 +55,41 @@ class NFVEnvironment:
         t_end: float,
         val: float,
     ):
-        t = float(t_start)
-        v = float(val)
-        if not times:
-            times.append(t)
-            values.append(v)
+        t_s = float(t_start)
+        t_e = float(t_end)
+        if t_e <= t_s:
             return
-        if t > times[-1]:
-            times.append(t)
-            values.append(v)
-        elif t == times[-1]:
-            values[-1] = v
-        else:
-            idx = bisect.bisect_right(times, t)
-            if idx > 0 and times[idx - 1] == t:
-                values[idx - 1] = v
+
+        cur_s = NFVEnvironment._res_query(times, values, t_s)
+        delta = float(val) - cur_s
+        if abs(delta) < 1e-9:
+            return
+
+        cur_e = NFVEnvironment._res_query(times, values, t_e)
+
+        idx_s = bisect.bisect_right(times, t_s)
+        if idx_s == 0 or times[idx_s - 1] != t_s:
+            times.insert(idx_s, t_s)
+            values.insert(idx_s, cur_s)
+
+        idx_e = bisect.bisect_right(times, t_e)
+        if idx_e == 0 or times[idx_e - 1] != t_e:
+            times.insert(idx_e, t_e)
+            values.insert(idx_e, cur_e)
+
+        start_idx = bisect.bisect_left(times, t_s)
+        end_idx = bisect.bisect_left(times, t_e)
+
+        for i in range(start_idx, end_idx):
+            values[i] += delta
+
+        i = 1
+        while i < len(times):
+            if abs(values[i] - values[i - 1]) < 1e-9:
+                times.pop(i)
+                values.pop(i)
             else:
-                times.insert(idx, t)
-                values.insert(idx, v)
+                i += 1
 
     @staticmethod
     def _res_range(times: List[float], t_start: float, t_end: float) -> Tuple[float, float]:
@@ -86,9 +103,10 @@ class NFVEnvironment:
         t_end: float,
         amount: float,
     ):
-        t = float(t_start)
-        cur = NFVEnvironment._res_query(times, values, t)
-        NFVEnvironment._res_set(times, values, t, t_end, cur + float(amount))
+        ts = float(t_start)
+        te = float(t_end)
+        cur = NFVEnvironment._res_query(times, values, ts)
+        NFVEnvironment._res_set(times, values, ts, te, cur + float(amount))
 
     @staticmethod
     def _release_bw_timeline(
@@ -210,11 +228,17 @@ class NFVEnvironment:
 
     @staticmethod
     def _unpack_alloc(item: Tuple):
-        node, path, cpu_req, bw = item[0], item[1], item[2], item[3]
+        node = item[0]
+        path = item[1]
+        cpu_req = item[2]
+        bw = item[3]
         ram_req = item[4] if len(item) > 4 else 0.0
         hdd_req = item[5] if len(item) > 5 else 0.0
-        return node, path, cpu_req, bw, ram_req, hdd_req
+        t_start = item[6] if len(item) > 6 else None
+        t_end = item[7] if len(item) > 7 else None
+        return node, path, cpu_req, bw, ram_req, hdd_req, t_start, t_end
 
+    # Resource allocation and release methods
     def allocate(
         self,
         node: int,
@@ -223,44 +247,56 @@ class NFVEnvironment:
         bw: float,
         ram_req: float = 0.0,
         hdd_req: float = 0.0,
+        t_start: Optional[float] = None,
+        t_end: Optional[float] = None,
     ):
+        ts = float(self.t) if t_start is None else float(t_start)
+        # Calculate the end time based on path and processing delays if t_end is not provided
+        if t_end is None:
+            adj = self.G._adj
+            path_d = sum(adj[path[i]][path[i + 1]].get("delay", 0.0) for i in range(len(path) - 1)) if len(path) > 1 else 0.0
+            proc_d = self.G.nodes[node].get("proc_delay", 0.0) if cpu_req > 0.0 else 0.0
+            te = ts + max(1.0, path_d + proc_d)
+        else:
+            te = float(t_end)
+
         nd = self.G.nodes[node]
         if cpu_req > 0.0:
-            cur_cpu = self._res_query(nd["_cpu_times"], nd["_cpu_values"], float(self.t))
+            cur_cpu = self._res_query(nd["_cpu_times"], nd["_cpu_values"], ts)
             self._res_set(
                 nd["_cpu_times"],
                 nd["_cpu_values"],
-                float(self.t),
-                float(self.t) + 1.0,
+                ts,
+                te,
                 cur_cpu - cpu_req,
             )
             if ram_req and "_ram_times" in nd:
-                cur_ram = self._res_query(nd["_ram_times"], nd["_ram_values"], float(self.t))
+                cur_ram = self._res_query(nd["_ram_times"], nd["_ram_values"], ts)
                 self._res_set(
                     nd["_ram_times"],
                     nd["_ram_values"],
-                    float(self.t),
-                    float(self.t) + 1.0,
+                    ts,
+                    te,
                     cur_ram - ram_req,
                 )
             if hdd_req and "_hdd_times" in nd:
-                cur_hdd = self._res_query(nd["_hdd_times"], nd["_hdd_values"], float(self.t))
+                cur_hdd = self._res_query(nd["_hdd_times"], nd["_hdd_values"], ts)
                 self._res_set(
                     nd["_hdd_times"],
                     nd["_hdd_values"],
-                    float(self.t),
-                    float(self.t) + 1.0,
+                    ts,
+                    te,
                     cur_hdd - hdd_req,
                 )
         adj = self.G._adj
         for i in range(len(path) - 1):
             e = adj[path[i]][path[i + 1]]
-            cur_bw = self._res_query(e["_bw_times"], e["_bw_values"], float(self.t))
+            cur_bw = self._res_query(e["_bw_times"], e["_bw_values"], ts)
             self._res_set(
                 e["_bw_times"],
                 e["_bw_values"],
-                float(self.t),
-                float(self.t) + 1.0,
+                ts,
+                te,
                 cur_bw - bw,
             )
         if len(path) > 1:
@@ -279,7 +315,7 @@ class NFVEnvironment:
         link_paths_bw = []
 
         for item in allocations:
-            node, path, cpu_req, bw, ram_req, hdd_req = self._unpack_alloc(item)
+            node, path, cpu_req, bw, ram_req, hdd_req, _, _ = self._unpack_alloc(item)
             if len(path) > 1:
                 link_delay = sum(
                     adj[path[i]][path[i + 1]].get("delay", 0.0)
@@ -324,7 +360,7 @@ class NFVEnvironment:
         nodes_data = self.G.nodes
         vnf_iter = iter(sfc.vnf_sequence) if sfc is not None else iter(())
         for item in allocations:
-            node, path, cpu_req, _, _, _ = self._unpack_alloc(item)
+            node, path, cpu_req, _, _, _, _, _ = self._unpack_alloc(item)
             for i in range(len(path) - 1):
                 total += adj[path[i]][path[i + 1]].get("delay", 0.0)
             if cpu_req > 0.0:
@@ -337,49 +373,17 @@ class NFVEnvironment:
 
     def _release_expired_active_sfcs(self):
         t_float = float(self.t)
-        adj = self.G._adj
-        nodes_data = self.G.nodes
         changed = False
         while self._op_heap and self._op_heap[0][0] <= t_float:
-            event_time, _, spec = heapq.heappop(self._op_heap)
-            op_type = spec[0]
-            if op_type == "link":
-                _, path, bw = spec
-                for i in range(len(path) - 1):
-                    u, v = path[i], path[i + 1]
-                    e = adj[u][v]
-                    self._release_bw_timeline(
-                        e["_bw_times"], e["_bw_values"], event_time, event_time + 1.0, bw
-                    )
-                changed = True
-            elif op_type == "cpu":
-                node = spec[1]
-                cpu_req = spec[2]
-                ram_req = spec[3] if len(spec) > 3 else 0.0
-                hdd_req = spec[4] if len(spec) > 4 else 0.0
-                nd = nodes_data[node]
-                res = self._res_range(nd["_cpu_times"], event_time, event_time + 1.0)
-                self._release_resource_timeline(
-                    nd["_cpu_times"], nd["_cpu_values"], res[0], res[1], cpu_req
-                )
-                if ram_req and "_ram_times" in nd:
-                    res = self._res_range(nd["_ram_times"], event_time, event_time + 1.0)
-                    self._release_resource_timeline(
-                        nd["_ram_times"], nd["_ram_values"], res[0], res[1], ram_req
-                    )
-                if hdd_req and "_hdd_times" in nd:
-                    res = self._res_range(nd["_hdd_times"], event_time, event_time + 1.0)
-                    self._release_resource_timeline(
-                        nd["_hdd_times"], nd["_hdd_values"], res[0], res[1], hdd_req
-                    )
-                changed = True
+            heapq.heappop(self._op_heap)
+            changed = True
         self.active_embeddings = [
             a for a in self.active_embeddings if a["deadline"] > self.t
         ]
         if changed:
             self._load_std_cache = None
             self._edge_index_cache = None
-            
+
     def _get_obs(self) -> Dict[str, Any]:
         return {
             "node_features": (
@@ -468,21 +472,26 @@ class NFVEnvironment:
         adj = self.G._adj
         nodes = self.G.nodes
         for item in allocations:
-            node, path, cpu_req, bw, ram_req, hdd_req = self._unpack_alloc(item)
+            node, path, cpu_req, bw, ram_req, hdd_req, t_start, t_end = self._unpack_alloc(item)
+            ts = float(self.t) if t_start is None else float(t_start)
+            if t_end is None:
+                path_d = sum(adj[path[i]][path[i + 1]].get("delay", 0.0) for i in range(len(path) - 1)) if len(path) > 1 else 0.0
+                proc_d = nodes[node].get("proc_delay", 0.0) if cpu_req > 0.0 else 0.0
+                te = ts + max(1.0, path_d + proc_d)
+            else:
+                te = float(t_end)
+
             if cpu_req > 0.0:
                 nd = nodes[node]
-                res = self._res_range(nd["_cpu_times"], float(self.t), float(self.t) + 1.0)
-                self._release_resource_timeline(nd["_cpu_times"], nd["_cpu_values"], res[0], res[1], cpu_req)
+                self._release_resource_timeline(nd["_cpu_times"], nd["_cpu_values"], ts, te, cpu_req)
                 if ram_req and "_ram_times" in nd:
-                    res = self._res_range(nd["_ram_times"], float(self.t), float(self.t) + 1.0)
-                    self._release_resource_timeline(nd["_ram_times"], nd["_ram_values"], res[0], res[1], ram_req)
+                    self._release_resource_timeline(nd["_ram_times"], nd["_ram_values"], ts, te, ram_req)
                 if hdd_req and "_hdd_times" in nd:
-                    res = self._res_range(nd["_hdd_times"], float(self.t), float(self.t) + 1.0)
-                    self._release_resource_timeline(nd["_hdd_times"], nd["_hdd_values"], res[0], res[1], hdd_req)
+                    self._release_resource_timeline(nd["_hdd_times"], nd["_hdd_values"], ts, te, hdd_req)
             for i in range(len(path) - 1):
                 u, v = path[i], path[i + 1]
                 e = adj[u][v]
-                self._release_bw_timeline(e["_bw_times"], e["_bw_values"], float(self.t), float(self.t) + 1.0, bw)
+                self._release_bw_timeline(e["_bw_times"], e["_bw_values"], ts, te, bw)
         self._load_std_cache = None
         self._edge_index_cache = None
 
@@ -495,7 +504,7 @@ class NFVEnvironment:
         total = 0.0
         nodes_data = self.G.nodes
         for item in allocations:
-            node, _, cpu_req, _, ram_req, hdd_req = self._unpack_alloc(item)
+            node, _, cpu_req, _, ram_req, hdd_req, _, _ = self._unpack_alloc(item)
             if cpu_req > 0.0:
                 nd = nodes_data[node]
                 total += (
