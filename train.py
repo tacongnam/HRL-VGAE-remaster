@@ -1,7 +1,13 @@
 import argparse
 import random
 import time
-from collections import defaultdict
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*torch\.jit\.script.*",
+)
 
 import numpy as np
 import torch
@@ -114,7 +120,6 @@ def run_episode(
     vgae_updates, hl_updates, ll_updates = 0, 0, 0
     sfc_vgae_count, sfc_total_count, sfc_step_count = 0, 0, 0
     done = False
-    blocked_until = {}
     failure_vec = cfg.pareto.failure_penalty_vector()
 
     if vgae is not None:
@@ -134,7 +139,7 @@ def run_episode(
     while not done:
         if not env.queue:
             done = env.step_time()
-            if not done and graph_dirty:
+            if not done:
                 z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
                 z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
             continue
@@ -168,15 +173,16 @@ def run_episode(
             z_nodes_cpu, sfc_vgae_count = z_nodes.cpu(), 0
 
         hl_res = hl_agent.select_sfc(
-            z_global, env.queue, env.t, pareto_w, blocked_until, verbose=verbose
+            z_global, env.queue, env.t, pareto_w
         )
         if hl_res is None:
             done = env.step_time()
-            if not done and graph_dirty:
+            if not done:
                 z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
                 z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
             continue
 
+        prev_hl_z_global = z_global.detach().cpu()
         sfc_idx, selected_sfc = hl_res
         sfc_feat = torch.tensor(
             selected_sfc.to_feature_vector(env.t), dtype=torch.float32, device=device
@@ -201,7 +207,6 @@ def run_episode(
                 current_source=curr_src,
                 G=env.G,
                 k_hop=cfg.train.k_hop_explore,
-                verbose=verbose,
                 t=env.t,
             )
             if chosen_node is None:
@@ -299,37 +304,33 @@ def run_episode(
                 )
                 dest_cost, dest_delay = compute_path_cost_delay(env.G, dest_path)
             if not embedding_failed:
+                dest_cost, dest_delay = compute_path_cost_delay(env.G, dest_path, env.t)
                 total_delay = env.compute_embedding_delay(
                     partial_allocations, selected_sfc
                 )
                 if float(env.t) + total_delay > selected_sfc.deadline:
                     embedding_failed = True
-
         sfc_total_count += 1
 
         if embedding_failed:
-            vgae.eval()
-            x_rb, ei_rb = env.get_node_features_tensor(device)
-            with torch.inference_mode():
-                z_nodes, z_global, _, _ = vgae(
-                    x_rb, ei_rb, graph_id=env.topology_id, update_temporal=False
-                )
-            z_nodes = z_nodes.detach()
-            z_global = z_global.detach()
-            z_nodes_cpu = z_nodes.cpu()
-            x, ei = x_rb, ei_rb
+            env.remove_sfc_from_queue(selected_sfc)
+            env.reject_sfc(selected_sfc, partial_allocations)
+
+            if partial_allocations:
+                vgae.eval()
+                x_rb, ei_rb = env.get_node_features_tensor(device)
+                with torch.inference_mode():
+                    z_nodes, z_global, _, _ = vgae(
+                        x_rb, ei_rb, graph_id=env.topology_id, update_temporal=False
+                    )
+                z_nodes = z_nodes.detach()
+                z_global = z_global.detach()
+                z_nodes_cpu = z_nodes.cpu()
+                x, ei = x_rb, ei_rb
             graph_dirty = False
 
             hl_reward_vec = failure_vec.copy()
             r_H = scalarizer.scalarize(-cfg.reward.r_fail, 0.0, w_accept, w_cost)
-
-            env.remove_sfc_from_queue(selected_sfc)
-            can_retry = not selected_sfc.is_expired(env.t + 1)
-            env.reject_sfc(selected_sfc, [], requeue=can_retry)
-            if can_retry and any(q.sfc_id == selected_sfc.sfc_id for q in env.queue):
-                blocked_until[selected_sfc.sfc_id] = env.t + 1
-            else:
-                blocked_until.pop(selected_sfc.sfc_id, None)
 
             if train and ll_records:
                 ll_fail_vec = failure_vec / max(1, len(ll_records))
@@ -339,7 +340,6 @@ def run_episode(
             deploy_cost = total_deploy_cost(env.G, partial_allocations, cfg)
             env.commit_sfc(selected_sfc, partial_allocations, deploy_cost=deploy_cost)
             env.remove_sfc_from_queue(selected_sfc)
-            blocked_until.pop(selected_sfc.sfc_id, None)
             graph_dirty, sfc_vgae_count = True, sfc_vgae_count + 1
 
             vgae.eval()
@@ -425,7 +425,7 @@ def run_episode(
                 not hasattr(env, "_req_cursor") or env._req_cursor >= len(env._all_requests)
             )
             hl_agent.store_transition(
-                z_global.cpu(),
+                prev_hl_z_global,
                 sfc_feat.cpu(),
                 pareto_w.cpu(),
                 sfc_idx,
@@ -450,10 +450,11 @@ def run_episode(
                     hl_updates += 1
 
         sfc_step_count += 1
-        done = env.step_time() if not env.queue else done
-        if not env.queue and not done and graph_dirty:
-            z_nodes, z_global, x, ei, _mu, _logvar = encode_graph(vgae, env, device)
-            z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
+        if not env.queue:
+            done = env.step_time()
+            if not done:
+                z_nodes, z_global, x, ei, _mu, _logvar = encode_graph(vgae, env, device)
+                z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
 
     if pareto_archive is not None and env.accepted > 0:
         pareto_archive.add(
@@ -490,6 +491,7 @@ def run_episode(
         "epsilon_hl": hl_agent.epsilon,
         "epsilon_ll": ll_agent.epsilon,
         "total_deploy_cost": env.total_deploy_cost,
+        "avg_cost_per_accepted": (env.total_deploy_cost / env.accepted) if env.accepted > 0 else 0.0,
         "total_node_placement_cost": env.total_node_placement_cost,
         "w_accept": w_accept,
         "w_cost": w_cost,
@@ -499,11 +501,10 @@ def run_episode(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-dir", type=str, default="data/train")
-    parser.add_argument("--test-dir", type=str, default="data/test1")
     parser.add_argument("--checkpoint", type=str, default="vgae_hrl_ql_checkpoint.pt")
     parser.add_argument("--log-dir", type=str, default="runs")
     parser.add_argument("--csv", type=str, default="training_log.csv")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--passes-per-file", type=int, default=1)
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--verbose", action="store_true")
@@ -573,12 +574,13 @@ def main():
                     logger.log(m)
 
                     phase = "WARMUP" if is_warmup else "TRAIN"
+                    avg_c = (m.total_deploy_cost / m.accepted) if m.accepted > 0 else 0.0
                     print(
                         f"[{phase}] Ep {global_ep:5d} | Epoch {epoch}/{args.epochs} | "
                         f"AccRatio={m.acceptance_ratio:.3f} | acc={m.accepted} rej={m.rejected} | "
                         f"HL_R={m.hl_reward:.2f} LL_R={m.ll_reward:.2f} | "
                         f"HL_L={m.hl_loss:.4f} LL_L={m.ll_loss:.4f} VGAE_L={m.vgae_loss:.4f} | "
-                        f"eps={m.epsilon:.3f} | DeployCost={m.total_deploy_cost:.2f} "
+                        f"eps={m.epsilon:.3f} | DeployCost={m.total_deploy_cost:.2f} AvgCost={avg_c:.2f} "
                         f"NodeCost={stats.get('total_node_placement_cost', 0.0):.2f} | "
                         f"Archive={stats['pareto_archive_size']} | time={time.perf_counter() - ep_start:.1f}s",
                         flush=True,

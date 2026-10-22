@@ -5,6 +5,7 @@ import glob
 import numpy as np
 import torch
 
+from typing import Optional
 from config import Config
 from env import NFVEnvironment
 from models import MNVGAE
@@ -35,8 +36,13 @@ def _resolve_episode_paths(args) -> list:
         )
     return discover_episodes(args.data_dir)
 
-
-def _compute_hv(scan_json: str, out: str, eps: float, baseline_json: str = ""):
+def _compute_hv(
+    scan_json: str,
+    out: str,
+    eps: float,
+    baseline_json: str = "",
+    ref_point: Optional[np.ndarray] = None,
+):
     with open(scan_json) as f:
         data = json.load(f)
 
@@ -54,10 +60,17 @@ def _compute_hv(scan_json: str, out: str, eps: float, baseline_json: str = ""):
     front_pts = pareto_front([tuple(p) for p in pts]) if len(pts) else []
 
     if len(pts) == 0:
-        ref = np.array([-eps, -eps], dtype=np.float64)
+        ref = (
+            np.array([-eps, -eps], dtype=np.float64)
+            if ref_point is None
+            else np.asarray(ref_point, dtype=np.float64)
+        )
         hv = 0.0
     else:
-        ref = np.array([pts[:, 0].min() - eps, pts[:, 1].min() - eps])
+        if ref_point is not None:
+            ref = np.asarray(ref_point, dtype=np.float64)
+        else:
+            ref = np.array([pts[:, 0].min() - eps, pts[:, 1].min() - eps])
         hv = (
             compute_hypervolume(np.array(front_pts, dtype=np.float64), ref)
             if front_pts
@@ -117,7 +130,6 @@ def _compute_hv(scan_json: str, out: str, eps: float, baseline_json: str = ""):
         f"HV={hv:.6f}  Spacing={spacing:.4f}  Delta={spread:.4f}  "
         f"ref={ref.tolist()}  front_size={len(front_pts)}  saved→{out}"
     )
-
 
 def _load_checkpoint(checkpoint: str, cfg: Config, device: torch.device):
     ckpt = torch.load(checkpoint, map_location=device)
@@ -255,21 +267,32 @@ def _scan_pareto(args):
                     train=False,
                     fixed_weight=(w_acc, w_cost),
                 )
+                accepted = int(stats.get("accepted", 0))
+                rejected = int(stats.get("rejected", 0))
+                deploy_cost = float(stats["total_deploy_cost"])
+                avg_cost_per_accepted = deploy_cost / accepted if accepted > 0 else 0.0
                 results.append(
                     {
                         "w_accept": w_acc,
                         "w_cost": w_cost,
                         "acc_ratio": float(stats["acceptance_ratio"]),
-                        "deploy_cost": float(stats["total_deploy_cost"]),
+                        "deploy_cost": deploy_cost,
+                        "avg_cost_per_accepted": avg_cost_per_accepted,
+                        "accepted": accepted,
+                        "rejected": rejected,
                         "path": path,
                     }
                 )
 
             w_entries = [e for e in results if abs(e["w_accept"] - w_acc) < 1e-9]
+            mean_acc = np.mean([e['acc_ratio'] for e in w_entries])
+            mean_cost = np.mean([e['deploy_cost'] for e in w_entries])
+            mean_avg_cost = np.mean([e['avg_cost_per_accepted'] for e in w_entries])
             print(
                 f"  w_accept={w_acc:.2f}  "
-                f"acc={np.mean([e['acc_ratio'] for e in w_entries]):.4f}  "
-                f"cost={np.mean([e['deploy_cost'] for e in w_entries]):.2f}"
+                f"acc={mean_acc:.4f}  "
+                f"cost={mean_cost:.2f}  "
+                f"avg_cost_per_accepted={mean_avg_cost:.2f}"
             )
 
     _ensure_parent(args.pareto_out)
@@ -277,8 +300,10 @@ def _scan_pareto(args):
         json.dump(results, f, indent=2)
     print(f"Pareto scan saved → {args.pareto_out}  ({len(results)} entries)")
     if args.compute_hv:
-        _compute_hv(args.pareto_out, args.hv_out, args.hv_eps)
-
+        ref_pt = None
+        if args.ref_acc is not None and args.ref_cost is not None:
+            ref_pt = np.array([args.ref_acc, -args.ref_cost], dtype=np.float64)
+        _compute_hv(args.pareto_out, args.hv_out, args.hv_eps, ref_point=ref_pt)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -310,16 +335,21 @@ def main():
     parser.add_argument("--compute-hv", action="store_true")
     parser.add_argument("--hv-out", type=str, default="hv_result.json")
     parser.add_argument("--hv-eps", type=float, default=1e-2)
+    parser.add_argument("--ref-acc", type=float, default=None)
+    parser.add_argument("--ref-cost", type=float, default=None)
     parser.add_argument("--ablation", type=str, default="HRL-VGAE", choices=["DefaultBaseline", "Random-Fit", "GreedyFIFO", "GreedyLowLevel", "HRL-VGAE"])
     args = parser.parse_args()
+
+    ref_pt = None
+    if args.ref_acc is not None and args.ref_cost is not None:
+        ref_pt = np.array([args.ref_acc, -args.ref_cost], dtype=np.float64)
 
     if args.ar_cost_only:
         _eval_ar_cost(args)
     elif args.pareto_scan:
         _scan_pareto(args)
     else:
-        _compute_hv(args.scan_json, args.out, args.eps)
-
+        _compute_hv(args.scan_json, args.out, args.eps, ref_point=ref_pt)
 
 if __name__ == "__main__":
     main()

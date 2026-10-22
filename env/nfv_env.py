@@ -1,3 +1,4 @@
+import bisect
 import heapq
 import math
 import random
@@ -14,9 +15,6 @@ from utils import (
     generate_sfc_requests,
 )
 from utils.graph_generator import get_node_features
-
-_MAX_SFC_RETRIES = 3
-
 
 class NFVEnvironment:
     def __init__(self, cfg: Config):
@@ -41,7 +39,82 @@ class NFVEnvironment:
         self._edge_index_cache: Optional[np.ndarray] = None
         self._op_heap: list = []
         self._op_counter: int = 0
-        self._sfc_retry_count: Dict[int, int] = {}
+
+    @staticmethod
+    def _res_query(times: List[float], values: List[float], t: float) -> float:
+        idx = bisect.bisect_right(times, t) - 1
+        if idx < 0:
+            idx = 0
+        return float(values[idx])
+
+    @staticmethod
+    def _res_set(
+        times: List[float],
+        values: List[float],
+        t_start: float,
+        t_end: float,
+        val: float,
+    ):
+        t = float(t_start)
+        v = float(val)
+        if not times:
+            times.append(t)
+            values.append(v)
+            return
+        if t > times[-1]:
+            times.append(t)
+            values.append(v)
+        elif t == times[-1]:
+            values[-1] = v
+        else:
+            idx = bisect.bisect_right(times, t)
+            if idx > 0 and times[idx - 1] == t:
+                values[idx - 1] = v
+            else:
+                times.insert(idx, t)
+                values.insert(idx, v)
+
+    @staticmethod
+    def _res_range(times: List[float], t_start: float, t_end: float) -> Tuple[float, float]:
+        return float(t_start), float(t_end)
+
+    @staticmethod
+    def _release_resource_timeline(
+        times: List[float],
+        values: List[float],
+        t_start: float,
+        t_end: float,
+        amount: float,
+    ):
+        t = float(t_start)
+        cur = NFVEnvironment._res_query(times, values, t)
+        NFVEnvironment._res_set(times, values, t, t_end, cur + float(amount))
+
+    @staticmethod
+    def _release_bw_timeline(
+        times: List[float],
+        values: List[float],
+        t_start: float,
+        t_end: float,
+        amount: float,
+    ):
+        NFVEnvironment._release_resource_timeline(times, values, t_start, t_end, amount)
+
+    def _init_timelines(self):
+        for _, nd in self.G.nodes(data=True):
+            cpu = float(nd.get("cpu_total", 0.0))
+            nd["_cpu_times"] = [0.0]
+            nd["_cpu_values"] = [cpu]
+            ram = float(nd.get("ram_total", 0.0))
+            nd["_ram_times"] = [0.0]
+            nd["_ram_values"] = [ram]
+            hdd = float(nd.get("hdd_total", 0.0))
+            nd["_hdd_times"] = [0.0]
+            nd["_hdd_values"] = [hdd]
+        for _, _, ed in self.G.edges(data=True):
+            bw = float(ed.get("bw_total", 0.0))
+            ed["_bw_times"] = [0.0]
+            ed["_bw_values"] = [bw]
 
     def reset(
         self,
@@ -61,10 +134,10 @@ class NFVEnvironment:
         self._edge_index_cache = None
         self._op_heap = []
         self._op_counter = 0
-        self._sfc_retry_count = {}
         if G is not None and requests is not None:
             self._dataset_mode = True
             self.G = G.copy()
+            self._init_timelines()
             self.topology_id = topology_id
             self._all_requests = sorted(requests, key=lambda r: r.arrival_time)
             self._req_cursor = 0
@@ -72,6 +145,7 @@ class NFVEnvironment:
         else:
             self._dataset_mode = False
             self.G = build_substrate_network(self.cfg, self.rng)
+            self._init_timelines()
             self.topology_id = None
             self._all_requests = []
             self.next_sfc_id = 0
@@ -152,12 +226,13 @@ class NFVEnvironment:
     ):
         nd = self.G.nodes[node]
         if cpu_req > 0.0:
+            cur_cpu = self._res_query(nd["_cpu_times"], nd["_cpu_values"], float(self.t))
             self._res_set(
                 nd["_cpu_times"],
                 nd["_cpu_values"],
                 float(self.t),
                 float(self.t) + 1.0,
-                nd.get("_cpu_values", [float(nd["cpu_total"])])[0] - cpu_req,
+                cur_cpu - cpu_req,
             )
             if ram_req and "_ram_times" in nd:
                 cur_ram = self._res_query(nd["_ram_times"], nd["_ram_values"], float(self.t))
@@ -179,12 +254,14 @@ class NFVEnvironment:
                 )
         adj = self.G._adj
         for i in range(len(path) - 1):
+            e = adj[path[i]][path[i + 1]]
+            cur_bw = self._res_query(e["_bw_times"], e["_bw_values"], float(self.t))
             self._res_set(
-                adj[path[i]][path[i + 1]]["_bw_times"],
-                adj[path[i]][path[i + 1]]["_bw_values"],
+                e["_bw_times"],
+                e["_bw_values"],
                 float(self.t),
                 float(self.t) + 1.0,
-                float(adj[path[i]][path[i + 1]]["_bw_values"][0]) - bw,
+                cur_bw - bw,
             )
         if len(path) > 1:
             self._load_std_cache = None
@@ -193,13 +270,6 @@ class NFVEnvironment:
     def _schedule_operation_releases(
         self, allocations: List[Tuple], t_start: float, sfc: Optional[SFCRequest] = None
     ):
-        """Schedule resource release after the entire SFC pipeline completes.
-
-        BW on all links is held until the full SFC serving pipeline finishes
-        (i.e., after the last CPU operation), matching greedy-KSP semantics
-        where bandwidth is reserved for the duration [t_start, t_end] of the SFC.
-        CPU on each node is released after that node's serving phase ends.
-        """
         adj = self.G._adj
         nodes_data = self.G.nodes
         vnf_iter = iter(sfc.vnf_sequence) if sfc is not None else iter(())
@@ -271,7 +341,7 @@ class NFVEnvironment:
         nodes_data = self.G.nodes
         changed = False
         while self._op_heap and self._op_heap[0][0] <= t_float:
-            _, _, spec = heapq.heappop(self._op_heap)
+            event_time, _, spec = heapq.heappop(self._op_heap)
             op_type = spec[0]
             if op_type == "link":
                 _, path, bw = spec
@@ -279,7 +349,7 @@ class NFVEnvironment:
                     u, v = path[i], path[i + 1]
                     e = adj[u][v]
                     self._release_bw_timeline(
-                        e["_bw_times"], e["_bw_values"], t_float, t_float + 1.0, bw
+                        e["_bw_times"], e["_bw_values"], event_time, event_time + 1.0, bw
                     )
                 changed = True
             elif op_type == "cpu":
@@ -288,17 +358,17 @@ class NFVEnvironment:
                 ram_req = spec[3] if len(spec) > 3 else 0.0
                 hdd_req = spec[4] if len(spec) > 4 else 0.0
                 nd = nodes_data[node]
-                res = self._res_range(nd["_cpu_times"], t_float, t_float + 1.0)
+                res = self._res_range(nd["_cpu_times"], event_time, event_time + 1.0)
                 self._release_resource_timeline(
                     nd["_cpu_times"], nd["_cpu_values"], res[0], res[1], cpu_req
                 )
                 if ram_req and "_ram_times" in nd:
-                    res = self._res_range(nd["_ram_times"], t_float, t_float + 1.0)
+                    res = self._res_range(nd["_ram_times"], event_time, event_time + 1.0)
                     self._release_resource_timeline(
                         nd["_ram_times"], nd["_ram_values"], res[0], res[1], ram_req
                     )
                 if hdd_req and "_hdd_times" in nd:
-                    res = self._res_range(nd["_hdd_times"], t_float, t_float + 1.0)
+                    res = self._res_range(nd["_hdd_times"], event_time, event_time + 1.0)
                     self._release_resource_timeline(
                         nd["_hdd_times"], nd["_hdd_values"], res[0], res[1], hdd_req
                     )
@@ -309,13 +379,13 @@ class NFVEnvironment:
         if changed:
             self._load_std_cache = None
             self._edge_index_cache = None
-
+            
     def _get_obs(self) -> Dict[str, Any]:
         return {
             "node_features": (
-                get_node_features_from_graph(self.G, self.cfg.vgae.d_in)
+                get_node_features_from_graph(self.G, self.cfg.vgae.d_in, self.t)
                 if self._dataset_mode
-                else get_node_features(self.G, self.cfg)
+                else get_node_features(self.G, self.cfg, self.t)
             ),
             "edge_index": self._build_edge_index(),
             "queue": self.queue,
@@ -343,17 +413,37 @@ class NFVEnvironment:
             torch.from_numpy(obs["edge_index"]).to(device),
         )
 
+    def get_edge_bw_free(self, u: int, v: int, t: float) -> float:
+        e = self.G._adj[u][v]
+        return NFVEnvironment._res_query(
+            e.get("_bw_times", [0.0]),
+            e.get("_bw_values", [float(e.get("bw_total", 0.0))]),
+            float(t),
+        )
+
     def get_node_cpu_free(self, node: int, t: float) -> float:
         nd = self.G.nodes[node]
-        return NFVEnvironment._res_query(nd["_cpu_times"], nd["_cpu_values"], float(t))
+        return NFVEnvironment._res_query(
+            nd.get("_cpu_times", [0.0]),
+            nd.get("_cpu_values", [float(nd.get("cpu_total", 0.0))]),
+            float(t),
+        )
 
     def get_node_ram_free(self, node: int, t: float) -> float:
         nd = self.G.nodes[node]
-        return NFVEnvironment._res_query(nd["_ram_times"], nd["_ram_values"], float(t))
+        return NFVEnvironment._res_query(
+            nd.get("_ram_times", [0.0]),
+            nd.get("_ram_values", [float(nd.get("ram_total", 0.0))]),
+            float(t),
+        )
 
     def get_node_hdd_free(self, node: int, t: float) -> float:
         nd = self.G.nodes[node]
-        return NFVEnvironment._res_query(nd["_hdd_times"], nd["_hdd_values"], float(t))
+        return NFVEnvironment._res_query(
+            nd.get("_hdd_times", [0.0]),
+            nd.get("_hdd_values", [float(nd.get("hdd_total", 0.0))]),
+            float(t),
+        )
 
     def build_ll_mask(
         self, cpu_req: float, ram_req: float = 0.0, hdd_req: float = 0.0
@@ -365,12 +455,10 @@ class NFVEnvironment:
                 continue
             if self.get_node_cpu_free(u, t) < cpu_req:
                 continue
-            if ram_req > 0.0 and "_ram_times" in nd:
-                if self._res_query(nd["_ram_times"], nd["_ram_values"], t) < ram_req:
-                    continue
-            if hdd_req > 0.0 and "_hdd_times" in nd:
-                if self._res_query(nd["_hdd_times"], nd["_hdd_values"], t) < hdd_req:
-                    continue
+            if ram_req > 0.0 and self.get_node_ram_free(u, t) < ram_req:
+                continue
+            if hdd_req > 0.0 and self.get_node_hdd_free(u, t) < hdd_req:
+                continue
             mask[u] = True
         return mask
 
@@ -400,7 +488,7 @@ class NFVEnvironment:
 
     def get_load_std(self) -> float:
         if self._load_std_cache is None:
-            self._load_std_cache = compute_load_std(self.G)
+            self._load_std_cache = compute_load_std(self.G, self.t)
         return self._load_std_cache
 
     def _node_placement_cost(self, allocations: List[Tuple]) -> float:
@@ -428,25 +516,13 @@ class NFVEnvironment:
         self.total_attempted += 1
         self.total_deploy_cost += deploy_cost
         self.total_node_placement_cost += self._node_placement_cost(allocations)
-        self._sfc_retry_count.pop(sfc.sfc_id, None)
 
     def reject_sfc(
-        self, sfc: SFCRequest, allocations: List[Tuple], requeue: bool = True
+        self, sfc: SFCRequest, allocations: List[Tuple]
     ):
         self._rollback_resources(allocations)
-        if requeue and sfc.deadline > self.t:
-            retries = self._sfc_retry_count.get(sfc.sfc_id, 0) + 1
-            if retries <= _MAX_SFC_RETRIES:
-                self._sfc_retry_count[sfc.sfc_id] = retries
-                if not any(q.sfc_id == sfc.sfc_id for q in self.queue):
-                    self.queue.append(sfc)
-            else:
-                self._sfc_retry_count.pop(sfc.sfc_id, None)
-                self.rejected += 1
-                self.total_attempted += 1
-        else:
-            self.rejected += 1
-            self.total_attempted += 1
+        self.rejected += 1
+        self.total_attempted += 1
 
     def norm_revenue(self, sfc: SFCRequest) -> float:
         rc = self.cfg.reward

@@ -1,9 +1,16 @@
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*torch\.jit\.script.*",
+)
+
 from torch_geometric.nn import GCNConv
 from config import Config
-
 
 class MNVGAE(nn.Module):
     def __init__(self, cfg: Config):

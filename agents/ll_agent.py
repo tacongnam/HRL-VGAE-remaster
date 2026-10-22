@@ -67,7 +67,6 @@ class LLAgent:
         current_source: int | None = None,
         G: nx.Graph | None = None,
         k_hop: int = 3,
-        verbose: bool = False,
         t: float = 0.0,
     ) -> int | None:
         valid_nodes = np.flatnonzero(cpu_mask)
@@ -98,7 +97,7 @@ class LLAgent:
                     candidates = [n for n in valid_nodes if n in lengths]
                     if candidates:
                         return int(random.choice(candidates))
-                except Exception:  # noqa: BLE001, S110
+                except Exception:
                     pass
             return int(random.choice(valid_nodes))
 
@@ -125,7 +124,7 @@ class LLAgent:
             q_sets, cpu_mask, self._ref_point, tie_break_rng=self._tie_rng
         )
         return int(chosen)
-
+    
     def store_transition(self, state_tuple, next_state_tuple, reward_vec: np.ndarray, done: float):
         self.buffer.push(state_tuple, next_state_tuple, reward_vec, done)
 

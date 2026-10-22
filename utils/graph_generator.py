@@ -68,7 +68,6 @@ class SFCRequest:
             dtype=np.float32,
         )
 
-
 def build_substrate_network(cfg: Config, rng: random.Random = None) -> nx.Graph:
     if rng is None:
         rng = random.Random()
@@ -80,6 +79,8 @@ def build_substrate_network(cfg: Config, rng: random.Random = None) -> nx.Graph:
     for u in G.nodes():
         G.nodes[u]["cpu_total"] = nc.cpu_capacity_mips
         G.nodes[u]["cpu_free"] = nc.cpu_capacity_mips
+        G.nodes[u]["_cpu_times"] = [0.0]
+        G.nodes[u]["_cpu_values"] = [nc.cpu_capacity_mips]
         G.nodes[u]["is_function_node"] = u in fn_nodes
         G.nodes[u]["cost_cpu"] = rng.uniform(100.0, 200.0)
         G.nodes[u]["cost_ram"] = rng.uniform(50.0, 100.0)
@@ -90,9 +91,10 @@ def build_substrate_network(cfg: Config, rng: random.Random = None) -> nx.Graph:
         delay = rng.uniform(nc.delay_min_ms, nc.delay_max_ms)
         G[u][v]["bw_total"] = bw
         G[u][v]["bw_free"] = bw
+        G[u][v]["_bw_times"] = [0.0]
+        G[u][v]["_bw_values"] = [bw]
         G[u][v]["delay"] = delay
     return G
-
 
 def generate_sfc_requests(
     cfg: Config, current_t: int, next_id_start: int, G: nx.Graph, rng: random.Random = None
@@ -134,14 +136,13 @@ def generate_sfc_requests(
         )
     return requests
 
-
-def get_node_features(G: nx.Graph, cfg: Config) -> np.ndarray:
+def get_node_features(G: nx.Graph, cfg: Config, t: float = 0.0) -> np.ndarray:
     nc = cfg.network
     feats = []
     for u in sorted(G.nodes()):
         nd = G.nodes[u]
         cpu_total = float(nd.get("cpu_total", 0.0))
-        cpu_free = _query_sparse(nd.get("_cpu_times", [0.0]), nd.get("_cpu_values", [cpu_total]), 0.0)
+        cpu_free = _query_sparse(nd.get("_cpu_times", [0.0]), nd.get("_cpu_values", [cpu_total]), float(t))
         cpu_util = 1.0 - cpu_free / cpu_total if cpu_total > 0 else 0.0
         is_fn = float(nd.get("is_function_node", False))
         neighbors = list(G.neighbors(u))
@@ -151,7 +152,7 @@ def get_node_features(G: nx.Graph, cfg: Config) -> np.ndarray:
             for v in neighbors:
                 e = G[u][v]
                 bw_total = float(e.get("bw_total", 0.0))
-                bw_free = _query_sparse(e.get("_bw_times", [0.0]), e.get("_bw_values", [bw_total]), 0.0)
+                bw_free = _query_sparse(e.get("_bw_times", [0.0]), e.get("_bw_values", [bw_total]), float(t))
                 utils.append(1.0 - bw_free / bw_total if bw_total > 0 else 0.0)
             avg_bw_util = float(np.mean(utils))
         degree_norm = G.degree(u) / max(1, nc.num_nodes - 1)

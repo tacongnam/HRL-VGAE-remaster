@@ -76,12 +76,9 @@ class HLAgent:
         queue: List,
         t: int,
         pareto_w: torch.Tensor,
-        blocked_until: Optional[dict] = None,
-        verbose: bool = False,
     ) -> Optional[Tuple[int, Any]]:
-        blocked_until = blocked_until or {}
         valid_indices = [
-            i for i, q in enumerate(queue) if not q.is_expired(t) and blocked_until.get(q.sfc_id, t) <= t
+            i for i, q in enumerate(queue) if not q.is_expired(t)
         ]
         if not valid_indices:
             return None
@@ -120,7 +117,7 @@ class HLAgent:
         )
         best_idx = valid_indices[best_local]
         return best_idx, queue[best_idx]
-
+    
     def store_transition(self, *args, **kwargs):
         self.buffer.push(*args, **kwargs)
 

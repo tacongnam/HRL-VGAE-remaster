@@ -11,11 +11,7 @@ import networkx as nx
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-try:
-    from utils.graph_generator import SFCRequest, VNF
-except ImportError:
-    from graph_generator import SFCRequest, VNF
-
+from utils.graph_generator import SFCRequest, VNF
 
 def _query_sparse(times: list[float], values: list[float], t: float) -> float:
     idx = bisect.bisect_right(times, t) - 1
@@ -42,7 +38,6 @@ def compute_topology_id(V_raw: dict, E_raw: list) -> str:
     payload = json.dumps({"n": node_sig, "e": edge_sig}, sort_keys=True)
     return hashlib.md5(payload.encode()).hexdigest()[:16]
 
-
 def parse_episode(path: str) -> Tuple[nx.Graph, List[SFCRequest], List[Dict], str]:
     with open(path, "r") as f:
         data = json.load(f)
@@ -68,6 +63,12 @@ def parse_episode(path: str) -> Tuple[nx.Graph, List[SFCRequest], List[Dict], st
             ram_free=ram,
             hdd_total=hdd,
             hdd_free=hdd,
+            _cpu_times=[0.0],
+            _cpu_values=[cpu],
+            _ram_times=[0.0],
+            _ram_values=[ram],
+            _hdd_times=[0.0],
+            _hdd_values=[hdd],
             is_function_node=is_server,
             proc_delay=float(nd.get("d_v", 0.0)) if is_server else 0.0,
             cost_cpu=float(nd.get("cost_c", 1.0)) if is_server else 0.0,
@@ -79,7 +80,7 @@ def parse_episode(path: str) -> Tuple[nx.Graph, List[SFCRequest], List[Dict], st
         v = _node_id(e["v"])
         bw = float(e["b_l"])
         dl = float(e["d_l"])
-        G.add_edge(u, v, bw_total=bw, bw_free=bw, delay=dl)
+        G.add_edge(u, v, bw_total=bw, bw_free=bw, _bw_times=[0.0], _bw_values=[bw], delay=dl)
     requests: List[SFCRequest] = []
     for idx, r in enumerate(R_raw):
         arrival = int(math.floor(r["T"]))
@@ -116,8 +117,7 @@ def parse_episode(path: str) -> Tuple[nx.Graph, List[SFCRequest], List[Dict], st
     requests.sort(key=lambda r: r.arrival_time)
     return G, requests, F_raw, topology_id
 
-
-def get_node_features_from_graph(G: nx.Graph, d_in: int = 16) -> np.ndarray:
+def get_node_features_from_graph(G: nx.Graph, d_in: int = 16, t: float = 0.0) -> np.ndarray:
     nodes = sorted(G.nodes())
     n = len(nodes)
     node_idx = {u: i for i, u in enumerate(nodes)}
@@ -126,7 +126,7 @@ def get_node_features_from_graph(G: nx.Graph, d_in: int = 16) -> np.ndarray:
         _query_sparse(
             G.nodes[u].get("_cpu_times", [0.0]),
             G.nodes[u].get("_cpu_values", [G.nodes[u]["cpu_total"]]),
-            0.0,
+            float(t),
         )
         for u in nodes
     ], dtype=np.float32)
@@ -153,7 +153,7 @@ def get_node_features_from_graph(G: nx.Graph, d_in: int = 16) -> np.ndarray:
         bw_free = _query_sparse(
             d.get("_bw_times", [0.0]),
             d.get("_bw_values", [bw_total]),
-            0.0,
+            float(t),
         )
         util = 1.0 - bw_free / bw_total if bw_total > 0 else 0.0
         i, j = node_idx[u], node_idx[v]
@@ -180,7 +180,6 @@ def get_node_features_from_graph(G: nx.Graph, d_in: int = 16) -> np.ndarray:
         feats = np.concatenate([feats, pad], axis=1)
     return feats[:, :d_in]
 
-
 def discover_episodes(data_dir: str) -> List[str]:
     return sorted(glob.glob(os.path.join(data_dir, "episode_*.json")))
 
@@ -196,14 +195,7 @@ def train_test_split(
 # Topology-only helpers
 # ---------------------------------------------------------------------------
 
-
 def parse_topology(path: str) -> Tuple[nx.Graph, List[Dict], str]:
-    """Load a topology-only JSON {V, E, F} and return (G, F_raw, topology_id).
-
-    The topology JSON is the same schema as an episode JSON but without the
-    'R' key (or with an empty 'R' list).  This allows one fixed topology to
-    be shared across many episode files.
-    """
     with open(path, "r") as f:
         data = json.load(f)
     V_raw = data["V"]
@@ -228,6 +220,12 @@ def parse_topology(path: str) -> Tuple[nx.Graph, List[Dict], str]:
             ram_free=ram,
             hdd_total=hdd,
             hdd_free=hdd,
+            _cpu_times=[0.0],
+            _cpu_values=[cpu],
+            _ram_times=[0.0],
+            _ram_values=[ram],
+            _hdd_times=[0.0],
+            _hdd_values=[hdd],
             is_function_node=is_server,
             proc_delay=float(nd.get("d_v", 0.0)) if is_server else 0.0,
             cost_cpu=float(nd.get("cost_c", 1.0)) if is_server else 0.0,
@@ -239,10 +237,9 @@ def parse_topology(path: str) -> Tuple[nx.Graph, List[Dict], str]:
         v = _node_id(e["v"])
         bw = float(e["b_l"])
         dl = float(e["d_l"])
-        G.add_edge(u, v, bw_total=bw, bw_free=bw, delay=dl)
+        G.add_edge(u, v, bw_total=bw, bw_free=bw, _bw_times=[0.0], _bw_values=[bw], delay=dl)
 
     return G, F_raw, topology_id
-
 
 def save_topology(path: str, G: nx.Graph, F_raw: List[Dict]):
     """Save topology {V, E, F} to JSON without any requests."""
