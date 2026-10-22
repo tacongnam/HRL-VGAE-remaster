@@ -1,9 +1,17 @@
 import random
+import bisect
 import numpy as np
 import networkx as nx
 from dataclasses import dataclass, field
 from typing import List
 from config import Config
+
+
+def _query_sparse(times: list[float], values: list[float], t: float) -> float:
+    idx = bisect.bisect_right(times, t) - 1
+    if idx < 0:
+        idx = 0
+    return values[idx]
 
 
 @dataclass
@@ -131,21 +139,26 @@ def get_node_features(G: nx.Graph, cfg: Config) -> np.ndarray:
     nc = cfg.network
     feats = []
     for u in sorted(G.nodes()):
-        cpu_util = 1.0 - G.nodes[u]["cpu_free"] / G.nodes[u]["cpu_total"]
-        is_fn = float(G.nodes[u]["is_function_node"])
+        nd = G.nodes[u]
+        cpu_total = float(nd.get("cpu_total", 0.0))
+        cpu_free = _query_sparse(nd.get("_cpu_times", [0.0]), nd.get("_cpu_values", [cpu_total]), 0.0)
+        cpu_util = 1.0 - cpu_free / cpu_total if cpu_total > 0 else 0.0
+        is_fn = float(nd.get("is_function_node", False))
         neighbors = list(G.neighbors(u))
         avg_bw_util = 0.0
         if neighbors:
             utils = []
             for v in neighbors:
                 e = G[u][v]
-                utils.append(1.0 - e["bw_free"] / e["bw_total"])
+                bw_total = float(e.get("bw_total", 0.0))
+                bw_free = _query_sparse(e.get("_bw_times", [0.0]), e.get("_bw_values", [bw_total]), 0.0)
+                utils.append(1.0 - bw_free / bw_total if bw_total > 0 else 0.0)
             avg_bw_util = float(np.mean(utils))
         degree_norm = G.degree(u) / max(1, nc.num_nodes - 1)
-        cpu_free_norm = G.nodes[u]["cpu_free"] / nc.cpu_capacity_mips
-        cpu_total_norm = G.nodes[u]["cpu_total"] / nc.cpu_capacity_mips
-        proc_delay_norm = G.nodes[u].get("proc_delay", 0.0) / 5.0
-        cost_cpu_norm = G.nodes[u].get("cost_cpu", 1.0) / 2.0
+        cpu_free_norm = cpu_free / nc.cpu_capacity_mips if nc.cpu_capacity_mips > 0 else 0.0
+        cpu_total_norm = cpu_total / nc.cpu_capacity_mips if nc.cpu_capacity_mips > 0 else 0.0
+        proc_delay_norm = nd.get("proc_delay", 0.0) / 5.0
+        cost_cpu_norm = nd.get("cost_cpu", 1.0) / 2.0
         feat = [
             cpu_util,
             cpu_free_norm,

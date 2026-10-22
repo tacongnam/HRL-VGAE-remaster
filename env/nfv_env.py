@@ -152,14 +152,40 @@ class NFVEnvironment:
     ):
         nd = self.G.nodes[node]
         if cpu_req > 0.0:
-            nd["cpu_free"] -= cpu_req
-            if ram_req and "ram_free" in nd:
-                nd["ram_free"] -= ram_req
-            if hdd_req and "hdd_free" in nd:
-                nd["hdd_free"] -= hdd_req
+            self._res_set(
+                nd["_cpu_times"],
+                nd["_cpu_values"],
+                float(self.t),
+                float(self.t) + 1.0,
+                nd.get("_cpu_values", [float(nd["cpu_total"])])[0] - cpu_req,
+            )
+            if ram_req and "_ram_times" in nd:
+                cur_ram = self._res_query(nd["_ram_times"], nd["_ram_values"], float(self.t))
+                self._res_set(
+                    nd["_ram_times"],
+                    nd["_ram_values"],
+                    float(self.t),
+                    float(self.t) + 1.0,
+                    cur_ram - ram_req,
+                )
+            if hdd_req and "_hdd_times" in nd:
+                cur_hdd = self._res_query(nd["_hdd_times"], nd["_hdd_values"], float(self.t))
+                self._res_set(
+                    nd["_hdd_times"],
+                    nd["_hdd_values"],
+                    float(self.t),
+                    float(self.t) + 1.0,
+                    cur_hdd - hdd_req,
+                )
         adj = self.G._adj
         for i in range(len(path) - 1):
-            adj[path[i]][path[i + 1]]["bw_free"] -= bw
+            self._res_set(
+                adj[path[i]][path[i + 1]]["_bw_times"],
+                adj[path[i]][path[i + 1]]["_bw_values"],
+                float(self.t),
+                float(self.t) + 1.0,
+                float(adj[path[i]][path[i + 1]]["_bw_values"][0]) - bw,
+            )
         if len(path) > 1:
             self._load_std_cache = None
         self._edge_index_cache = None
@@ -252,7 +278,9 @@ class NFVEnvironment:
                 for i in range(len(path) - 1):
                     u, v = path[i], path[i + 1]
                     e = adj[u][v]
-                    e["bw_free"] = min(e["bw_free"] + bw, e["bw_total"])
+                    self._release_bw_timeline(
+                        e["_bw_times"], e["_bw_values"], t_float, t_float + 1.0, bw
+                    )
                 changed = True
             elif op_type == "cpu":
                 node = spec[1]
@@ -260,11 +288,20 @@ class NFVEnvironment:
                 ram_req = spec[3] if len(spec) > 3 else 0.0
                 hdd_req = spec[4] if len(spec) > 4 else 0.0
                 nd = nodes_data[node]
-                nd["cpu_free"] = min(nd["cpu_free"] + cpu_req, nd["cpu_total"])
-                if ram_req and "ram_free" in nd:
-                    nd["ram_free"] = min(nd["ram_free"] + ram_req, nd.get("ram_total", nd["ram_free"] + ram_req))
-                if hdd_req and "hdd_free" in nd:
-                    nd["hdd_free"] = min(nd["hdd_free"] + hdd_req, nd.get("hdd_total", nd["hdd_free"] + hdd_req))
+                res = self._res_range(nd["_cpu_times"], t_float, t_float + 1.0)
+                self._release_resource_timeline(
+                    nd["_cpu_times"], nd["_cpu_values"], res[0], res[1], cpu_req
+                )
+                if ram_req and "_ram_times" in nd:
+                    res = self._res_range(nd["_ram_times"], t_float, t_float + 1.0)
+                    self._release_resource_timeline(
+                        nd["_ram_times"], nd["_ram_values"], res[0], res[1], ram_req
+                    )
+                if hdd_req and "_hdd_times" in nd:
+                    res = self._res_range(nd["_hdd_times"], t_float, t_float + 1.0)
+                    self._release_resource_timeline(
+                        nd["_hdd_times"], nd["_hdd_values"], res[0], res[1], hdd_req
+                    )
                 changed = True
         self.active_embeddings = [
             a for a in self.active_embeddings if a["deadline"] > self.t
@@ -306,19 +343,34 @@ class NFVEnvironment:
             torch.from_numpy(obs["edge_index"]).to(device),
         )
 
+    def get_node_cpu_free(self, node: int, t: float) -> float:
+        nd = self.G.nodes[node]
+        return NFVEnvironment._res_query(nd["_cpu_times"], nd["_cpu_values"], float(t))
+
+    def get_node_ram_free(self, node: int, t: float) -> float:
+        nd = self.G.nodes[node]
+        return NFVEnvironment._res_query(nd["_ram_times"], nd["_ram_values"], float(t))
+
+    def get_node_hdd_free(self, node: int, t: float) -> float:
+        nd = self.G.nodes[node]
+        return NFVEnvironment._res_query(nd["_hdd_times"], nd["_hdd_values"], float(t))
+
     def build_ll_mask(
         self, cpu_req: float, ram_req: float = 0.0, hdd_req: float = 0.0
     ) -> np.ndarray:
         mask = np.zeros(self.G.number_of_nodes(), dtype=bool)
+        t = self.t
         for u, nd in self.G.nodes(data=True):
             if not nd.get("is_function_node", False):
                 continue
-            if nd["cpu_free"] < cpu_req:
+            if self.get_node_cpu_free(u, t) < cpu_req:
                 continue
-            if ram_req > 0.0 and nd.get("ram_free", float("inf")) < ram_req:
-                continue
-            if hdd_req > 0.0 and nd.get("hdd_free", float("inf")) < hdd_req:
-                continue
+            if ram_req > 0.0 and "_ram_times" in nd:
+                if self._res_query(nd["_ram_times"], nd["_ram_values"], t) < ram_req:
+                    continue
+            if hdd_req > 0.0 and "_hdd_times" in nd:
+                if self._res_query(nd["_hdd_times"], nd["_hdd_values"], t) < hdd_req:
+                    continue
             mask[u] = True
         return mask
 
@@ -331,15 +383,18 @@ class NFVEnvironment:
             node, path, cpu_req, bw, ram_req, hdd_req = self._unpack_alloc(item)
             if cpu_req > 0.0:
                 nd = nodes[node]
-                nd["cpu_free"] = min(nd["cpu_free"] + cpu_req, nd["cpu_total"])
-                if ram_req and "ram_free" in nd:
-                    nd["ram_free"] = min(nd["ram_free"] + ram_req, nd.get("ram_total", nd["ram_free"] + ram_req))
-                if hdd_req and "hdd_free" in nd:
-                    nd["hdd_free"] = min(nd["hdd_free"] + hdd_req, nd.get("hdd_total", nd["hdd_free"] + hdd_req))
+                res = self._res_range(nd["_cpu_times"], float(self.t), float(self.t) + 1.0)
+                self._release_resource_timeline(nd["_cpu_times"], nd["_cpu_values"], res[0], res[1], cpu_req)
+                if ram_req and "_ram_times" in nd:
+                    res = self._res_range(nd["_ram_times"], float(self.t), float(self.t) + 1.0)
+                    self._release_resource_timeline(nd["_ram_times"], nd["_ram_values"], res[0], res[1], ram_req)
+                if hdd_req and "_hdd_times" in nd:
+                    res = self._res_range(nd["_hdd_times"], float(self.t), float(self.t) + 1.0)
+                    self._release_resource_timeline(nd["_hdd_times"], nd["_hdd_values"], res[0], res[1], hdd_req)
             for i in range(len(path) - 1):
                 u, v = path[i], path[i + 1]
                 e = adj[u][v]
-                e["bw_free"] = min(e["bw_free"] + bw, e["bw_total"])
+                self._release_bw_timeline(e["_bw_times"], e["_bw_values"], float(self.t), float(self.t) + 1.0, bw)
         self._load_std_cache = None
         self._edge_index_cache = None
 

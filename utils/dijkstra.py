@@ -1,8 +1,16 @@
+import bisect
 import heapq
 import math
 
 import networkx as nx
 import numpy as np
+
+
+def _query_sparse(times: list[float], values: list[float], t: float) -> float:
+    idx = bisect.bisect_right(times, t) - 1
+    if idx < 0:
+        idx = 0
+    return values[idx]
 
 
 def custom_dijkstra(
@@ -12,6 +20,7 @@ def custom_dijkstra(
     req_bw: float,
     omega_bw: float = 100.0,
     lambda_penalty: float = 1.0,
+    t: float = 0.0,
 ) -> list[int] | None:
     if source == target:
         return [source]
@@ -33,7 +42,7 @@ def custom_dijkstra(
         for v, e in u_nbrs.items():
             if v in visited:
                 continue
-            bw_free = e["bw_free"]
+            bw_free = _query_sparse(e["_bw_times"], e["_bw_values"], t)
             if bw_free < req_bw:
                 continue
             rho = 1.0 - bw_free / e["bw_total"]
@@ -58,7 +67,7 @@ def custom_dijkstra(
     return path
 
 
-def compute_path_cost_delay(G: nx.Graph, path: list[int]) -> tuple[float, float]:
+def compute_path_cost_delay(G: nx.Graph, path: list[int], t: float = 0.0) -> tuple[float, float]:
     p_len = len(path)
     if p_len < 2:
         return 0.0, 0.0
@@ -66,14 +75,18 @@ def compute_path_cost_delay(G: nx.Graph, path: list[int]) -> tuple[float, float]
     adj = G._adj
     for i in range(p_len - 1):
         e = adj[path[i]][path[i + 1]]
-        cost += 1.0 - e["bw_free"] / e["bw_total"]
+        bw_free = _query_sparse(e["_bw_times"], e["_bw_values"], t)
+        cost += 1.0 - bw_free / e["bw_total"]
         delay += e["delay"]
     return float(cost), float(delay)
 
 
-def compute_load_std(G: nx.Graph) -> float:
+def compute_load_std(G: nx.Graph, t: float = 0.0) -> float:
     edges = G.edges(data=True)
     if len(edges) < 2:
         return 0.0
-    utils = [1.0 - d["bw_free"] / d["bw_total"] for _, _, d in edges]
+    utils = [
+        1.0 - _query_sparse(d["_bw_times"], d["_bw_values"], t) / d["bw_total"]
+        for _, _, d in edges
+    ]
     return float(np.std(utils, ddof=1))

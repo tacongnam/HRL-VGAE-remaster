@@ -1,4 +1,5 @@
 import random
+import bisect
 from collections import deque
 
 import networkx as nx
@@ -67,6 +68,7 @@ class LLAgent:
         G: nx.Graph | None = None,
         k_hop: int = 3,
         verbose: bool = False,
+        t: float = 0.0,
     ) -> int | None:
         valid_nodes = np.flatnonzero(cpu_mask)
         if valid_nodes.size == 0:
@@ -74,7 +76,19 @@ class LLAgent:
 
         mode = self.cfg.train.ablation_mode
         if mode in ["DefaultBaseline", "GreedyLowLevel"] and G is not None:
-            best_node = max(valid_nodes, key=lambda n: G.nodes[n].get("cpu_free", 0.0))
+            def _cpu_free(n: int) -> float:
+                nd = G.nodes[n]
+                times = nd["_cpu_times"]
+                values = nd["_cpu_values"]
+                idx = bisect.bisect_right(times, t) - 1
+                if idx < 0:
+                    idx = 0
+                return values[idx]
+
+            if hasattr(G, "get_node_cpu_free"):
+                best_node = max(valid_nodes, key=lambda n: G.get_node_cpu_free(n, t))
+            else:
+                best_node = max(valid_nodes, key=_cpu_free)
             return int(best_node)
 
         if random.random() < self.epsilon:

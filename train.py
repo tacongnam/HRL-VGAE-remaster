@@ -202,6 +202,7 @@ def run_episode(
                 G=env.G,
                 k_hop=cfg.train.k_hop_explore,
                 verbose=verbose,
+                t=env.t,
             )
             if chosen_node is None:
                 embedding_failed = True
@@ -223,8 +224,9 @@ def run_episode(
                 selected_sfc.bandwidth,
                 cfg.reward.omega_bw,
                 0.0 if cfg.train.ablation_mode == "DefaultBaseline" else cfg.reward.lambda_penalty,
+                t=env.t,
             )
-            if path is None or env.G.nodes[chosen_node]["cpu_free"] < vnf.cpu_req:
+            if path is None or env.get_node_cpu_free(chosen_node, env.t) < vnf.cpu_req:
                 embedding_failed = True
                 ll_records.append(
                     {
@@ -254,7 +256,7 @@ def run_episode(
                     vnf.hdd_req,
                 )
             )
-            p_cost, p_delay = compute_path_cost_delay(env.G, path)
+            p_cost, p_delay = compute_path_cost_delay(env.G, path, env.t)
             ll_records.append(
                 {
                     "state": state_record,
@@ -286,6 +288,7 @@ def run_episode(
                 selected_sfc.bandwidth,
                 cfg.reward.omega_bw,
                 0.0 if cfg.train.ablation_mode == "DefaultBaseline" else cfg.reward.lambda_penalty,
+                t=env.t,
             )
             if dest_path is None:
                 embedding_failed = True
@@ -305,7 +308,6 @@ def run_episode(
         sfc_total_count += 1
 
         if embedding_failed:
-            env._rollback_resources(partial_allocations)
             vgae.eval()
             x_rb, ei_rb = env.get_node_features_tensor(device)
             with torch.inference_mode():

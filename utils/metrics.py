@@ -37,12 +37,21 @@ class MetricsTracker:
     def flush_episode(self, ep: int, env, stats: dict) -> EpisodeMetrics:
         link_utils = []
         for u, v, e in env.G.edges(data=True):
-            link_utils.append(1.0 - e["bw_free"] / e["bw_total"])
+            bw_total = float(e.get("bw_total", 0.0))
+            if hasattr(env, "get_edge_bw_free"):
+                bw_free = float(env.get_edge_bw_free(u, v, env.t))
+            else:
+                bw_free = float(e.get("bw_free", bw_total))
+            link_utils.append(1.0 - bw_free / bw_total if bw_total > 0 else 0.0)
         cpu_utils = []
         for u in env.G.nodes():
             nd = env.G.nodes[u]
             if nd.get("cpu_total", 0) > 0:
-                cpu_utils.append(1.0 - nd["cpu_free"] / nd["cpu_total"])
+                if hasattr(env, "get_node_cpu_free"):
+                    cpu_free = float(env.get_node_cpu_free(u, env.t))
+                else:
+                    cpu_free = float(nd.get("cpu_free", float(nd["cpu_total"])))
+                cpu_utils.append(1.0 - cpu_free / float(nd["cpu_total"]))
         m = EpisodeMetrics(
             episode=ep,
             hl_reward=stats["hl_reward"],

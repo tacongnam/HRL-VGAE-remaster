@@ -4,6 +4,7 @@ import math
 import os
 import glob
 import hashlib
+import bisect
 from typing import List, Tuple, Dict
 import numpy as np
 import networkx as nx
@@ -14,6 +15,13 @@ try:
     from utils.graph_generator import SFCRequest, VNF
 except ImportError:
     from graph_generator import SFCRequest, VNF
+
+
+def _query_sparse(times: list[float], values: list[float], t: float) -> float:
+    idx = bisect.bisect_right(times, t) - 1
+    if idx < 0:
+        idx = 0
+    return values[idx]
 
 
 def _node_id(name) -> int:
@@ -114,7 +122,14 @@ def get_node_features_from_graph(G: nx.Graph, d_in: int = 16) -> np.ndarray:
     n = len(nodes)
     node_idx = {u: i for i, u in enumerate(nodes)}
     cpu_totals = np.array([G.nodes[u]["cpu_total"] for u in nodes], dtype=np.float32)
-    cpu_frees = np.array([G.nodes[u]["cpu_free"] for u in nodes], dtype=np.float32)
+    cpu_frees = np.array([
+        _query_sparse(
+            G.nodes[u].get("_cpu_times", [0.0]),
+            G.nodes[u].get("_cpu_values", [G.nodes[u]["cpu_total"]]),
+            0.0,
+        )
+        for u in nodes
+    ], dtype=np.float32)
     is_fn = np.array(
         [float(G.nodes[u]["is_function_node"]) for u in nodes], dtype=np.float32
     )
@@ -134,7 +149,13 @@ def get_node_features_from_graph(G: nx.Graph, d_in: int = 16) -> np.ndarray:
     degree_norm = degrees / max(1, n - 1)
     avg_bw_util = np.zeros(n, dtype=np.float32)
     for u, v, d in G.edges(data=True):
-        util = 1.0 - d["bw_free"] / d["bw_total"]
+        bw_total = float(d.get("bw_total", 0.0))
+        bw_free = _query_sparse(
+            d.get("_bw_times", [0.0]),
+            d.get("_bw_values", [bw_total]),
+            0.0,
+        )
+        util = 1.0 - bw_free / bw_total if bw_total > 0 else 0.0
         i, j = node_idx[u], node_idx[v]
         avg_bw_util[i] += util
         avg_bw_util[j] += util
