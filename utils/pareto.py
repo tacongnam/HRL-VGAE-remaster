@@ -136,7 +136,6 @@ def select_by_hypervolume(
         raise ValueError("No valid action available")
     if valid_indices.size == 1:
         return int(valid_indices[0])
-
     hv_scores = np.array(
         [hv_score_for_action(q_sets[i], reference_point) for i in valid_indices],
         dtype=np.float64,
@@ -145,7 +144,6 @@ def select_by_hypervolume(
     tied = valid_indices[hv_scores >= best_hv - 1e-12]
     if len(tied) == 1:
         return int(tied[0])
-
     best_cost = -np.inf
     best_tied = tied[0]
     for idx in tied:
@@ -154,7 +152,6 @@ def select_by_hypervolume(
             if mco > best_cost:
                 best_cost = mco
                 best_tied = idx
-
     cost_winners = [
         idx
         for idx in tied
@@ -164,7 +161,6 @@ def select_by_hypervolume(
         cost_winners = list(tied)
     if len(cost_winners) == 1:
         return int(cost_winners[0])
-
     rng = tie_break_rng or random.Random(42)
     return int(rng.choice(cost_winners))
 
@@ -286,7 +282,7 @@ class ParetoScalarizer:
         if recent_accept_ratio < target_accept:
             self.w_accept = min(0.95, self.w_accept + rate)
         else:
-            self.w_accept = max(0.05, self.w_accept - rate * 0.5)
+            self.w_accept = max(0.05, self.w_accept - rate)
         self.w_cost = 1.0 - self.w_accept
 
 
@@ -367,7 +363,6 @@ def spread_metric(
     else:
         pts_norm = pts
         ext_norm = np.asarray(extreme_points, dtype=np.float64) if extreme_points is not None else None
-
     n, m = pts_norm.shape
     d = np.zeros(n)
     for i in range(n):

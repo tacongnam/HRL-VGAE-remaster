@@ -59,30 +59,23 @@ class NFVEnvironment:
         t_e = float(t_end)
         if t_e <= t_s:
             return
-
         cur_s = NFVEnvironment._res_query(times, values, t_s)
         delta = float(val) - cur_s
         if abs(delta) < 1e-9:
             return
-
         cur_e = NFVEnvironment._res_query(times, values, t_e)
-
         idx_s = bisect.bisect_right(times, t_s)
         if idx_s == 0 or times[idx_s - 1] != t_s:
             times.insert(idx_s, t_s)
             values.insert(idx_s, cur_s)
-
         idx_e = bisect.bisect_right(times, t_e)
         if idx_e == 0 or times[idx_e - 1] != t_e:
             times.insert(idx_e, t_e)
             values.insert(idx_e, cur_e)
-
         start_idx = bisect.bisect_left(times, t_s)
         end_idx = bisect.bisect_left(times, t_e)
-
         for i in range(start_idx, end_idx):
             values[i] += delta
-
         i = 1
         while i < len(times):
             if abs(values[i] - values[i - 1]) < 1e-9:
@@ -238,7 +231,6 @@ class NFVEnvironment:
         t_end = item[7] if len(item) > 7 else None
         return node, path, cpu_req, bw, ram_req, hdd_req, t_start, t_end
 
-    # Resource allocation and release methods
     def allocate(
         self,
         node: int,
@@ -251,7 +243,6 @@ class NFVEnvironment:
         t_end: Optional[float] = None,
     ):
         ts = float(self.t) if t_start is None else float(t_start)
-        # Calculate the end time based on path and processing delays if t_end is not provided
         if t_end is None:
             adj = self.G._adj
             path_d = sum(adj[path[i]][path[i + 1]].get("delay", 0.0) for i in range(len(path) - 1)) if len(path) > 1 else 0.0
@@ -259,46 +250,21 @@ class NFVEnvironment:
             te = ts + max(1.0, path_d + proc_d)
         else:
             te = float(t_end)
-
         nd = self.G.nodes[node]
         if cpu_req > 0.0:
             cur_cpu = self._res_query(nd["_cpu_times"], nd["_cpu_values"], ts)
-            self._res_set(
-                nd["_cpu_times"],
-                nd["_cpu_values"],
-                ts,
-                te,
-                cur_cpu - cpu_req,
-            )
+            self._res_set(nd["_cpu_times"], nd["_cpu_values"], ts, te, cur_cpu - cpu_req)
             if ram_req and "_ram_times" in nd:
                 cur_ram = self._res_query(nd["_ram_times"], nd["_ram_values"], ts)
-                self._res_set(
-                    nd["_ram_times"],
-                    nd["_ram_values"],
-                    ts,
-                    te,
-                    cur_ram - ram_req,
-                )
+                self._res_set(nd["_ram_times"], nd["_ram_values"], ts, te, cur_ram - ram_req)
             if hdd_req and "_hdd_times" in nd:
                 cur_hdd = self._res_query(nd["_hdd_times"], nd["_hdd_values"], ts)
-                self._res_set(
-                    nd["_hdd_times"],
-                    nd["_hdd_values"],
-                    ts,
-                    te,
-                    cur_hdd - hdd_req,
-                )
+                self._res_set(nd["_hdd_times"], nd["_hdd_values"], ts, te, cur_hdd - hdd_req)
         adj = self.G._adj
         for i in range(len(path) - 1):
             e = adj[path[i]][path[i + 1]]
             cur_bw = self._res_query(e["_bw_times"], e["_bw_values"], ts)
-            self._res_set(
-                e["_bw_times"],
-                e["_bw_values"],
-                ts,
-                te,
-                cur_bw - bw,
-            )
+            self._res_set(e["_bw_times"], e["_bw_values"], ts, te, cur_bw - bw)
         if len(path) > 1:
             self._load_std_cache = None
         self._edge_index_cache = None
@@ -309,18 +275,13 @@ class NFVEnvironment:
         adj = self.G._adj
         nodes_data = self.G.nodes
         vnf_iter = iter(sfc.vnf_sequence) if sfc is not None else iter(())
-
         t = float(t_start)
         cpu_events = []
         link_paths_bw = []
-
         for item in allocations:
             node, path, cpu_req, bw, ram_req, hdd_req, _, _ = self._unpack_alloc(item)
             if len(path) > 1:
-                link_delay = sum(
-                    adj[path[i]][path[i + 1]].get("delay", 0.0)
-                    for i in range(len(path) - 1)
-                )
+                link_delay = sum(adj[path[i]][path[i + 1]].get("delay", 0.0) for i in range(len(path) - 1))
                 t += link_delay
                 link_paths_bw.append((tuple(path), bw))
             if cpu_req > 0.0:
@@ -333,23 +294,14 @@ class NFVEnvironment:
                 finish_serve = t + proc + vnf_d
                 cpu_events.append((finish_serve, node, cpu_req, ram_req, hdd_req))
                 t = finish_serve
-
         pipeline_end = t
-
         for path_tup, bw in link_paths_bw:
             ctr = self._op_counter
-            heapq.heappush(
-                self._op_heap,
-                (pipeline_end, ctr, ("link", path_tup, bw)),
-            )
+            heapq.heappush(self._op_heap, (pipeline_end, ctr, ("link", path_tup, bw)))
             self._op_counter += 1
-
         for finish_serve, node, cpu_req, ram_req, hdd_req in cpu_events:
             ctr = self._op_counter
-            heapq.heappush(
-                self._op_heap,
-                (finish_serve, ctr, ("cpu", node, cpu_req, ram_req, hdd_req)),
-            )
+            heapq.heappush(self._op_heap, (finish_serve, ctr, ("cpu", node, cpu_req, ram_req, hdd_req)))
             self._op_counter += 1
 
     def compute_embedding_delay(
@@ -377,9 +329,7 @@ class NFVEnvironment:
         while self._op_heap and self._op_heap[0][0] <= t_float:
             heapq.heappop(self._op_heap)
             changed = True
-        self.active_embeddings = [
-            a for a in self.active_embeddings if a["deadline"] > self.t
-        ]
+        self.active_embeddings = [a for a in self.active_embeddings if a["deadline"] > self.t]
         if changed:
             self._load_std_cache = None
             self._edge_index_cache = None
@@ -408,9 +358,7 @@ class NFVEnvironment:
             self._edge_index_cache = np.array([src, dst], dtype=np.int64)
         return self._edge_index_cache
 
-    def get_node_features_tensor(
-        self, device: torch.device
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_node_features_tensor(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         obs = self._get_obs()
         return (
             torch.from_numpy(obs["node_features"]).to(device),
@@ -450,10 +398,10 @@ class NFVEnvironment:
         )
 
     def build_ll_mask(
-        self, cpu_req: float, ram_req: float = 0.0, hdd_req: float = 0.0
+        self, cpu_req: float, ram_req: float = 0.0, hdd_req: float = 0.0, t: float = None
     ) -> np.ndarray:
         mask = np.zeros(self.G.number_of_nodes(), dtype=bool)
-        t = self.t
+        t = self.t if t is None else t
         for u, nd in self.G.nodes(data=True):
             if not nd.get("is_function_node", False):
                 continue
@@ -480,7 +428,6 @@ class NFVEnvironment:
                 te = ts + max(1.0, path_d + proc_d)
             else:
                 te = float(t_end)
-
             if cpu_req > 0.0:
                 nd = nodes[node]
                 self._release_resource_timeline(nd["_cpu_times"], nd["_cpu_values"], ts, te, cpu_req)
@@ -514,21 +461,15 @@ class NFVEnvironment:
                 )
         return total
 
-    def commit_sfc(
-        self, sfc: SFCRequest, allocations: List[Tuple], deploy_cost: float = 0.0
-    ):
+    def commit_sfc(self, sfc: SFCRequest, allocations: List[Tuple], deploy_cost: float = 0.0):
         self._schedule_operation_releases(allocations, float(self.t), sfc=sfc)
-        self.active_embeddings.append(
-            {"sfc_id": sfc.sfc_id, "deadline": sfc.deadline}
-        )
+        self.active_embeddings.append({"sfc_id": sfc.sfc_id, "deadline": sfc.deadline})
         self.accepted += 1
         self.total_attempted += 1
         self.total_deploy_cost += deploy_cost
         self.total_node_placement_cost += self._node_placement_cost(allocations)
 
-    def reject_sfc(
-        self, sfc: SFCRequest, allocations: List[Tuple]
-    ):
+    def reject_sfc(self, sfc: SFCRequest, allocations: List[Tuple]):
         self._rollback_resources(allocations)
         self.rejected += 1
         self.total_attempted += 1
@@ -554,11 +495,9 @@ class NFVEnvironment:
                 self.t = self._op_heap[0][0]
                 self._release_expired_active_sfcs()
                 return False
-
             self.t = next_int_t
             self._release_expired_active_sfcs()
             self._flush_arrivals()
-
             if self._req_cursor >= len(self._all_requests):
                 unexpired = [q for q in self.queue if q.deadline > self.t]
                 if unexpired:
@@ -589,9 +528,7 @@ class NFVEnvironment:
         self.queue = [q for q in self.queue if q.sfc_id != sfc.sfc_id]
 
     def acceptance_ratio(self) -> float:
-        return (
-            (self.accepted / self.total_attempted) if self.total_attempted > 0 else 0.0
-        )
+        return (self.accepted / self.total_attempted) if self.total_attempted > 0 else 0.0
 
     @property
     def num_nodes(self) -> int:
