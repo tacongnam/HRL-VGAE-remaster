@@ -546,6 +546,24 @@ def main():
 
     for ep in range(args.num_episodes):
         ep_seed = int(master_rng.integers(0, 2**31))
+        out_path = os.path.join(args.out_dir, f"episode_{ep:04d}.json")
+        if os.path.isfile(out_path):
+            try:
+                with open(out_path, "r", encoding="utf-8") as f:
+                    cur_data = json.load(f)
+                if (
+                    isinstance(cur_data, dict)
+                    and "V" in cur_data
+                    and "E" in cur_data
+                    and "R" in cur_data
+                    and isinstance(cur_data["R"], list)
+                ):
+                    print(
+                        f"  Ep {ep + 1:4d}/{args.num_episodes} | exists (reusing) | {os.path.basename(out_path)}"
+                    )
+                    continue
+            except Exception:
+                pass
         ep_rng = np.random.default_rng(ep_seed)
         R = generate_requests(
             V,
@@ -560,7 +578,6 @@ def main():
             scheme=req_cfg["scheme"],
         )
         episode = {"V": V, "E": E, "F": F, "R": R}
-        out_path = os.path.join(args.out_dir, f"episode_{ep:04d}.json")
         with open(out_path, "w") as f:
             json.dump(episode, f, indent=2)
         print(

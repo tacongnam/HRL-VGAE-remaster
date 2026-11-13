@@ -34,6 +34,14 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from utils.pareto import (
+    normalize_ar_cost,
+    filter_pareto_2d_min,
+    compute_hv_2d_min,
+    compute_r2_indicator,
+    compute_igd_plus,
+)
+
 # ---------------------------------------------------------------------------
 # Grid definition
 # ---------------------------------------------------------------------------
@@ -69,6 +77,9 @@ def evaluate_screen_single(
     screen_out: Path,
     ablation: str,
     dry_run: bool,
+    ref_front_json: Optional[Path] = None,
+    c_min: Optional[float] = None,
+    c_max: Optional[float] = None,
 ) -> int:
     ensure_dir(screen_out.parent)
     cmd = [
@@ -79,6 +90,10 @@ def evaluate_screen_single(
         "--ar-cost-out", str(screen_out),
         "--ablation", ablation,
     ]
+    if c_min is not None and c_max is not None:
+        cmd.extend(["--c-min", str(c_min), "--c-max", str(c_max)])
+    if ref_front_json is not None and ref_front_json.is_file():
+        cmd.extend(["--ref-front-json", str(ref_front_json)])
     return run_cmd(cmd, dry_run=dry_run)
 
 
@@ -88,6 +103,9 @@ def evaluate_screen_all(
     screen_out: Path,
     ablation: str,
     dry_run: bool,
+    ref_front_json: Optional[Path] = None,
+    c_min: Optional[float] = None,
+    c_max: Optional[float] = None,
 ) -> int:
     ensure_dir(screen_out.parent)
     cmd = [
@@ -98,6 +116,10 @@ def evaluate_screen_all(
         "--ar-cost-out", str(screen_out),
         "--ablation", ablation,
     ]
+    if c_min is not None and c_max is not None:
+        cmd.extend(["--c-min", str(c_min), "--c-max", str(c_max)])
+    if ref_front_json is not None and ref_front_json.is_file():
+        cmd.extend(["--ref-front-json", str(ref_front_json)])
     return run_cmd(cmd, dry_run=dry_run)
 
 
@@ -110,7 +132,10 @@ def evaluate_pareto_single(
     ablation: str,
     dry_run: bool,
     ref_acc: Optional[float] = None,
-    ref_cost: Optional[float] = None
+    ref_cost: Optional[float] = None,
+    ref_front_json: Optional[Path] = None,
+    c_min: Optional[float] = None,
+    c_max: Optional[float] = None,
 ) -> int:
     ensure_dir(pareto_out.parent)
     ensure_dir(hv_out.parent)
@@ -127,6 +152,10 @@ def evaluate_pareto_single(
     ]
     if ref_acc is not None and ref_cost is not None:
         cmd.extend(["--ref-acc", str(ref_acc), "--ref-cost", str(ref_cost)])
+    if c_min is not None and c_max is not None:
+        cmd.extend(["--c-min", str(c_min), "--c-max", str(c_max)])
+    if ref_front_json is not None and ref_front_json.is_file():
+        cmd.extend(["--ref-front-json", str(ref_front_json)])
     return run_cmd(cmd, dry_run=dry_run)
 
 def ensure_dir(path: str | Path) -> Path:
@@ -242,29 +271,6 @@ def generate_tests(
     ]
     return run_cmd(cmd, dry_run=dry_run)
 
-
-def evaluate_screen_all(
-    checkpoint: Path,
-    data_dir: Path,
-    screen_out: Path,
-    ablation: str,
-    dry_run: bool,
-) -> int:
-    """
-    Run all episodes once using weights from the checkpoint (no Pareto grid).
-    Produces AR + deploy_cost per episode for ranking.
-    """
-    ensure_dir(screen_out.parent)
-    cmd = [
-        sys.executable, "evaluate.py",
-        "--ar-cost-only",
-        "--checkpoint", str(checkpoint),
-        "--data-dir", str(data_dir),
-        "--ar-cost-out", str(screen_out),
-        "--ablation", ablation,
-    ]
-    return run_cmd(cmd, dry_run=dry_run)
-
 # ---------------------------------------------------------------------------
 # Select best-AR episode from screening JSON
 # ---------------------------------------------------------------------------
@@ -345,6 +351,9 @@ def write_summary(
             orig_hv_data = json.load(f)
         orig_metrics = {
             "hypervolume": orig_hv_data.get("hypervolume"),
+            "hv_min": orig_hv_data.get("hv_min"),
+            "r2": orig_hv_data.get("r2"),
+            "igd_plus": orig_hv_data.get("igd_plus"),
             "spacing": orig_hv_data.get("spacing"),
             "spread": orig_hv_data.get("spread"),
             "delta": orig_hv_data.get("delta"),
@@ -363,6 +372,9 @@ def write_summary(
             hv = json.load(f)
         hv_metrics = {
             "hypervolume": hv.get("hypervolume"),
+            "hv_min": hv.get("hv_min"),
+            "r2": hv.get("r2"),
+            "igd_plus": hv.get("igd_plus"),
             "spacing": hv.get("spacing"),
             "spread": hv.get("spread"),
             "delta": hv.get("delta"),
@@ -436,6 +448,9 @@ def update_ablation_summary_table(
         "accepted",
         "rejected",
         "hypervolume",
+        "hv_min",
+        "r2",
+        "igd_plus",
         "spacing",
         "spread",
     ]
@@ -507,14 +522,17 @@ def run_experiment(
     resume: bool = True,
     ref_acc: Optional[float] = None,
     ref_cost: Optional[float] = None,
-) -> bool:
+    ref_front_json: Optional[Path] = None,
+    c_min: Optional[float] = None,
+    c_max: Optional[float] = None,
+) -> str:
     suffix = ablation_suffix(ablation)
     name = f"{topology}_{allocation}_{difficulty}{suffix}"
     tc = testcase_path(testcase_dir, topology, allocation, difficulty)
 
     if not tc.is_file():
         print(f"[ERROR] missing original testcase: {tc}", flush=True)
-        return False
+        return "FAIL"
 
     ckpt = checkpoint_path(ckpt_root, topology, allocation, difficulty, suffix)
     csv_path = log_csv_path(log_root, topology, allocation, difficulty, suffix)
@@ -540,7 +558,7 @@ def run_experiment(
         and orig_hv_out.is_file()
     ):
         print(f"\n[RESUME SKIP] Experiment {name} already completed.", flush=True)
-        return True
+        return "SKIP"
 
     print(f"\n{'=' * 60}", flush=True)
     print(f" EXPERIMENT: {name}  [ablation={ablation}]", flush=True)
@@ -625,6 +643,9 @@ def run_experiment(
                     dry_run=dry_run,
                     ref_acc=ref_acc,
                     ref_cost=ref_cost,
+                    ref_front_json=ref_front_json,
+                    c_min=c_min,
+                    c_max=c_max,
                 )
                 if rc_orig_pareto != 0:
                     print(f"[FAIL] original test pareto: {name}", flush=True)
@@ -641,6 +662,9 @@ def run_experiment(
                     screen_out=screen_out,
                     ablation=ablation,
                     dry_run=dry_run,
+                    ref_front_json=ref_front_json,
+                    c_min=c_min,
+                    c_max=c_max,
                 )
                 if rc != 0:
                     print(f"[FAIL] episode tests screen: {name}", flush=True)
@@ -676,6 +700,9 @@ def run_experiment(
                             dry_run=dry_run,
                             ref_acc=ref_acc,
                             ref_cost=ref_cost,
+                            ref_front_json=ref_front_json,
+                            c_min=c_min,
+                            c_max=c_max,
                         )
                         if rc != 0:
                             print(f"[FAIL] episode pareto: {name}", flush=True)
@@ -776,7 +803,7 @@ def run_experiment(
     elapsed = time.perf_counter() - t0
     status = "OK" if ok else "FAILED"
     print(f"[{status}] {name}  ({elapsed:.1f}s)", flush=True)
-    return ok
+    return "OK" if ok else "FAIL"
 
 def main():
     parser = argparse.ArgumentParser(
@@ -832,6 +859,9 @@ def main():
 
     parser.add_argument("--ref-acc", type=float, default=None)
     parser.add_argument("--ref-cost", type=float, default=None)
+    parser.add_argument("--c-min", type=float, default=None)
+    parser.add_argument("--c-max", type=float, default=None)
+    parser.add_argument("--ref-front-json", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -860,6 +890,57 @@ def main():
     print(f"Ablation: {args.ablation}", flush=True)
     print(f"Resume  : {args.resume}", flush=True)
 
+    instance_bounds: Dict[Tuple[str, str, str], Tuple[float, float]] = {}
+    for topology, allocation, difficulty in experiments:
+        all_costs = []
+        tc = testcase_path(testcase_dir, topology, allocation, difficulty)
+        for ablation in ABLATIONS:
+            sfx = ablation_suffix(ablation)
+            r_dir = result_dir(results_root, topology, allocation, difficulty, sfx)
+            for p_file in [r_dir / "pareto_front.json", r_dir / "original_test_pareto_front.json", r_dir / "screen_ar_cost.json"]:
+                if p_file.is_file():
+                    try:
+                        with open(p_file) as f:
+                            pts_list = json.load(f)
+                        for r in pts_list:
+                            if "deploy_cost" in r:
+                                all_costs.append(float(r["deploy_cost"]))
+                    except Exception:
+                        pass
+        if all_costs:
+            c_min_val, c_max_val = float(min(all_costs)), float(max(all_costs))
+            if abs(c_max_val - c_min_val) < 1e-12:
+                c_max_val = c_min_val + 1.0
+            instance_bounds[(topology, allocation, difficulty)] = (c_min_val, c_max_val)
+
+    ref_front_files: Dict[Tuple[str, str, str], Path] = {}
+    for topology, allocation, difficulty in experiments:
+        bnds = instance_bounds.get((topology, allocation, difficulty))
+        if not bnds:
+            continue
+        c_min_val, c_max_val = bnds
+        merged_min_points = []
+        for ablation in ABLATIONS:
+            sfx = ablation_suffix(ablation)
+            r_dir = result_dir(results_root, topology, allocation, difficulty, sfx)
+            p_file = r_dir / "pareto_front.json"
+            if p_file.is_file():
+                try:
+                    with open(p_file) as f:
+                        scan_pts = json.load(f)
+                    for pt in scan_pts:
+                        if "acc_ratio" in pt and "deploy_cost" in pt:
+                            norm_pt = normalize_ar_cost(float(pt["acc_ratio"]), float(pt["deploy_cost"]), c_min_val, c_max_val)
+                            merged_min_points.append(norm_pt)
+                except Exception:
+                    pass
+        if merged_min_points:
+            empirical_ref = filter_pareto_2d_min(np.array(merged_min_points, dtype=np.float64))
+            rf_path = results_root / f"ref_front_{topology}_{allocation}_{difficulty}.json"
+            with open(rf_path, "w") as f:
+                json.dump({"pareto_front_min": empirical_ref.tolist()}, f, indent=2)
+            ref_front_files[(topology, allocation, difficulty)] = rf_path
+
     succeeded, failed, skipped = [], [], []
 
     for topology, allocation, difficulty in experiments:
@@ -871,7 +952,10 @@ def main():
                 break
             continue
 
-        ok = run_experiment(
+        bnds = instance_bounds.get((topology, allocation, difficulty), (None, None))
+        rf_file = ref_front_files.get((topology, allocation, difficulty))
+
+        status = run_experiment(
             topology, allocation, difficulty,
             testcase_dir=testcase_dir,
             test_root=test_root,
@@ -893,10 +977,16 @@ def main():
             resume=args.resume,
             ref_acc=args.ref_acc,
             ref_cost=args.ref_cost,
+            c_min=bnds[0],
+            c_max=bnds[1],
+            ref_front_json=rf_file,
         )
+        
         name = f"{topology}_{allocation}_{difficulty}{ablation_suffix(args.ablation)}"
-        if ok:
+        if status == "OK":
             succeeded.append(name)
+        elif status == "SKIP":
+            skipped.append(name)
         else:
             failed.append(name)
             if args.stop_on_error:

@@ -18,6 +18,13 @@ from utils import (
     spacing_metric,
     spread_metric,
 )
+from utils.pareto import (
+    normalize_ar_cost,
+    filter_pareto_2d_min,
+    compute_hv_2d_min,
+    compute_r2_indicator,
+    compute_igd_plus,
+)
 from data import parse_episode, discover_episodes
 
 
@@ -31,10 +38,14 @@ def _resolve_episode_paths(args) -> list:
     if args.single_episode:
         return [args.single_episode]
     if args.recursive:
-        return sorted(
+        paths = sorted(
             glob.glob(os.path.join(args.data_dir, "*", "*", "*", "episode_*.json"))
         )
-    return discover_episodes(args.data_dir)
+    else:
+        paths = discover_episodes(args.data_dir)
+    if getattr(args, "max_episodes", None) and args.max_episodes > 0:
+        paths = paths[:args.max_episodes]
+    return paths
 
 def _compute_hv(
     scan_json: str,
@@ -42,6 +53,9 @@ def _compute_hv(
     eps: float,
     baseline_json: str = "",
     ref_point: Optional[np.ndarray] = None,
+    ref_front_json: str = "",
+    c_min_override: Optional[float] = None,
+    c_max_override: Optional[float] = None,
 ):
     with open(scan_json) as f:
         data = json.load(f)
@@ -58,6 +72,26 @@ def _compute_hv(
         pts = np.unique(raw, axis=0)
 
     front_pts = pareto_front([tuple(p) for p in pts]) if len(pts) else []
+
+    costs = [float(r["deploy_cost"]) for r in data] if data else [0.0]
+    c_min = float(min(costs)) if c_min_override is None else float(c_min_override)
+    c_max = float(max(costs)) if c_max_override is None else float(c_max_override)
+    if abs(c_max - c_min) < 1e-12:
+        c_max = c_min + 1.0
+
+    min_pts = np.array([normalize_ar_cost(float(r["acc_ratio"]), float(r["deploy_cost"]), c_min, c_max) for r in data], dtype=np.float64) if data else np.empty((0, 2))
+    front_min = filter_pareto_2d_min(min_pts)
+    hv_min = compute_hv_2d_min(front_min, np.array([1.1, 1.1]))
+    r2_val = compute_r2_indicator(front_min, num_weights=101, ideal_point=np.array([0.0, 0.0]))
+
+    igd_plus_val = 0.0
+    if ref_front_json and os.path.exists(ref_front_json):
+        with open(ref_front_json) as rf_f:
+            rf_data = json.load(rf_f)
+        rf_pts = rf_data if isinstance(rf_data, list) else rf_data.get("pareto_front_min", [])
+        if rf_pts:
+            rf_arr = np.array([[float(p[0]), float(p[1])] for p in rf_pts], dtype=np.float64)
+            igd_plus_val = compute_igd_plus(front_min, rf_arr)
 
     if len(pts) == 0:
         ref = (
@@ -86,6 +120,12 @@ def _compute_hv(
         "spacing": float(spacing),
         "delta": float(spread),
         "spread": float(spread),
+        "hv_min": float(hv_min),
+        "r2": float(r2_val),
+        "igd_plus": float(igd_plus_val),
+        "c_min": float(c_min),
+        "c_max": float(c_max),
+        "ref_point_min": [1.1, 1.1],
         "reference_point": {
             "acc_ratio": float(ref[0]),
             "neg_deploy_cost": float(ref[1]),
@@ -93,6 +133,7 @@ def _compute_hv(
         "pareto_front": [
             {"acc_ratio": float(p[0]), "deploy_cost": float(-p[1])} for p in front_pts
         ],
+        "pareto_front_min": front_min.tolist(),
         "all_points": data,
     }
 
@@ -303,7 +344,15 @@ def _scan_pareto(args):
         ref_pt = None
         if args.ref_acc is not None and args.ref_cost is not None:
             ref_pt = np.array([args.ref_acc, -args.ref_cost], dtype=np.float64)
-        _compute_hv(args.pareto_out, args.hv_out, args.hv_eps, ref_point=ref_pt)
+        _compute_hv(
+            args.pareto_out,
+            args.hv_out,
+            args.hv_eps,
+            ref_point=ref_pt,
+            ref_front_json=args.ref_front_json,
+            c_min_override=args.c_min,
+            c_max_override=args.c_max,
+        )
 
 def main():
     parser = argparse.ArgumentParser()
@@ -325,6 +374,7 @@ def main():
     parser.add_argument("--single-episode", type=str, default="")
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--pareto-points", type=int, default=11)
+    parser.add_argument("--max-episodes", type=int, default=10)
     parser.add_argument("--pareto-out", type=str, default="pareto_front.json")
     parser.add_argument(
         "--ar-cost-out",
@@ -337,6 +387,9 @@ def main():
     parser.add_argument("--hv-eps", type=float, default=1e-2)
     parser.add_argument("--ref-acc", type=float, default=None)
     parser.add_argument("--ref-cost", type=float, default=None)
+    parser.add_argument("--c-min", type=float, default=None)
+    parser.add_argument("--c-max", type=float, default=None)
+    parser.add_argument("--ref-front-json", type=str, default="")
     parser.add_argument("--ablation", type=str, default="HRL-VGAE", choices=["DefaultBaseline", "Random-Fit", "GreedyFIFO", "GreedyLowLevel", "HRL-VGAE"])
     args = parser.parse_args()
 

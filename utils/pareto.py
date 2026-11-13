@@ -377,3 +377,65 @@ def spread_metric(
     numerator = d_e_sum + np.sum(np.abs(d - d_bar))
     denominator = d_e_sum + n * d_bar
     return float(numerator / denominator) if denominator >= 1e-12 else 0.0
+
+
+def normalize_ar_cost(ar: float, cost: float, c_min: float, c_max: float) -> np.ndarray:
+    ar_norm = ar / 100.0 if ar > 1.0 else ar
+    f1 = float(np.clip(1.0 - ar_norm, 0.0, 1.0))
+    denom = c_max - c_min
+    f2 = float(np.clip((cost - c_min) / denom, 0.0, 1.0)) if denom > 1e-12 else 0.0
+    return np.array([f1, f2], dtype=np.float64)
+
+
+def filter_pareto_2d_min(points: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.size == 0:
+        return np.empty((0, 2), dtype=np.float64)
+    if pts.ndim == 1:
+        pts = pts.reshape(1, -1)
+    pts = np.unique(pts, axis=0)
+    n = pts.shape[0]
+    if n <= 1:
+        return pts
+    order = np.lexsort((pts[:, 1], pts[:, 0]))
+    sorted_pts = pts[order]
+    keep = np.zeros(n, dtype=bool)
+    min_y = np.inf
+    for i in range(n):
+        y = sorted_pts[i, 1]
+        if y < min_y:
+            keep[i] = True
+            min_y = y
+    return sorted_pts[keep]
+
+
+def compute_hv_2d_min(points: np.ndarray, ref_point: np.ndarray = np.array([1.1, 1.1])) -> float:
+    pts = filter_pareto_2d_min(points)
+    if pts.size == 0:
+        return 0.0
+    valid = (pts[:, 0] < ref_point[0]) & (pts[:, 1] < ref_point[1])
+    pts_valid = pts[valid]
+    if pts_valid.shape[0] == 0:
+        return 0.0
+    u = ref_point - pts_valid
+    return _hv_2d(u, np.array([0.0, 0.0], dtype=np.float64))
+
+
+def compute_r2_indicator(points: np.ndarray, num_weights: int = 101, ideal_point: np.ndarray = np.array([0.0, 0.0])) -> float:
+    pts = filter_pareto_2d_min(points)
+    if pts.size == 0:
+        return 1.0
+    weights = np.array([[k / (num_weights - 1), 1.0 - k / (num_weights - 1)] for k in range(num_weights)], dtype=np.float64)
+    diffs = np.abs(pts[:, None, :] - ideal_point[None, None, :])
+    g_all = np.max(weights[None, :, :] * diffs, axis=2)
+    return float(np.mean(np.min(g_all, axis=0)))
+
+
+def compute_igd_plus(points: np.ndarray, reference_front: np.ndarray) -> float:
+    pts = filter_pareto_2d_min(points)
+    ref = filter_pareto_2d_min(reference_front)
+    if ref.size == 0 or pts.size == 0:
+        return 0.0 if ref.size == 0 else 1.0
+    diff = np.maximum(pts[:, None, :] - ref[None, :, :], 0.0)
+    d_plus = np.sqrt(np.sum(diff ** 2, axis=2))
+    return float(np.mean(np.min(d_plus, axis=0)))
