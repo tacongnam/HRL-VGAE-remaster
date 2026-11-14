@@ -390,7 +390,7 @@ def main():
     parser.add_argument("--c-min", type=float, default=None)
     parser.add_argument("--c-max", type=float, default=None)
     parser.add_argument("--ref-front-json", type=str, default="")
-    parser.add_argument("--ablation", type=str, default="HRL-VGAE", choices=["DefaultBaseline", "Random-Fit", "GreedyFIFO", "GreedyLowLevel", "HRL-VGAE"])
+    parser.add_argument("--ablation", type=str, default="HRL-VGAE", choices=["DefaultBaseline", "Random-Fit", "GreedyFIFO", "GreedyLowLevel", "HRL-VGAE", "HRL-noVGAE"])
     args = parser.parse_args()
 
     ref_pt = None

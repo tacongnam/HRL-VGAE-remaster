@@ -36,7 +36,16 @@ def set_seeds(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def encode_graph(vgae, env, device, update_temporal=True):
+def encode_graph(vgae, env, device, cfg=None, update_temporal=True):
+    if cfg is not None and cfg.train.ablation_mode == "HRL-noVGAE":
+        n = env.G.number_of_nodes()
+        d_z = cfg.vgae.d_latent
+        x, ei = env.get_node_features_tensor(device)
+        z_nodes = torch.zeros(n, d_z, device=device)
+        z_global = torch.zeros(2 * d_z, device=device)
+        mu = torch.zeros(n, d_z, device=device)
+        logvar = torch.zeros(n, d_z, device=device)
+        return z_nodes, z_global, x, ei, mu, logvar
     x, ei = env.get_node_features_tensor(device)
     with torch.inference_mode():
         z_nodes, z_global, mu, logvar = vgae(x, ei, graph_id=env.topology_id, update_temporal=update_temporal)
@@ -106,7 +115,7 @@ def run_episode(
     )
     pareto_w = torch.tensor([w_accept, w_cost], dtype=torch.float32, device=device)
 
-    z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
+    z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device, cfg)
     graph_dirty = False
     z_nodes_cpu = z_nodes.cpu()
 
@@ -114,11 +123,13 @@ def run_episode(
         if not env.queue:
             done = env.step_time()
             if not done:
-                z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
+                z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device, cfg)
                 z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
             continue
 
-        if train and vgae_optimizer is not None and sfc_vgae_count >= cfg.vgae.train_every_steps:
+        if (train and vgae_optimizer is not None
+                and sfc_vgae_count >= cfg.vgae.train_every_steps
+                and cfg.train.ablation_mode != "HRL-noVGAE"):
             vgae_optimizer.zero_grad()
             vgae.train()
             _is_pretrained = not any(
@@ -150,7 +161,7 @@ def run_episode(
         if hl_res is None:
             done = env.step_time()
             if not done:
-                z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device)
+                z_nodes, z_global, x, ei, mu, logvar = encode_graph(vgae, env, device, cfg)
                 z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
             continue
 
@@ -165,59 +176,35 @@ def run_episode(
 
         for i in range(selected_sfc.F_k):
             vnf = selected_sfc.vnf_sequence[i]
-            # P1 Fix 1: feasibility mask checked at pipeline time cur_t
             ll_mask_i = env.build_ll_mask(vnf.cpu_req, vnf.ram_req, vnf.hdd_req, t=cur_t)
             z_prev = z_nodes[curr_src].detach()
             vnf_feat = build_vnf_feature(vnf, cfg, device)
 
             chosen_node = ll_agent.select_node(
-                z_global,
-                z_prev,
-                z_nodes,
-                vnf_feat,
-                sfc_feat,
-                ll_mask_i,
-                pareto_w,
-                current_source=curr_src,
-                G=env.G,
-                k_hop=cfg.train.k_hop_explore,
-                t=env.t,
+                z_global, z_prev, z_nodes, vnf_feat, sfc_feat, ll_mask_i, pareto_w,
+                current_source=curr_src, G=env.G, k_hop=cfg.train.k_hop_explore, t=env.t,
             )
             if chosen_node is None:
                 embedding_failed = True
                 break
 
             state_record = (
-                z_global.cpu(),
-                z_prev.cpu(),
-                z_nodes_cpu[chosen_node],
-                vnf_feat.cpu(),
-                sfc_feat.cpu(),
-                pareto_w.cpu(),
+                z_global.cpu(), z_prev.cpu(), z_nodes_cpu[chosen_node],
+                vnf_feat.cpu(), sfc_feat.cpu(), pareto_w.cpu(),
             )
 
             path = custom_dijkstra(
-                env.G,
-                curr_src,
-                chosen_node,
-                selected_sfc.bandwidth,
+                env.G, curr_src, chosen_node, selected_sfc.bandwidth,
                 cfg.reward.omega_bw,
                 0.0 if cfg.train.ablation_mode == "DefaultBaseline" else cfg.reward.lambda_penalty,
                 t=env.t,
             )
-            # P1 Fix 2: CPU check at pipeline time cur_t, not env.t
             if path is None or env.get_node_cpu_free(chosen_node, cur_t) < vnf.cpu_req:
                 embedding_failed = True
-                ll_records.append(
-                    {
-                        "state": state_record,
-                        "path_cost": 0.0,
-                        "path_delay": 0.0,
-                        "target_node": chosen_node,
-                        "serve_end": cur_t,
-                        "load_std": 0.0,
-                    }
-                )
+                ll_records.append({
+                    "state": state_record, "path_cost": 0.0, "path_delay": 0.0,
+                    "target_node": chosen_node, "serve_end": cur_t, "load_std": 0.0,
+                })
                 break
 
             link_delay = sum(env.G[path[k]][path[k + 1]]["delay"] for k in range(len(path) - 1)) if len(path) > 1 else 0.0
@@ -226,62 +213,41 @@ def run_episode(
             serve_end = serve_start + proc_delay
 
             env.allocate(
-                chosen_node,
-                path,
-                vnf.cpu_req,
-                selected_sfc.bandwidth,
-                ram_req=vnf.ram_req,
-                hdd_req=vnf.hdd_req,
-                t_start=cur_t,
-                t_end=serve_end,
+                chosen_node, path, vnf.cpu_req, selected_sfc.bandwidth,
+                ram_req=vnf.ram_req, hdd_req=vnf.hdd_req, t_start=cur_t, t_end=serve_end,
             )
-            partial_allocations.append(
-                (
-                    chosen_node,
-                    path,
-                    vnf.cpu_req,
-                    selected_sfc.bandwidth,
-                    vnf.ram_req,
-                    vnf.hdd_req,
-                    cur_t,
-                    serve_end,
-                )
-            )
+            partial_allocations.append((
+                chosen_node, path, vnf.cpu_req, selected_sfc.bandwidth,
+                vnf.ram_req, vnf.hdd_req, cur_t, serve_end,
+            ))
             p_cost, p_delay = compute_path_cost_delay(env.G, path, env.t)
-            # P7: capture load_std after this segment's provisional allocation
             load_std_step = env.get_load_std()
-            ll_records.append(
-                {
-                    "state": state_record,
-                    "path_cost": p_cost,
-                    "path_delay": p_delay,
-                    "target_node": chosen_node,
-                    "serve_end": serve_end,
-                    "load_std": load_std_step,
-                }
-            )
+            ll_records.append({
+                "state": state_record, "path_cost": p_cost, "path_delay": p_delay,
+                "target_node": chosen_node, "serve_end": serve_end, "load_std": load_std_step,
+            })
             curr_src = chosen_node
             cur_t = serve_end
 
             if i < selected_sfc.F_k - 1:
-                vgae.eval()
-                x_cur, ei_cur = env.get_node_features_tensor(device)
-                with torch.inference_mode():
-                    z_nodes, z_global, _, _ = vgae(
-                        x_cur, ei_cur, graph_id=env.topology_id, update_temporal=False
-                    )
-                z_nodes = z_nodes.detach()
-                z_global = z_global.detach()
-                z_nodes_cpu = z_nodes.cpu()
-                x, ei = x_cur, ei_cur
+                if cfg.train.ablation_mode == "HRL-noVGAE":
+                    pass  # keep zero embeddings unchanged
+                else:
+                    vgae.eval()
+                    x_cur, ei_cur = env.get_node_features_tensor(device)
+                    with torch.inference_mode():
+                        z_nodes, z_global, _, _ = vgae(
+                            x_cur, ei_cur, graph_id=env.topology_id, update_temporal=False
+                        )
+                    z_nodes = z_nodes.detach()
+                    z_global = z_global.detach()
+                    z_nodes_cpu = z_nodes.cpu()
+                    x, ei = x_cur, ei_cur
 
         dest_cost, dest_delay, load_std_dest = 0.0, 0.0, 0.0
         if not embedding_failed:
             dest_path = custom_dijkstra(
-                env.G,
-                curr_src,
-                selected_sfc.dest,
-                selected_sfc.bandwidth,
+                env.G, curr_src, selected_sfc.dest, selected_sfc.bandwidth,
                 cfg.reward.omega_bw,
                 0.0 if cfg.train.ablation_mode == "DefaultBaseline" else cfg.reward.lambda_penalty,
                 t=env.t,
@@ -296,7 +262,6 @@ def run_episode(
                     (selected_sfc.dest, dest_path, 0.0, selected_sfc.bandwidth, 0.0, 0.0, cur_t, dest_end)
                 )
                 dest_cost, dest_delay = compute_path_cost_delay(env.G, dest_path, env.t)
-                # P7: capture load_std after dest segment allocation
                 load_std_dest = env.get_load_std()
             if not embedding_failed:
                 total_delay = env.compute_embedding_delay(partial_allocations, selected_sfc)
@@ -309,7 +274,7 @@ def run_episode(
             env.remove_sfc_from_queue(selected_sfc)
             env.reject_sfc(selected_sfc, partial_allocations)
 
-            if partial_allocations:
+            if partial_allocations and cfg.train.ablation_mode != "HRL-noVGAE":
                 vgae.eval()
                 x_rb, ei_rb = env.get_node_features_tensor(device)
                 with torch.inference_mode():
@@ -320,6 +285,8 @@ def run_episode(
                 z_global = z_global.detach()
                 z_nodes_cpu = z_nodes.cpu()
                 x, ei = x_rb, ei_rb
+            elif partial_allocations and cfg.train.ablation_mode == "HRL-noVGAE":
+                x, ei = env.get_node_features_tensor(device)
             graph_dirty = False
 
             hl_reward_vec = failure_vec.copy()
@@ -336,26 +303,28 @@ def run_episode(
             env.remove_sfc_from_queue(selected_sfc)
             graph_dirty, sfc_vgae_count = True, sfc_vgae_count + 1
 
-            vgae.eval()
-            x_new, ei_new = env.get_node_features_tensor(device)
-            with torch.inference_mode():
-                z_nodes, z_global, _, _ = vgae(
-                    x_new, ei_new, graph_id=env.topology_id, update_temporal=False
-                )
-            z_nodes = z_nodes.detach()
-            z_global = z_global.detach()
-            z_nodes_cpu = z_nodes.cpu()
-            x, ei = x_new, ei_new
+            if cfg.train.ablation_mode == "HRL-noVGAE":
+                x, ei = env.get_node_features_tensor(device)
+                # z_nodes/z_global remain zeros
+            else:
+                vgae.eval()
+                x_new, ei_new = env.get_node_features_tensor(device)
+                with torch.inference_mode():
+                    z_nodes, z_global, _, _ = vgae(
+                        x_new, ei_new, graph_id=env.topology_id, update_temporal=False
+                    )
+                z_nodes = z_nodes.detach()
+                z_global = z_global.detach()
+                z_nodes_cpu = z_nodes.cpu()
+                x, ei = x_new, ei_new
 
             n_steps = selected_sfc.F_k + 1
             for rec in ll_records:
-                # P7: use per-segment load_std snapshot (captured after each provisional allocation)
                 rec["r_quality"] = -(
                     cfg.reward.alpha * rec["path_cost"]
                     + cfg.reward.beta * rec["path_delay"]
                     + cfg.reward.gamma_load * rec["load_std"]
                 )
-            # P7: use load_std captured after dest allocation
             r_dest = -(
                 cfg.reward.alpha * dest_cost
                 + cfg.reward.beta * dest_delay
@@ -396,7 +365,6 @@ def run_episode(
                             z_nodes_cpu,
                             build_vnf_feature(selected_sfc.vnf_sequence[k + 1], cfg, device).cpu(),
                             sfc_feat.cpu(),
-                            # P1 Fix 3: next-state mask at serve_end of VNF k (= start time for VNF k+1)
                             env.build_ll_mask(
                                 selected_sfc.vnf_sequence[k + 1].cpu_req,
                                 selected_sfc.vnf_sequence[k + 1].ram_req,
@@ -422,26 +390,18 @@ def run_episode(
                 not hasattr(env, "_req_cursor") or env._req_cursor >= len(env._all_requests)
             )
             hl_agent.store_transition(
-                prev_hl_z_global,
-                sfc_feat.cpu(),
-                pareto_w.cpu(),
-                sfc_idx,
-                hl_reward_vec,
-                z_global.cpu(),
-                [f.cpu() for f in next_feats],
-                pareto_w.cpu(),
-                float(hl_done),
-                valid_action_mask=np.ones(len(next_feats), dtype=bool),
+                prev_hl_z_global, sfc_feat.cpu(), pareto_w.cpu(), sfc_idx, hl_reward_vec,
+                z_global.cpu(), [f.cpu() for f in next_feats], pareto_w.cpu(),
+                float(hl_done), valid_action_mask=np.ones(len(next_feats), dtype=bool),
             )
 
         if train and (sfc_total_count % cfg.train.train_interval_sfc == 0):
-            # P2: gate LL training — skip when ll_frozen (ablation with pre-trained LL)
-            if cfg.train.ablation_mode in ["HRL-VGAE", "Random-Fit", "GreedyFIFO"] and not ll_frozen:
+            if cfg.train.ablation_mode in ["HRL-VGAE", "HRL-noVGAE", "Random-Fit", "GreedyFIFO"] and not ll_frozen:
                 loss_ll = ll_agent.train_step()
                 if loss_ll is not None:
                     ll_loss_acc += loss_ll
                     ll_updates += 1
-            if cfg.train.ablation_mode in ["HRL-VGAE", "GreedyLowLevel"]:
+            if cfg.train.ablation_mode in ["HRL-VGAE", "HRL-noVGAE", "GreedyLowLevel"]:
                 loss_hl = hl_agent.train_step()
                 if loss_hl is not None:
                     hl_loss_acc += loss_hl
@@ -451,7 +411,7 @@ def run_episode(
         if not env.queue:
             done = env.step_time()
             if not done:
-                z_nodes, z_global, x, ei, _mu, _logvar = encode_graph(vgae, env, device)
+                z_nodes, z_global, x, ei, _mu, _logvar = encode_graph(vgae, env, device, cfg)
                 z_nodes_cpu, graph_dirty = z_nodes.cpu(), False
 
     if pareto_archive is not None and env.accepted > 0:
@@ -461,8 +421,7 @@ def run_episode(
                 dtype=np.float64,
             ),
             episode=getattr(env, "_episode_id", 0),
-            w_accept=w_accept,
-            w_cost=w_cost,
+            w_accept=w_accept, w_cost=w_cost,
             acceptance_ratio=env.acceptance_ratio(),
             total_deploy_cost=env.total_deploy_cost,
         )
@@ -472,28 +431,22 @@ def run_episode(
             env.acceptance_ratio(),
             min(1.0, (env.total_deploy_cost / max(1.0, env.accepted)) / 1000.0),
         )
-        # P6: persistent weight is the base; episode sample blended in with 0.1 weight
         scalarizer.w_accept = scalarizer.w_accept * 0.9 + w_accept * 0.1
         scalarizer.w_cost = 1.0 - scalarizer.w_accept
 
     return {
-        "hl_reward": ep_hl_r,
-        "ll_reward": ep_ll_r,
+        "hl_reward": ep_hl_r, "ll_reward": ep_ll_r,
         "acceptance_ratio": env.acceptance_ratio(),
-        "accepted": env.accepted,
-        "rejected": env.rejected,
+        "accepted": env.accepted, "rejected": env.rejected,
         "vgae_loss": vgae_loss_acc / max(1, vgae_updates),
         "hl_loss": hl_loss_acc / max(1, hl_updates),
         "ll_loss": ll_loss_acc / max(1, ll_updates),
-        "hl_updates": hl_updates,
-        "ll_updates": ll_updates,
-        "epsilon_hl": hl_agent.epsilon,
-        "epsilon_ll": ll_agent.epsilon,
+        "hl_updates": hl_updates, "ll_updates": ll_updates,
+        "epsilon_hl": hl_agent.epsilon, "epsilon_ll": ll_agent.epsilon,
         "total_deploy_cost": env.total_deploy_cost,
         "avg_cost_per_accepted": (env.total_deploy_cost / env.accepted) if env.accepted > 0 else 0.0,
         "total_node_placement_cost": env.total_node_placement_cost,
-        "w_accept": w_accept,
-        "w_cost": w_cost,
+        "w_accept": w_accept, "w_cost": w_cost,
         "pareto_archive_size": len(pareto_archive) if pareto_archive else 0,
     }
 
@@ -510,8 +463,9 @@ def main():
     parser.add_argument("--archive-size", type=int, default=200)
     parser.add_argument("--train-file", type=str, default="")
     parser.add_argument("--pretrained-vgae", type=str, default="")
-    parser.add_argument("--ablation", type=str, default="HRL-VGAE", choices=["DefaultBaseline", "Random-Fit", "GreedyFIFO", "GreedyLowLevel", "HRL-VGAE"])
-    # P2: allow loading a pre-trained LL checkpoint for Random-Fit and GreedyFIFO ablations
+    parser.add_argument("--ablation", type=str, default="HRL-VGAE",
+                        choices=["DefaultBaseline", "Random-Fit", "GreedyFIFO",
+                                 "GreedyLowLevel", "HRL-VGAE", "HRL-noVGAE"])
     parser.add_argument("--ll-checkpoint", type=str, default="")
     args = parser.parse_args()
 
@@ -534,7 +488,6 @@ def main():
     )
     scalarizer = ParetoScalarizer(cfg)
 
-    # P2: load pre-trained LL for ablation runs that retain learned LL policy
     ll_frozen = False
     if args.ll_checkpoint:
         _ckpt = torch.load(args.ll_checkpoint, map_location=device)
@@ -582,7 +535,7 @@ def main():
                         if not ll_frozen:
                             ll_agent.epsilon = max(cfg.qnet.eps_end, ll_agent.epsilon * eps_decay_per_ep)
 
-                    stats["epsilon_hl"], stats["epsilon_ll"] = (hl_agent.epsilon, ll_agent.epsilon)
+                    stats["epsilon_hl"], stats["epsilon_ll"] = hl_agent.epsilon, ll_agent.epsilon
                     m = tracker.flush_episode(global_ep, env, stats)
                     logger.log(m)
 
