@@ -1,0 +1,621 @@
+PHẦN A – DANH SÁCH FILE
+
+| STT | File                             | Batch đã chỉnh sửa                                   |
+| --- | -------------------------------- | ---------------------------------------------------- |
+| 1   | `config.py`                      | Batch 2                                              |
+| 2   | `utils/__init__.py`              | Batch 1                                              |
+| 3   | `utils/pareto.py`                | Batch 2                                              |
+| 4   | `utils/graph_generator.py`       | Batch 2, Batch 3                                     |
+| 5   | `utils/dijkstra.py`              | Batch 3                                              |
+| 6   | `utils/logger.py`                | Batch 7                                              |
+| 7   | `utils/stats_agg.py`             | Batch 5, Batch 6, Batch 7                            |
+| 8   | `data/loader.py`                 | Batch 2, Batch 3                                     |
+| 9   | `env/nfv_env.py`                 | Batch 2, Batch 3                                     |
+| 10  | `agents/hl_agent.py`             | Batch 2, Batch 3                                     |
+| 11  | `agents/ll_agent.py`             | Batch 2, Batch 3                                     |
+| 12  | `pretrain_vgae.py`               | Batch 7                                              |
+| 13  | `train.py`                       | Batch 2, Batch 3, Batch 4, Batch 5, Batch 7          |
+| 14  | `evaluate.py`                    | Batch 1, Batch 2, Batch 3, Batch 4, Batch 5, Batch 7 |
+| 15  | `run_kaggle_experiments.py`      | Batch 1, Batch 4, Batch 5, Batch 7                   |
+| 16  | `scripts/plot_results.py`        | Batch 1, Batch 6                                     |
+| 17  | `scripts/generate_report.py`     | Batch 6, Batch 7                                     |
+| 18  | `tests/test_regression_suite.py` | Batch 4                                              |
+| 19  | `tests/test_batch5_framework.py` | Batch 5                                              |
+| 20  | `tests/test_batch6_reporting.py` | Batch 6                                              |
+| 21  | `requirements.txt`               | Batch 7                                              |
+| 22  | `README.md`                      | Batch 7                                              |
+
+PHẦN B – CÁC FILE SOURCE CODE HOÀN CHỈNH
+
+1. config.py
+2. utils/__init__.py
+3. utils/pareto.py
+4. utils/graph_generator.py
+5. utils/dijkstra.py
+6. utils/logger.py
+7. utils/stats_agg.py
+8. data/loader.py
+9. env/nfv_env.py
+10. agents/hl_agent.py
+11. agents/ll_agent.py
+12. pretrain_vgae.py
+13. train.py
+14. evaluate.py
+15. run_kaggle_experiments.py
+16. scripts/plot_results.py
+17. scripts/generate_report.py
+18. tests/test_regression_suite.py
+
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+
+import networkx as nx
+import numpy as np
+import torch
+
+from agents import HLAgent, LLAgent
+from config import Config
+from data import get_node_features_from_graph
+from env import NFVEnvironment
+from evaluate import _compute_hv, _load_checkpoint
+from models import MNVGAE
+from run_kaggle_experiments import (
+    compute_and_save_mo_indicators_for_experiment,
+    select_shared_pareto_episode,
+)
+from train import encode_graph, run_episode
+from utils import ParetoScalarizer, SFCRequest, VNF, custom_dijkstra, get_node_features
+from utils.pareto import compute_hv_2d_min
+from utils.pareto_indicator import (
+    compute_hv_normalized,
+    compute_igd_plus,
+    compute_r2,
+    normalize_pareto_objectives,
+)
+
+
+def _make_sample_graph_and_reqs():
+    G = nx.Graph()
+    for u in range(5):
+        is_srv = u in (1, 2, 3)
+        G.add_node(
+            u,
+            cpu_total=1000.0 if is_srv else 0.0,
+            cpu_free=1000.0 if is_srv else 0.0,
+            ram_total=500.0 if is_srv else 0.0,
+            ram_free=500.0 if is_srv else 0.0,
+            hdd_total=500.0 if is_srv else 0.0,
+            hdd_free=500.0 if is_srv else 0.0,
+            is_function_node=is_srv,
+            proc_delay=0.5 if is_srv else 0.0,
+            cost_cpu=10.0 * u if is_srv else 0.0,
+            cost_ram=2.0 if is_srv else 0.0,
+            cost_stor=1.0 if is_srv else 0.0,
+        )
+    for u, v in [(0, 1), (1, 2), (2, 3), (3, 4), (0, 2), (1, 3), (2, 4)]:
+        G.add_edge(u, v, bw_total=100.0, bw_free=100.0, delay=1.0)
+    vnfs = [VNF(0, cpu_req=100.0), VNF(1, cpu_req=150.0)]
+    reqs = [
+        SFCRequest(sfc_id=0, source=0, dest=4, bandwidth=10.0, vnf_sequence=vnfs, deadline=30, arrival_time=0),
+        SFCRequest(sfc_id=1, source=0, dest=4, bandwidth=15.0, vnf_sequence=[VNF(0, cpu_req=120.0)], deadline=40, arrival_time=1),
+    ]
+    return G, reqs
+
+
+class HRLVGAERegressionTests(unittest.TestCase):
+    def test_feature_dims_and_normalization_safety(self):
+        for mode in ("HRL-VGAE", "HRL-noVGAE"):
+            cfg = Config()
+            cfg.train.ablation_mode = mode
+            G, reqs = _make_sample_graph_and_reqs()
+            env = NFVEnvironment(cfg)
+            env.reset(G, reqs, topology_id="topo_test")
+            feats_gen = get_node_features(env.G, cfg, 0.0)
+            feats_ds = get_node_features_from_graph(env.G, cfg.vgae.d_in, 0.0)
+            for f in (feats_gen, feats_ds):
+                self.assertEqual(f.shape, (5, 8))
+                self.assertFalse(np.isnan(f).any())
+                self.assertFalse(np.isinf(f).any())
+                self.assertTrue((f >= 0.0).all() and (f <= 1.0 + 1e-6).all())
+                self.assertEqual(float(f[0, 7]), 0.0)
+                self.assertEqual(float(f[4, 7]), 0.0)
+            hl = HLAgent(cfg, torch.device("cpu"))
+            ll = LLAgent(cfg, torch.device("cpu"))
+            self.assertEqual(hl.q_net.trunk[0].in_features, cfg.d_hl_input)
+            self.assertEqual(ll.q_net.shared[0].in_features, cfg.d_ll_input)
+
+    def test_hrl_novgae_differentiates_candidates(self):
+        cfg = Config()
+        cfg.train.ablation_mode = "HRL-noVGAE"
+        G, reqs = _make_sample_graph_and_reqs()
+        env = NFVEnvironment(cfg)
+        env.reset(G, reqs, topology_id="topo_novgae")
+        env.allocate(1, [0, 1], cpu_req=400.0, bw=20.0, t_start=0.0, t_end=5.0)
+        device = torch.device("cpu")
+        z_nodes, z_global, _, _, _, _ = encode_graph(None, env, device, cfg)
+        self.assertGreater(float(z_nodes.std()), 0.0)
+        ll = LLAgent(cfg, device)
+        with torch.inference_mode():
+            q = ll.q_net(
+                z_global.unsqueeze(0).expand(3, -1),
+                z_nodes[0].unsqueeze(0).expand(3, -1),
+                z_nodes[[1, 2, 3]],
+                torch.tensor([[0.1]]).expand(3, -1),
+                torch.zeros(3, cfg.d_sfc_full),
+                torch.tensor([[0.5, 0.5]]).expand(3, -1),
+            )
+        self.assertGreater(float(q.std(dim=0).max()), 1e-6)
+
+    def test_vgae_grad_flow_and_temporal_disabled(self):
+        cfg = Config()
+        self.assertFalse(cfg.vgae.temporal)
+        G, reqs = _make_sample_graph_and_reqs()
+        env = NFVEnvironment(cfg)
+        env.reset(G, reqs, topology_id="topo_vgae")
+        device = torch.device("cpu")
+        vgae = MNVGAE(cfg).to(device)
+        self.assertFalse(hasattr(vgae, "temporal_cell"))
+        x, ei = env.get_node_features_tensor(device)
+        z_nodes, z_global, mu, logvar = vgae(x, ei, graph_id="topo_vgae")
+        pos = (z_nodes[ei[0]] * z_nodes[ei[1]]).sum(dim=-1)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(pos, torch.ones_like(pos)) + vgae.kl_loss(mu, logvar)
+        loss.backward()
+        for name, p in vgae.named_parameters():
+            if p.requires_grad:
+                self.assertIsNotNone(p.grad, f"Missing grad for {name}")
+                self.assertGreater(float(p.grad.abs().sum()), 0.0)
+
+    def test_preference_conditioning_and_failure_dominance(self):
+        cfg = Config()
+        device = torch.device("cpu")
+        hl = HLAgent(cfg, device)
+        ll = LLAgent(cfg, device)
+        with torch.no_grad():
+            for m in (hl.q_net, hl.target_net):
+                m.q_heads[0].weight.zero_()
+                m.q_heads[1].weight.zero_()
+                m.q_heads[0].bias.fill_(0.0)
+                m.q_heads[1].bias.fill_(0.0)
+        q_np = np.array([[0.9, 0.1], [0.1, 0.9]], dtype=np.float32)
+        self.assertEqual(int(np.argmax(ParetoScalarizer.scalarize_q(q_np, np.array([1.0, 0.0])))), 0)
+        self.assertEqual(int(np.argmax(ParetoScalarizer.scalarize_q(q_np, np.array([0.0, 1.0])))), 1)
+
+        fail_vec = cfg.pareto.failure_penalty_vector()
+        self.assertTrue((fail_vec < 0.0).all())
+        for w_acc in np.linspace(0.0, 1.0, 11):
+            w = np.array([w_acc, 1.0 - w_acc])
+            self.assertLess(float(np.dot(fail_vec, w)), 0.0)
+            self.assertGreaterEqual(float(np.dot(np.array([0.0, 0.0]), w)), 0.0)
+
+        ll.epsilon = 0.0
+        zg = torch.zeros(cfg.d_global)
+        zp = torch.zeros(cfg.d_node_repr)
+        z_all = torch.zeros(5, cfg.d_node_repr)
+        vf = torch.zeros(cfg.qnet.d_vnf)
+        sf = torch.zeros(cfg.d_sfc_full)
+        mask = np.array([False, True, True, False, False])
+        for i in range(cfg.qnet.batch_size):
+            w = torch.tensor([1.0, 0.0] if i % 2 == 0 else [0.0, 1.0])
+            s = (zg, zp, z_all[1], vf, sf, w)
+            ns = (zg, z_all[1], z_all, vf, sf, mask, w)
+            ll.store_transition(s, ns, np.array([0.5, 0.5], dtype=np.float32), 0.0)
+        loss_val = ll.train_step()
+        self.assertIsNotNone(loss_val)
+        self.assertTrue(np.isfinite(loss_val))
+
+    def test_cur_t_and_rollback_and_cache_invalidation(self):
+        cfg = Config()
+        G, reqs = _make_sample_graph_and_reqs()
+        env = NFVEnvironment(cfg)
+        env.reset(G, reqs, topology_id="topo_time")
+        device = torch.device("cpu")
+        f_t0, _ = env.get_node_features_tensor(device, t=0.0)
+        env.allocate(1, [0, 1], cpu_req=500.0, bw=50.0, t_start=0.0, t_end=3.0)
+        f_t0_alloc, _ = env.get_node_features_tensor(device, t=0.0)
+        f_t3_alloc, _ = env.get_node_features_tensor(device, t=3.0)
+        self.assertGreater(float(f_t0_alloc[1, 0]), float(f_t0[1, 0]))
+        self.assertAlmostEqual(float(f_t3_alloc[1, 0]), 0.0, places=6)
+        self.assertIsNotNone(custom_dijkstra(env.G, 0, 1, 60.0, t=3.0))
+        self.assertIsNone(custom_dijkstra(env.G, 0, 1, 60.0, t=0.0))
+        env.reject_sfc(reqs[0], [(1, [0, 1], 500.0, 50.0, 0.0, 0.0, 0.0, 3.0)])
+        f_rb, _ = env.get_node_features_tensor(device, t=0.0)
+        self.assertTrue(torch.allclose(f_t0, f_rb))
+        self.assertEqual(env.get_node_cpu_free(1, 0.0), 1000.0)
+
+    def test_pareto_indicators_and_no_fake_igd_zero(self):
+        pts_norm = normalize_pareto_objectives(np.array([[0.8, 100.0], [0.9, 200.0]]), 100.0, 200.0)
+        self.assertGreater(compute_hv_normalized(pts_norm, np.array([1.1, 1.1])), 0.0)
+        self.assertGreaterEqual(compute_r2(pts_norm, np.array([0.0, 0.0])), 0.0)
+        self.assertAlmostEqual(compute_igd_plus(pts_norm, pts_norm), 0.0, places=7)
+        self.assertEqual(compute_hv_2d_min(np.empty((0, 2))), 0.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scan_p = Path(tmp) / "scan.json"
+            hv_p = Path(tmp) / "hv.json"
+            with open(scan_p, "w") as f:
+                json.dump([{"acc_ratio": 0.8, "deploy_cost": 100.0}, {"acc_ratio": 0.9, "deploy_cost": 200.0}], f)
+            _compute_hv(str(scan_p), str(hv_p), 1e-2)
+            with open(hv_p) as f:
+                hv_data = json.load(f)
+            self.assertIsNone(hv_data["igd_plus"])
+            self.assertFalse(hv_data["ref_front_used"])
+
+    def test_evaluation_fairness_and_cross_mo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            eps = [root / f"episode_{i:04d}.json" for i in range(3)]
+            for e in eps:
+                e.write_text("{}")
+            for abl, suffix, ars in [("HRL-VGAE", "", [0.2, 0.9, 0.5]), ("DefaultBaseline", "_DefaultBaseline", [0.9, 0.3, 0.4])]:
+                res = root / f"nsf_centers_hard{suffix}"
+                res.mkdir(parents=True)
+                scr = res / "screen_ar_cost.json"
+                pf = res / "pareto_front.json"
+                summ = res / "summary.json"
+                with open(scr, "w") as f:
+                    json.dump([{"path": str(eps[i]), "acc_ratio": ars[i], "deploy_cost": 100.0 * (i + 1), "avg_cost_per_accepted": 50.0, "accepted": 2, "rejected": 1} for i in range(3)], f)
+                sel = select_shared_pareto_episode(eps, scr, pareto_episode_idx=0)
+                self.assertEqual(Path(sel["path"]).name, "episode_0000.json")
+                with open(pf, "w") as f:
+                    json.dump([{"w_accept": 0.5, "w_cost": 0.5, "acc_ratio": ars[0], "deploy_cost": 100.0 if suffix == "" else 300.0, "path": sel["path"]}], f)
+                with open(summ, "w") as f:
+                    json.dump({"experiment": f"nsf_centers_hard{suffix}", "ablation": abl, "selected_for_pareto": {"path": sel["path"], "selection_policy": "fixed_shared_episode"}, "episode_tests": {"selected_for_pareto": {"path": sel["path"], "selection_policy": "fixed_shared_episode"}, "metrics": {}}}, f)
+
+            compute_and_save_mo_indicators_for_experiment("nsf_centers_hard", ["HRL-VGAE", "DefaultBaseline"], root)
+            with open(root / "nsf_centers_hard_mo_indicators.json") as f:
+                mo = json.load(f)
+            self.assertEqual(mo["cost_bounds"], {"min": 100.0, "max": 300.0})
+            self.assertIn("igd_plus", mo["indicators"]["HRL-VGAE"])
+            self.assertIn("igd_plus", mo["indicators"]["DefaultBaseline"])
+
+    def test_smoke_run_episode_and_checkpoint_arch_check(self):
+        cfg = Config()
+        device = torch.device("cpu")
+        G, reqs = _make_sample_graph_and_reqs()
+        env = NFVEnvironment(cfg)
+        env.reset(G, reqs, topology_id="topo_smoke")
+        vgae = MNVGAE(cfg).to(device)
+        hl = HLAgent(cfg, device)
+        ll = LLAgent(cfg, device)
+        scalarizer = ParetoScalarizer(cfg)
+        vgae_opt = torch.optim.Adam(vgae.parameters(), lr=1e-3)
+        stats = run_episode(env, vgae, hl, ll, vgae_opt, scalarizer, cfg, device, train=True)
+        self.assertIn("acceptance_ratio", stats)
+        self.assertGreaterEqual(stats["acceptance_ratio"], 0.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt_p = Path(tmp) / "ckpt.pt"
+            torch.save({
+                "vgae": vgae.state_dict(),
+                "hl_q": hl.q_net.state_dict(),
+                "ll_q": ll.q_net.state_dict(),
+                "arch_cfg": {
+                    "d_in": cfg.vgae.d_in, "d_latent": cfg.vgae.d_latent,
+                    "d_sfc": cfg.qnet.d_sfc, "d_vnf": cfg.qnet.d_vnf,
+                    "d_hl_input": cfg.d_hl_input, "d_ll_input": cfg.d_ll_input,
+                },
+            }, ckpt_p)
+            _load_checkpoint(str(ckpt_p), cfg, device)
+            bad_cfg = Config()
+            bad_cfg.train.ablation_mode = "HRL-noVGAE"
+            with self.assertRaises(ValueError):
+                _load_checkpoint(str(ckpt_p), bad_cfg, device)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+19. tests/test_batch5_framework.py
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+from evaluate import _compute_hv
+from run_kaggle_experiments import (
+    _compute_config_fingerprint,
+    compute_and_save_mo_indicators_for_experiment,
+    experiment_id_for,
+    select_shared_pareto_episode,
+)
+from utils.stats_agg import aggregate_experiment_records, paired_significance_test, summarize_samples
+
+
+class Batch5FrameworkTests(unittest.TestCase):
+    def test_experiment_id_and_fingerprint_uniqueness(self):
+        id1 = experiment_id_for("nsf", "centers", "hard", "HRL-VGAE", 42, multi_seed=True)
+        id2 = experiment_id_for("nsf", "centers", "hard", "HRL-VGAE", 43, multi_seed=True)
+        self.assertNotEqual(id1, id2)
+        fp1 = _compute_config_fingerprint({"epochs": 10, "seed": 42, "ablation": "HRL-VGAE"})
+        fp2 = _compute_config_fingerprint({"epochs": 10, "seed": 42, "ablation": "HRL-VGAE"})
+        fp3 = _compute_config_fingerprint({"epochs": 20, "seed": 42, "ablation": "HRL-VGAE"})
+        self.assertEqual(fp1, fp2)
+        self.assertNotEqual(fp1, fp3)
+
+    def test_empty_front_and_accepted_zero_handling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scan_p = Path(tmp) / "empty_scan.json"
+            hv_p = Path(tmp) / "empty_hv.json"
+            scan_p.write_text("[]")
+            _compute_hv(str(scan_p), str(hv_p), 1e-2)
+            hv = json.loads(hv_p.read_text())
+            self.assertTrue(hv["empty_front"])
+            self.assertEqual(hv["hypervolume"], 0.0)
+            self.assertIsNone(hv["igd_plus"])
+
+    def test_statistical_aggregation_separates_seed_and_testcase_and_small_sample_guard(self):
+        records = [
+            {"base_instance": "nsf_c_h", "topology": "nsf", "allocation": "c", "difficulty": "h",
+             "ablation": "HRL-VGAE", "seed": 42, "status": "completed", "metrics": {"mean_ar": 0.8, "hv_normalized": 0.7}},
+            {"base_instance": "nsf_c_h", "topology": "nsf", "allocation": "c", "difficulty": "h",
+             "ablation": "HRL-VGAE", "seed": 43, "status": "completed", "metrics": {"mean_ar": 0.9, "hv_normalized": 0.8}},
+            {"base_instance": "nsf_c_h", "topology": "nsf", "allocation": "c", "difficulty": "h",
+             "ablation": "HRL-VGAE", "seed": 44, "status": "completed", "metrics": {"mean_ar": 0.85, "hv_normalized": 0.75}},
+            {"base_instance": "cogent_c_h", "topology": "cogent", "allocation": "c", "difficulty": "h",
+             "ablation": "HRL-VGAE", "seed": 42, "status": "completed", "metrics": {"mean_ar": 0.6, "hv_normalized": None}},
+            {"base_instance": "cogent_c_h", "topology": "cogent", "allocation": "c", "difficulty": "h",
+             "ablation": "DefaultBaseline", "seed": 42, "status": "failed", "metrics": {}},
+        ]
+        agg = aggregate_experiment_records(records, metrics=("mean_ar", "hv_normalized"))
+        seed_stats = agg["across_seeds_per_instance"]["nsf_c_h::HRL-VGAE"]["metrics"]["mean_ar"]
+        self.assertEqual(seed_stats["n"], 3)
+        self.assertAlmostEqual(seed_stats["mean"], 0.85, places=6)
+        self.assertIsNotNone(seed_stats["ci95_low"])
+
+        tc_stats = agg["across_testcases_by_ablation"]["HRL-VGAE"]["overall"]["mean_ar"]
+        self.assertEqual(tc_stats["n"], 2)
+        self.assertIsNone(tc_stats["ci95_low"])
+        self.assertEqual(agg["across_testcases_by_ablation"]["HRL-VGAE"]["overall"]["hv_normalized"]["n"], 1)
+
+        sig_small = paired_significance_test([0.8, 0.9, 0.85], [0.5, 0.6, 0.55])
+        self.assertEqual(sig_small["status"], "insufficient_samples")
+        self.assertIsNone(sig_small["significant"])
+        self.assertEqual(summarize_samples([None])["status"], "no_valid_samples")
+
+    def test_cross_mo_multi_seed_shared_bounds_and_shared_episode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            eps = [root / f"episode_{i:04d}.json" for i in range(2)]
+            for e in eps:
+                e.write_text("{}")
+            for abl, s, cost in [("HRL-VGAE", 42, 100.0), ("HRL-VGAE", 43, 150.0), ("DefaultBaseline", 42, 300.0)]:
+                eid = experiment_id_for("nsf", "centers", "hard", abl, s, multi_seed=True)
+                rdir = root / eid
+                rdir.mkdir(parents=True)
+                scr = rdir / "screen_ar_cost.json"
+                scr.write_text(json.dumps([
+                    {"path": str(eps[0]), "acc_ratio": 0.7, "deploy_cost": cost, "avg_cost_per_accepted": cost / 2},
+                    {"path": str(eps[1]), "acc_ratio": 0.9, "deploy_cost": cost + 20, "avg_cost_per_accepted": cost / 2},
+                ]))
+                sel = select_shared_pareto_episode(eps, scr, pareto_episode_idx=0)
+                self.assertEqual(Path(sel["path"]).name, "episode_0000.json")
+                (rdir / "pareto_front.json").write_text(json.dumps([
+                    {"w_accept": 0.5, "w_cost": 0.5, "acc_ratio": 0.7, "deploy_cost": cost, "path": sel["path"]}
+                ]))
+                (rdir / "summary.json").write_text(json.dumps({"ablation": abl, "episode_tests": {"selected_for_pareto": {"path": sel["path"]}, "metrics": {}}}))
+
+            compute_and_save_mo_indicators_for_experiment(
+                "nsf_centers_hard", ["HRL-VGAE", "DefaultBaseline"], root, seeds=[42, 43], multi_seed=True
+            )
+            mo = json.loads((root / "nsf_centers_hard_mo_indicators.json").read_text())
+            self.assertEqual(mo["cost_bounds"], {"min": 100.0, "max": 300.0})
+            self.assertEqual(len(mo["empirical_ref_front_source"]), 3)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+20. tests/test_batch6_reporting.py
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts.generate_report import main as generate_report_main
+from utils.stats_agg import check_comparability_group, load_experiment_records
+
+
+class Batch6ReportingTests(unittest.TestCase):
+    def test_comparability_and_accepted_zero_and_report_exports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            res_root = root / "results"
+            log_root = root / "logs"
+            out_dir = root / "report"
+            log_root.mkdir(parents=True)
+
+            for abl, suffix, ar, acc_cnt, hv, r2, igd in [
+                ("HRL-VGAE", "", 0.85, 5, 0.72, 0.12, 0.05),
+                ("HRL-noVGAE", "_HRL-noVGAE", 0.65, 3, 0.50, 0.25, 0.18),
+                ("DefaultBaseline", "_DefaultBaseline", 0.00, 0, 0.10, 0.80, 0.60),
+            ]:
+                for seed in (42, 43):
+                    eid = f"nsf_centers_hard{suffix}_seed{seed}"
+                    edir = res_root / eid
+                    edir.mkdir(parents=True)
+                    (edir / "manifest.json").write_text(json.dumps({
+                        "experiment_id": eid, "status": "completed", "duration_sec": 12.5,
+                        "effective_config": {"base_instance": "nsf_centers_hard", "topology": "nsf",
+                                             "allocation": "centers", "difficulty": "hard",
+                                             "ablation": abl, "seed": seed, "test_seed": 42,
+                                             "pareto_episode": "episode_0000.json"},
+                        "test_episodes": ["episode_0000.json"],
+                    }))
+                    (edir / "screen_ar_cost.json").write_text(json.dumps([{
+                        "path": "episode_0000.json", "acc_ratio": ar,
+                        "deploy_cost": 100.0 if acc_cnt > 0 else 0.0,
+                        "avg_cost_per_accepted": (100.0 / acc_cnt) if acc_cnt > 0 else 0.0,
+                        "accepted": acc_cnt, "rejected": 5 - acc_cnt,
+                    }]))
+                    (edir / "pareto_front.json").write_text(json.dumps([
+                        {"w_accept": 0.0, "w_cost": 1.0, "acc_ratio": max(0.0, ar - 0.1), "deploy_cost": 80.0, "accepted": acc_cnt, "path": "episode_0000.json"},
+                        {"w_accept": 1.0, "w_cost": 0.0, "acc_ratio": ar, "deploy_cost": 120.0, "accepted": acc_cnt, "path": "episode_0000.json"},
+                    ]))
+                    (edir / "hv_result.json").write_text(json.dumps({"hypervolume": hv, "ref_front_used": True, "igd_plus": igd}))
+                    (edir / "summary.json").write_text(json.dumps({
+                        "experiment": eid, "ablation": abl,
+                        "selected_for_pareto": {"path": "episode_0000.json"},
+                        "metrics": {"hypervolume": hv, "hv_normalized": hv, "r2": r2, "igd_plus": igd,
+                                    "cost_min_used": 80.0, "cost_max_used": 120.0, "normalization_scope": "cross_ablation"},
+                    }))
+                    (log_root / f"{eid}.csv").write_text(
+                        "episode,hl_reward,ll_reward,vgae_loss,hl_loss,ll_loss,accepted,rejected,acceptance_ratio,avg_hops,avg_link_util,avg_cpu_util,total_revenue,total_deploy_cost,epsilon,w_accept,w_cost\n"
+                        f"1,0.5,0.4,0.2,0.1,0.1,{acc_cnt},1,{ar},2,0.2,0.3,1.0,100.0,0.5,0.5,0.5\n"
+                    )
+
+            (res_root / "nsf_centers_hard_mo_indicators.json").write_text(json.dumps({"raw_ref_point": [0.0, -130.0]}))
+            recs = load_experiment_records(res_root, logs_root=log_root)
+            self.assertEqual(len(recs), 6)
+            self.assertTrue(check_comparability_group(recs)["comparable"])
+            db = [r for r in recs if r["ablation"] == "DefaultBaseline"][0]
+            self.assertIsNone(db["metrics"]["mean_cost_per_acc"])
+
+            with patch.object(sys, "argv", ["generate_report.py", "--results-root", str(res_root), "--logs-root", str(log_root), "--out", str(out_dir), "--formats", "png", "pdf"]):
+                generate_report_main()
+            for expected in [
+                out_dir / "comparative_summary.csv",
+                out_dir / "comparative_stats.json",
+                out_dir / "tables.tex",
+                out_dir / "research_summary.md",
+                out_dir / "figures" / "metric_mean_ar.png",
+                out_dir / "figures" / "metric_mean_ar.pdf",
+                out_dir / "figures" / "nsf_centers_hard" / "pareto_comparison.png",
+                out_dir / "figures" / "nsf_centers_hard" / "convergence_comparison.png",
+            ]:
+                self.assertTrue(expected.is_file() and expected.stat().st_size > 0, f"Missing {expected}")
+
+    def test_non_comparable_detection(self):
+        r1 = {"status": "completed", "ablation": "HRL-VGAE", "pareto_episode": "episode_0000.json", "test_episodes": ["episode_0000.json"], "test_seed": 42, "normalization_scope": "cross_ablation", "cost_min_used": 10.0, "cost_max_used": 20.0}
+        r2 = {"status": "completed", "ablation": "DefaultBaseline", "pareto_episode": "episode_0001.json", "test_episodes": ["episode_0000.json"], "test_seed": 42, "normalization_scope": "cross_ablation", "cost_min_used": 10.0, "cost_max_used": 20.0}
+        chk = check_comparability_group([r1, r2])
+        self.assertFalse(chk["comparable"])
+        self.assertTrue(any("pareto_episode_mismatch" in w for w in chk["warnings"]))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+21. requirements.txt
+
+torch>=2.0.0
+torch_geometric>=2.3.0
+numpy>=1.23.0
+networkx>=2.8.0
+matplotlib>=3.6.0
+scipy>=1.10.0
+tensorboard>=2.12.0
+pytest>=7.0.0
+
+22. README.md
+
+# HRL-VGAE: Hierarchical Reinforcement Learning with VGAE for Multi-Objective SFC Deployment
+
+Code Freeze Baseline: `v1.0-freeze`
+
+## 1. Directory Structure
+```text
+├── config.py                  # Hyperparameters & network/MOO/reward configs
+├── train.py                   # HRL-VGAE training & validation/checkpointing
+├── evaluate.py                # AR/Cost evaluation, Pareto scan, HV/R2/IGD+
+├── pretrain_vgae.py           # Optional static VGAE pre-training
+├── run_kaggle_experiments.py  # Experiment runner, manifests, multi-seed, cross-MO
+├── agents/                    # HLAgent & LLAgent (preference-conditioned Q-learning)
+├── models/                    # MNVGAE, HLSharedQScorer, LLNodeScorer
+├── env/                       # NFVEnvironment & timeline resource manager
+├── data/                      # Dataset loader & episode generators
+├── utils/                     # Graph features, Dijkstra, Pareto indicators, stats_agg, logger
+├── scripts/
+│   ├── plot_results.py        # Training/screening/Pareto/comparative plotting
+│   └── generate_report.py     # Automated CSV/LaTeX/Markdown/figure report builder
+└── tests/                     # Regression, framework, and reporting test suites
+
+2. Environment & Dependency Check
+
+Install dependencies (on Kaggle, keep pre-installed CUDA torch and install
+missing packages only):
+
+pip install -r requirements.txt
+python run_kaggle_experiments.py --check-env
+
+3. Dataset Preparation
+
+Place testcase topologies ({topology}_{allocation}_{difficulty}.json) under
+data/testcase/ (or /kaggle/input/**/testcase on Kaggle). Shared test episodes
+are auto-generated once per (topology, allocation, difficulty) via
+data/generate_episodes.py using --test-seed.
+
+4. VGAE Pre-training (Optional)
+
+python pretrain_vgae.py --episode data/testcase/nsf_centers_hard.json --epochs 100 --out checkpoints/pretrained_vgae.pt
+
+5. Training & Ablations
+
+Supported --ablation modes: HRL-VGAE, HRL-noVGAE, GreedyLowLevel, GreedyFIFO,
+Random-Fit, DefaultBaseline.
+
+python train.py \
+  --train-file data/testcase/nsf_centers_hard.json \
+  --ablation HRL-VGAE --seed 42 --epochs 10 \
+  --checkpoint checkpoints/nsf_centers_hard.pt \
+  --csv logs/nsf_centers_hard.csv
+
+6. Evaluation, Pareto Scan & Indicators
+
+python evaluate.py --ar-cost-only \
+  --checkpoint checkpoints/nsf_centers_hard.pt \
+  --data-dir data/test/nsf/centers/hard --max-episodes 10 \
+  --ar-cost-out results/nsf_centers_hard/screen_ar_cost.json --ablation HRL-VGAE
+
+python evaluate.py --pareto-scan \
+  --checkpoint checkpoints/nsf_centers_hard.pt \
+  --single-episode data/test/nsf/centers/hard/episode_0000.json \
+  --pareto-points 11 --pareto-out results/nsf_centers_hard/pareto_front.json \
+  --compute-hv --hv-out results/nsf_centers_hard/hv_result.json --ablation HRL-VGAE
+
+7. Kaggle T4x2 Multi-Seed / Cross-Ablation Pipeline & Resume
+
+python run_kaggle_experiments.py \
+  --topology nsf --allocation centers --difficulty hard \
+  --ablation HRL-VGAE --seeds 42 43 44 --test-seed 42 \
+  --epochs 10 --time-budget-hours 11.5
+
+python run_kaggle_experiments.py \
+  --topology nsf --allocation centers --difficulty hard \
+  --ablation HRL-noVGAE --seeds 42 43 44 --test-seed 42 --epochs 10 \
+  --compute-cross-mo --cross-mo-ablations HRL-VGAE HRL-noVGAE DefaultBaseline --aggregate
+
+python run_kaggle_experiments.py \
+  --topology nsf --allocation centers --difficulty hard \
+  --ablation HRL-VGAE --seeds 42 43 44 --resume --resume-train --compute-cross-mo --aggregate
+
+On Kaggle, datasets are discovered under /kaggle/input/**/testcase and outputs
+write to /kaggle/working/{checkpoints,logs,results,data/test}. Single GPU (cuda)
+is used automatically, with --device cpu available as fallback.
+
+8. Research Analysis, Tables & Figures
+
+python scripts/generate_report.py --results-root results --logs-root logs --out report --formats png pdf
+python scripts/plot_results.py --results-root results --logs-root logs --out plots
+
+9. Verification Suite
+
+python -m pytest tests/test_regression_suite.py tests/test_batch5_framework.py tests/test_batch6_reporting.py -v
+
+10. Effective Default Configuration Snapshot (config.py)
+
+  - VGAEConfig: d_in=8, d_hidden=64, d_latent=32, temporal=False,
+    train_every_steps=20
+  - QNetConfig: d_sfc=6, d_vnf=1, lr=5e-4, gamma=0.95, batch_size=64,
+    hl_buffer_size=15000, ll_buffer_size=72000
+  - ParetoConfig: num_weight_bins=11, failure_penalty_cost=1.0,
+    failure_penalty_success=1.0, hv_ref=[-25.0, -25.0]
+

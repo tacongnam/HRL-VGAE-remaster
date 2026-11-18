@@ -7,12 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from config import Config
 from models import HLSharedQScorer
-from utils.pareto import (
-    build_target_q_set_fast,
-    non_dominated_2d_fast,
-    prune_by_hypervolume_fast,
-    select_by_hypervolume,
-)
+from utils.pareto import ParetoScalarizer
 
 
 class HLReplayBuffer:
@@ -60,8 +55,6 @@ class HLAgent:
         self.device = device
         self.epsilon = cfg.qnet.eps_start
         self.train_steps = 0
-        self._ref_point = cfg.pareto.hv_reference_point()
-        self._max_q_vecs = cfg.qnet.max_q_vectors_per_action
         self._tie_rng = random.Random(cfg.train.seed)
         self.q_net = HLSharedQScorer(cfg).to(device)
         self.target_net = HLSharedQScorer(cfg).to(device)
@@ -76,6 +69,8 @@ class HLAgent:
         queue: List,
         t: int,
         pareto_w: torch.Tensor,
+        z_nodes: Optional[torch.Tensor] = None,
+        env=None,
     ) -> Optional[Tuple[int, Any]]:
         valid_indices = [
             i for i, q in enumerate(queue) if not q.is_expired(t)
@@ -101,23 +96,28 @@ class HLAgent:
         m = len(valid_indices)
         self.q_net.eval()
         with torch.inference_mode():
-            sfc_feats_np = np.stack([queue[i].to_feature_vector(t) for i in valid_indices]).astype(np.float32)
-            sfc_feats_t = torch.from_numpy(sfc_feats_np).to(self.device)
+            if z_nodes is not None and env is not None:
+                src_idx = [queue[i].source for i in valid_indices]
+                dst_idx = [queue[i].dest for i in valid_indices]
+                scalars_np = np.stack([env.get_sfc_scalar_features(queue[i], t) for i in valid_indices]).astype(np.float32)
+                scalars_t = torch.from_numpy(scalars_np).to(self.device)
+                sfc_feats_t = torch.cat([z_nodes[src_idx].to(self.device), z_nodes[dst_idx].to(self.device), scalars_t], dim=-1)
+            else:
+                sfc_feats_np = np.stack([queue[i].to_feature_vector(t) for i in valid_indices]).astype(np.float32)
+                sfc_feats_t = torch.from_numpy(sfc_feats_np).to(self.device)
             zg_exp = z_global.unsqueeze(0).expand(m, -1)
             pw_exp = pareto_w.unsqueeze(0).expand(m, -1)
             q_vecs = self.q_net(zg_exp, sfc_feats_t, pw_exp)
             q_np = q_vecs.cpu().numpy()
 
-        q_sets = [
-            [prune_by_hypervolume_fast(non_dominated_2d_fast(q_np[j:j+1]), self._max_q_vecs, self._ref_point)[0]]
-            for j in range(m)
-        ]
-        best_local = select_by_hypervolume(
-            q_sets, np.ones(m, dtype=bool), self._ref_point, tie_break_rng=self._tie_rng
-        )
+        w_np = pareto_w.detach().cpu().numpy()
+        scores = ParetoScalarizer.scalarize_q(q_np, w_np)
+        best_score = float(np.max(scores))
+        tied = np.flatnonzero(scores >= best_score - 1e-12)
+        best_local = int(tied[0]) if len(tied) == 1 else int(self._tie_rng.choice(tied.tolist()))
         best_idx = valid_indices[best_local]
         return best_idx, queue[best_idx]
-    
+
     def store_transition(self, *args, **kwargs):
         self.buffer.push(*args, **kwargs)
 
@@ -171,22 +171,26 @@ class HLAgent:
             with torch.inference_mode():
                 all_cand_np = self.target_net(batched_zg, batched_sf, batched_pw).cpu().numpy()
 
+        pw_next_np_all = torch.stack(next_pareto_ws).detach().cpu().numpy()
         target_q_vecs = np.empty((len(batch), 2), dtype=np.float32)
         for i in range(len(batch)):
             r_vec = np.asarray(reward_vecs[i], dtype=np.float64)
             is_done = bool(dones[i] > 0.5)
             st, ed = slices[i]
             if is_done or st == ed or all_cand_np is None:
-                target_q_vecs[i] = r_vec
+                target_q_vecs[i] = r_vec.astype(np.float32)
             else:
                 cand_np = all_cand_np[st:ed]
                 mask = valid_masks[i]
                 if mask is not None and len(mask) == cand_np.shape[0]:
                     cand_np = cand_np[mask]
-                t_set = build_target_q_set_fast(
-                    r_vec, cand_np, self.cfg.qnet.gamma, self._max_q_vecs, self._ref_point, done=is_done
-                )
-                target_q_vecs[i] = np.mean(t_set, axis=0) if t_set.size > 0 else r_vec
+                if cand_np.shape[0] == 0:
+                    target_q_vecs[i] = r_vec.astype(np.float32)
+                else:
+                    w_next = pw_next_np_all[i]
+                    cand_scores = ParetoScalarizer.scalarize_q(cand_np, w_next)
+                    best_next = int(np.argmax(cand_scores))
+                    target_q_vecs[i] = (r_vec + self.cfg.qnet.gamma * cand_np[best_next]).astype(np.float32)
 
         target_t = torch.from_numpy(target_q_vecs).to(self.device)
         loss = nn.MSELoss()(current_q, target_t)

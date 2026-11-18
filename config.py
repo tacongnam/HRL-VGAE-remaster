@@ -31,20 +31,20 @@ class SFCConfig:
 
 @dataclass
 class VGAEConfig:
-    d_in: int = 16
+    d_in: int = 8
     d_hidden: int = 64
     d_latent: int = 32
     lr: float = 1e-3
     neg_sample_ratio: float = 1.0
     train_every_steps: int = 20
-    temporal: bool = True
+    temporal: bool = False
     temporal_hidden: int = 64
 
 
 @dataclass
 class QNetConfig:
-    d_sfc: int = 7
-    d_vnf: int = 2
+    d_sfc: int = 6
+    d_vnf: int = 1
     lr: float = 5e-4
     gamma: float = 0.95
     target_update_freq: int = 50
@@ -83,10 +83,10 @@ class ParetoConfig:
     hv_ref_delay: float = -25.0
     hv_ref_balance: float = -25.0
     hv_ref_success: float = -25.0
-    failure_penalty_cost: float = 10.0
-    failure_penalty_delay: float = 10.0
+    failure_penalty_cost: float = 1.0
+    failure_penalty_delay: float = 1.0
     failure_penalty_balance: float = 10.0
-    failure_penalty_success: float = 10.0
+    failure_penalty_success: float = 1.0
     ll_ref_momentum: float = 0.99
     ll_ref_margin: float = 1.0
 
@@ -143,22 +143,30 @@ class Config:
         return self.vgae.d_latent
 
     @property
+    def d_node_repr(self) -> int:
+        return self.vgae.d_in if self.train.ablation_mode == "HRL-noVGAE" else self.vgae.d_latent
+
+    @property
     def d_global(self) -> int:
-        return 2 * self.vgae.d_latent
+        return 2 * self.d_node_repr
+
+    @property
+    def d_sfc_full(self) -> int:
+        return 2 * self.d_node_repr + self.qnet.d_sfc
 
     @property
     def d_ll_input(self) -> int:
         return (
             self.d_global
-            + 2 * self.vgae.d_latent
+            + 2 * self.d_node_repr
             + self.qnet.d_vnf
-            + self.qnet.d_sfc
+            + self.d_sfc_full
             + 2
         )
 
     @property
     def d_hl_input(self) -> int:
-        return self.d_global + self.qnet.d_sfc + 2
+        return self.d_global + self.d_sfc_full + 2
 
     @property
     def sfc_quota_per_timestep(self) -> int:

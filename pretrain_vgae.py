@@ -40,10 +40,14 @@ def main():
     parser.add_argument("--neg-ratio", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", type=str, default="pretrained_vgae.pt")
+    parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
 
     set_seeds(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device("cpu" if (args.device.startswith("cuda") and not torch.cuda.is_available()) else args.device)
     cfg = Config()
 
     G, _, _, topology_id = parse_episode(args.episode)
@@ -97,6 +101,9 @@ def main():
                 f"  Epoch {epoch:4d}/{args.epochs} | loss={loss.item():.6f} (recon={recon.item():.6f} kl={kl.item():.6f})"
             )
 
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     torch.save(
         {
             "vgae": (

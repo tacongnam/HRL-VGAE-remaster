@@ -9,7 +9,7 @@ from torch import nn, optim
 
 from config import Config
 from models import LLNodeScorer
-from utils import build_target_q_set, non_dominated, prune_by_hypervolume, select_by_hypervolume
+from utils.pareto import ParetoScalarizer
 
 
 class LLReplayBuffer:
@@ -32,9 +32,6 @@ class LLAgent:
         self.device = device
         self.epsilon = cfg.qnet.eps_start
         self.train_steps = 0
-        self._ref_point = cfg.pareto.hv_reference_point()
-        self._obs_min = np.array([np.inf, np.inf], dtype=np.float64)
-        self._max_q_vecs = cfg.qnet.max_q_vectors_per_action
         self._tie_rng = random.Random(cfg.train.seed + 1)
         self.q_net = LLNodeScorer(cfg).to(device)
         self.target_net = LLNodeScorer(cfg).to(device)
@@ -42,18 +39,6 @@ class LLAgent:
         self.target_net.eval()
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=cfg.qnet.lr)
         self.buffer = LLReplayBuffer(cfg.qnet.ll_buffer_size)
-        self._obj_scale = torch.tensor([1.0, 1000.0], dtype=torch.float32, device=device)
-
-    def _update_ref_point(self, q_np: np.ndarray):
-        if q_np.size == 0:
-            return
-        batch_min = q_np.min(axis=0).astype(np.float64)
-        m = self.cfg.pareto.ll_ref_momentum
-        finite_mask = np.isfinite(self._obs_min)
-        self._obs_min = np.where(
-            finite_mask, np.minimum(batch_min, m * self._obs_min + (1.0 - m) * batch_min), batch_min
-        )
-        self._ref_point = self._obs_min - self.cfg.pareto.ll_ref_margin
 
     def select_node(
         self,
@@ -93,15 +78,19 @@ class LLAgent:
         if random.random() < self.epsilon:
             if G is not None and current_source is not None and k_hop > 0:
                 try:
-                    lengths = nx.single_source_shortest_path_length(G, current_source, cutoff=k_hop)
-                    candidates = [n for n in valid_nodes if n in lengths]
+                    khop_cache = G.graph.setdefault("_khop_cache", {})
+                    key = (k_hop, current_source)
+                    khop_set = khop_cache.get(key)
+                    if khop_set is None:
+                        khop_set = set(nx.single_source_shortest_path_length(G, current_source, cutoff=k_hop))
+                        khop_cache[key] = khop_set
+                    candidates = [n for n in valid_nodes if n in khop_set]
                     if candidates:
                         return int(random.choice(candidates))
                 except Exception:
                     pass
             return int(random.choice(valid_nodes))
 
-        num_nodes = z_nodes.shape[0]
         k = len(valid_nodes)
         self.q_net.eval()
         with torch.inference_mode():
@@ -114,17 +103,14 @@ class LLAgent:
             q_vecs = self.q_net(zg_exp, zp_exp, z_valid, vf_exp, sf_exp, pw_exp)
             q_np = q_vecs.cpu().numpy()
 
-        self._update_ref_point(q_np)
-        q_sets: list[list[np.ndarray]] = [[] for _ in range(num_nodes)]
-        for local_j, global_i in enumerate(valid_nodes):
-            nd_set = non_dominated([q_np[local_j]])
-            q_sets[global_i] = prune_by_hypervolume(nd_set, self._max_q_vecs, self._ref_point)
-
-        chosen = select_by_hypervolume(
-            q_sets, cpu_mask, self._ref_point, tie_break_rng=self._tie_rng
-        )
+        w_np = pareto_w.detach().cpu().numpy()
+        scores = ParetoScalarizer.scalarize_q(q_np, w_np)
+        best_score = float(np.max(scores))
+        tied = np.flatnonzero(scores >= best_score - 1e-12)
+        best_local = int(tied[0]) if len(tied) == 1 else int(self._tie_rng.choice(tied.tolist()))
+        chosen = int(valid_nodes[best_local])
         return int(chosen)
-    
+
     def store_transition(self, state_tuple, next_state_tuple, reward_vec: np.ndarray, done: float):
         self.buffer.push(state_tuple, next_state_tuple, reward_vec, done)
 
@@ -194,26 +180,16 @@ class LLAgent:
             is_done = bool(dones[i] > 0.5)
             st, ed = slices[i]
             if ns is None or is_done or st == ed or all_cand_np is None:
-                target_sets = [r_vec]
+                target_q_vecs.append(r_vec.astype(np.float32))
             else:
                 cand_np = all_cand_np[st:ed]
-                k = cand_np.shape[0]
-                target_sets = build_target_q_set(
-                    r_vec,
-                    [[cand_np[j]] for j in range(k)],
-                    self.cfg.qnet.gamma,
-                    self._max_q_vecs,
-                    self._ref_point,
-                    done=is_done,
-                )
-            target_q_vecs.append(
-                np.mean(target_sets, axis=0).astype(np.float32)
-                if target_sets
-                else r_vec.astype(np.float32)
-            )
+                npw = ns[6].detach().cpu().numpy()
+                cand_scores = ParetoScalarizer.scalarize_q(cand_np, npw)
+                best_next = int(np.argmax(cand_scores))
+                target_q_vecs.append((r_vec + self.cfg.qnet.gamma * cand_np[best_next]).astype(np.float32))
 
         target_t = torch.from_numpy(np.stack(target_q_vecs)).to(self.device)
-        loss = nn.MSELoss()(current_q * self._obj_scale, target_t * self._obj_scale)
+        loss = nn.MSELoss()(current_q, target_t)
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)

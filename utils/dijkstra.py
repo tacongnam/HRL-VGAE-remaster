@@ -7,6 +7,8 @@ import numpy as np
 
 
 def _query_sparse(times: list[float], values: list[float], t: float) -> float:
+    if len(times) == 1 or t >= times[-1]:
+        return values[-1]
     idx = bisect.bisect_right(times, t) - 1
     if idx < 0:
         idx = 0
@@ -30,10 +32,15 @@ def custom_dijkstra(
     visited = set()
     log_omega = math.log(omega_bw)
     adj = G._adj
+    heappop = heapq.heappop
+    heappush = heapq.heappush
+    bisect_right = bisect.bisect_right
+    exp = math.exp
+    inf = math.inf
 
     while heap:
-        d, u = heapq.heappop(heap)
-        if u in visited or d > dist.get(u, math.inf):
+        d, u = heappop(heap)
+        if u in visited or d > dist.get(u, inf):
             continue
         visited.add(u)
         if u == target:
@@ -42,7 +49,9 @@ def custom_dijkstra(
         for v, e in u_nbrs.items():
             if v in visited:
                 continue
-            bw_free = _query_sparse(e["_bw_times"], e["_bw_values"], t)
+            times = e["_bw_times"]
+            vals = e["_bw_values"]
+            bw_free = vals[-1] if (len(times) == 1 or t >= times[-1]) else vals[max(0, bisect_right(times, t) - 1)]
             if bw_free < req_bw:
                 continue
             rho = 1.0 - bw_free / e["bw_total"]
@@ -50,12 +59,12 @@ def custom_dijkstra(
                 rho = 0.0
             elif rho > 0.999999999:
                 rho = 0.999999999
-            w = e["delay"] + lambda_penalty * (math.exp(rho * log_omega) - 1.0)
+            w = e["delay"] + lambda_penalty * (exp(rho * log_omega) - 1.0)
             new_dist = d + w
-            if new_dist < dist.get(v, math.inf):
+            if new_dist < dist.get(v, inf):
                 dist[v] = new_dist
                 prev[v] = u
-                heapq.heappush(heap, (new_dist, v))
+                heappush(heap, (new_dist, v))
 
     if target not in dist:
         return None

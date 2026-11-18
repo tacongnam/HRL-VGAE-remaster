@@ -16,6 +16,7 @@ from utils import (
 )
 from utils.graph_generator import get_node_features
 
+
 class NFVEnvironment:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -37,11 +38,32 @@ class NFVEnvironment:
         self.total_node_placement_cost: float = 0.0
         self._load_std_cache: Optional[float] = None
         self._edge_index_cache: Optional[np.ndarray] = None
+        self._edge_index_tensor_cache: Dict[str, torch.Tensor] = {}
+        self._topo_stats_cache: Dict[str, Tuple[Dict[int, Dict[int, int]], float, float]] = {}
+        self._server_nodes: List[int] = []
+        self._edge_bw_timelines: List[Tuple[List[float], List[float], float]] = []
+        self._res_version: int = 0
+        self._obs_cache_key: Optional[Tuple[bool, int, float]] = None
+        self._obs_cache: Optional[Dict[str, Any]] = None
         self._op_heap: list = []
         self._op_counter: int = 0
+        self._hop_dists: Dict[int, Dict[int, int]] = {}
+        self._max_hop_dist: float = 1.0
+        self._mean_hop_dist: float = 1.0
+        self._c_cpu_max: float = 1.0
+        self._c_ram_max: float = 0.0
+        self._c_stor_max: float = 0.0
+        self._sfc_bw_scale: float = float(cfg.sfc.bw_req_max)
+        self._sfc_fk_scale: float = float(cfg.sfc.vnf_len_max)
+        self._sfc_dl_scale: float = float(cfg.sfc.deadline_max)
+        self._sfc_cpu_scale: float = float(cfg.network.cpu_capacity_mips)
+        self._vnf_cpu_scale: float = float(cfg.network.cpu_capacity_mips)
+        self._max_norm_revenue: float = 1.0
 
     @staticmethod
     def _res_query(times: List[float], values: List[float], t: float) -> float:
+        if len(times) == 1 or t >= times[-1]:
+            return float(values[-1])
         idx = bisect.bisect_right(times, float(t)) - 1
         if idx < 0:
             idx = 0
@@ -76,13 +98,10 @@ class NFVEnvironment:
         end_idx = bisect.bisect_left(times, t_e)
         for i in range(start_idx, end_idx):
             values[i] += delta
-        i = 1
-        while i < len(times):
-            if abs(values[i] - values[i - 1]) < 1e-9:
-                times.pop(i)
-                values.pop(i)
-            else:
-                i += 1
+        for j in (end_idx, start_idx):
+            if 0 < j < len(times) and abs(values[j] - values[j - 1]) < 1e-9:
+                times.pop(j)
+                values.pop(j)
 
     @staticmethod
     def _res_range(times: List[float], t_start: float, t_end: float) -> Tuple[float, float]:
@@ -126,6 +145,8 @@ class NFVEnvironment:
             bw = float(ed.get("bw_total", 0.0))
             ed["_bw_times"] = [0.0]
             ed["_bw_values"] = [bw]
+        self._res_version += 1
+        self._obs_cache = None
 
     def reset(
         self,
@@ -143,6 +164,9 @@ class NFVEnvironment:
         self.active_embeddings = []
         self._load_std_cache = None
         self._edge_index_cache = None
+        self._edge_index_tensor_cache.clear()
+        self._obs_cache_key = None
+        self._obs_cache = None
         self._op_heap = []
         self._op_counter = 0
         if G is not None and requests is not None:
@@ -161,7 +185,87 @@ class NFVEnvironment:
             self._all_requests = []
             self.next_sfc_id = 0
             self._arrive_sfcs_random()
+        self._init_scales_and_topology_stats()
         return self._get_obs()
+
+    def _init_scales_and_topology_stats(self):
+        if self.topology_id and self.topology_id in self._topo_stats_cache:
+            self._hop_dists, self._max_hop_dist, self._mean_hop_dist = self._topo_stats_cache[self.topology_id]
+        else:
+            self._hop_dists = {u: d for u, d in nx.all_pairs_shortest_path_length(self.G)}
+            all_hops = [
+                dist
+                for src_map in self._hop_dists.values()
+                for dst, dist in src_map.items()
+                if dist > 0
+            ]
+            self._max_hop_dist = float(max(all_hops)) if all_hops else 1.0
+            self._mean_hop_dist = float(np.mean(all_hops)) if all_hops else 1.0
+            if self.topology_id:
+                self._topo_stats_cache[self.topology_id] = (self._hop_dists, self._max_hop_dist, self._mean_hop_dist)
+
+        self._server_nodes = [u for u, nd in self.G.nodes(data=True) if nd.get("is_function_node", False)]
+        self._edge_bw_timelines = [
+            (d["_bw_times"], d["_bw_values"], float(d["bw_total"]))
+            for _, _, d in self.G.edges(data=True)
+        ]
+
+        server_nodes = [nd for _, nd in self.G.nodes(data=True) if nd.get("is_function_node", False)]
+        self._c_cpu_max = max((float(nd.get("cost_cpu", 0.0)) for nd in server_nodes), default=1.0)
+        self._c_ram_max = max((float(nd.get("cost_ram", 0.0)) for nd in server_nodes), default=0.0)
+        self._c_stor_max = max((float(nd.get("cost_stor", 0.0)) for nd in server_nodes), default=0.0)
+
+        if self._dataset_mode and self._all_requests:
+            reqs = self._all_requests
+            self._sfc_bw_scale = max(max(float(r.bandwidth) for r in reqs), 1.0)
+            self._sfc_fk_scale = max(max(float(r.F_k) for r in reqs), 1.0)
+            self._sfc_dl_scale = max(max(float(r.deadline - r.arrival_time) for r in reqs), 1.0)
+            self._sfc_cpu_scale = max(max(float(r.total_cpu_req()) for r in reqs), 1.0)
+            self._vnf_cpu_scale = max(max((float(v.cpu_req) for r in reqs for v in r.vnf_sequence), default=0.0), 1.0)
+            self._max_norm_revenue = max(max(self.norm_revenue(r) for r in reqs), 1e-6)
+        else:
+            sc, nc, rc = self.cfg.sfc, self.cfg.network, self.cfg.reward
+            self._sfc_bw_scale = max(float(sc.bw_req_max), 1.0)
+            self._sfc_fk_scale = max(float(sc.vnf_len_max), 1.0)
+            self._sfc_dl_scale = max(float(sc.deadline_max), 1.0)
+            self._sfc_cpu_scale = max(float(sc.vnf_len_max * sc.cpu_req_max), float(nc.cpu_capacity_mips), 1.0)
+            self._vnf_cpu_scale = max(float(sc.cpu_req_max), float(nc.cpu_capacity_mips), 1.0)
+            self._max_norm_revenue = max(
+                (rc.mu_cpu * sc.vnf_len_max * sc.cpu_req_max + rc.mu_bw * sc.bw_req_max * (sc.vnf_len_max + 1))
+                / max(1, sc.vnf_len_min),
+                1e-6,
+            )
+
+    def get_hop_distance_norm(self, src: int, dst: int) -> float:
+        d = self._hop_dists.get(src, {}).get(dst, self.num_nodes - 1)
+        return float(d) / max(1, self.num_nodes - 1)
+
+    def get_sfc_scalar_features(self, sfc: SFCRequest, t: Optional[float] = None) -> np.ndarray:
+        q_t = self.t if t is None else float(t)
+        return sfc.to_feature_vector(
+            q_t,
+            bw_scale=self._sfc_bw_scale,
+            fk_scale=self._sfc_fk_scale,
+            dl_scale=self._sfc_dl_scale,
+            cpu_scale=self._sfc_cpu_scale,
+            hop_dist_norm=self.get_hop_distance_norm(sfc.source, sfc.dest),
+        )
+
+    def get_vnf_cpu_norm(self, vnf) -> float:
+        return float(np.clip(vnf.cpu_req / max(1e-6, self._vnf_cpu_scale), 0.0, 1.0))
+
+    def estimate_sfc_max_cost(self, sfc: SFCRequest) -> float:
+        dc = self.cfg.deploy_cost
+        node_max = sum(
+            dc.w_cpu * self._c_cpu_max * v.cpu_req
+            + dc.w_ram * self._c_ram_max * v.ram_req
+            + dc.w_storage * self._c_stor_max * v.hdd_req
+            for v in sfc.vnf_sequence
+        )
+        link_max = (sfc.F_k + 1) * max(1.0, self._max_hop_dist) * (
+            dc.w_bw * sfc.bandwidth + dc.w_init * dc.init_cost_per_hop
+        )
+        return max(1e-6, float(node_max + link_max))
 
     def _flush_arrivals_initial(self):
         reqs = self._all_requests
@@ -267,7 +371,8 @@ class NFVEnvironment:
             self._res_set(e["_bw_times"], e["_bw_values"], ts, te, cur_bw - bw)
         if len(path) > 1:
             self._load_std_cache = None
-        self._edge_index_cache = None
+        self._res_version += 1
+        self._obs_cache = None
 
     def _schedule_operation_releases(
         self, allocations: List[Tuple], t_start: float, sfc: Optional[SFCRequest] = None
@@ -332,19 +437,25 @@ class NFVEnvironment:
         self.active_embeddings = [a for a in self.active_embeddings if a["deadline"] > self.t]
         if changed:
             self._load_std_cache = None
-            self._edge_index_cache = None
 
-    def _get_obs(self) -> Dict[str, Any]:
-        return {
+    def _get_obs(self, t: Optional[float] = None) -> Dict[str, Any]:
+        q_t = self.t if t is None else float(t)
+        key = (self._dataset_mode, self._res_version, q_t)
+        if self._obs_cache is not None and self._obs_cache_key == key:
+            return self._obs_cache
+        obs = {
             "node_features": (
-                get_node_features_from_graph(self.G, self.cfg.vgae.d_in, self.t)
+                get_node_features_from_graph(self.G, self.cfg.vgae.d_in, q_t)
                 if self._dataset_mode
-                else get_node_features(self.G, self.cfg, self.t)
+                else get_node_features(self.G, self.cfg, q_t)
             ),
             "edge_index": self._build_edge_index(),
             "queue": self.queue,
-            "t": self.t,
+            "t": q_t,
         }
+        self._obs_cache_key = key
+        self._obs_cache = obs
+        return obs
 
     def _build_edge_index(self) -> np.ndarray:
         if self._edge_index_cache is not None:
@@ -358,12 +469,14 @@ class NFVEnvironment:
             self._edge_index_cache = np.array([src, dst], dtype=np.int64)
         return self._edge_index_cache
 
-    def get_node_features_tensor(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        obs = self._get_obs()
-        return (
-            torch.from_numpy(obs["node_features"]).to(device),
-            torch.from_numpy(obs["edge_index"]).to(device),
-        )
+    def get_node_features_tensor(self, device: torch.device, t: Optional[float] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        obs = self._get_obs(t=t)
+        dev_key = str(device)
+        ei_t = self._edge_index_tensor_cache.get(dev_key)
+        if ei_t is None:
+            ei_t = torch.from_numpy(obs["edge_index"]).to(device)
+            self._edge_index_tensor_cache[dev_key] = ei_t
+        return torch.from_numpy(obs["node_features"]).to(device), ei_t
 
     def get_edge_bw_free(self, u: int, v: int, t: float) -> float:
         e = self.G._adj[u][v]
@@ -402,9 +515,10 @@ class NFVEnvironment:
     ) -> np.ndarray:
         mask = np.zeros(self.G.number_of_nodes(), dtype=bool)
         t = self.t if t is None else t
-        for u, nd in self.G.nodes(data=True):
-            if not nd.get("is_function_node", False):
-                continue
+        nodes_iter = self._server_nodes if self._server_nodes else [
+            u for u, nd in self.G.nodes(data=True) if nd.get("is_function_node", False)
+        ]
+        for u in nodes_iter:
             if self.get_node_cpu_free(u, t) < cpu_req:
                 continue
             if ram_req > 0.0 and self.get_node_ram_free(u, t) < ram_req:
@@ -440,12 +554,23 @@ class NFVEnvironment:
                 e = adj[u][v]
                 self._release_bw_timeline(e["_bw_times"], e["_bw_values"], ts, te, bw)
         self._load_std_cache = None
-        self._edge_index_cache = None
+        self._res_version += 1
+        self._obs_cache = None
 
-    def get_load_std(self) -> float:
-        if self._load_std_cache is None:
-            self._load_std_cache = compute_load_std(self.G, self.t)
-        return self._load_std_cache
+    def get_load_std(self, t: Optional[float] = None) -> float:
+        q_t = self.t if t is None else float(t)
+        if q_t == self.t:
+            if self._load_std_cache is None:
+                self._load_std_cache = self._compute_load_std_fast(self.t)
+            return self._load_std_cache
+        return self._compute_load_std_fast(q_t)
+
+    def _compute_load_std_fast(self, t: float) -> float:
+        if len(self._edge_bw_timelines) < 2:
+            return compute_load_std(self.G, t)
+        res_query = self._res_query
+        utils = [1.0 - res_query(bt, bv, t) / tot for bt, bv, tot in self._edge_bw_timelines]
+        return float(np.std(utils, ddof=1))
 
     def _node_placement_cost(self, allocations: List[Tuple]) -> float:
         total = 0.0

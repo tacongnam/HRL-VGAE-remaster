@@ -2,6 +2,8 @@ import argparse
 import json
 import os
 import glob
+import math
+import random
 import numpy as np
 import torch
 
@@ -37,6 +39,8 @@ def _ensure_parent(path: str):
 def _resolve_episode_paths(args) -> list:
     if args.single_episode:
         return [args.single_episode]
+    if getattr(args, "episodes", None):
+        return list(args.episodes)
     if args.recursive:
         paths = sorted(
             glob.glob(os.path.join(args.data_dir, "*", "*", "*", "episode_*.json"))
@@ -46,6 +50,16 @@ def _resolve_episode_paths(args) -> list:
     if getattr(args, "max_episodes", None) and args.max_episodes > 0:
         paths = paths[:args.max_episodes]
     return paths
+
+
+def _resolve_device(device_arg: str) -> torch.device:
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device_arg.startswith("cuda") and not torch.cuda.is_available():
+        print(f"[WARN] --device={device_arg} requested but CUDA unavailable; falling back to cpu", flush=True)
+        return torch.device("cpu")
+    return torch.device(device_arg)
+
 
 def _compute_hv(
     scan_json: str,
@@ -57,6 +71,8 @@ def _compute_hv(
     c_min_override: Optional[float] = None,
     c_max_override: Optional[float] = None,
 ):
+    if not os.path.isfile(scan_json):
+        raise FileNotFoundError(f"Scan JSON not found: {scan_json}")
     with open(scan_json) as f:
         data = json.load(f)
 
@@ -84,14 +100,17 @@ def _compute_hv(
     hv_min = compute_hv_2d_min(front_min, np.array([1.1, 1.1]))
     r2_val = compute_r2_indicator(front_min, num_weights=101, ideal_point=np.array([0.0, 0.0]))
 
-    igd_plus_val = 0.0
-    if ref_front_json and os.path.exists(ref_front_json):
-        with open(ref_front_json) as rf_f:
-            rf_data = json.load(rf_f)
-        rf_pts = rf_data if isinstance(rf_data, list) else rf_data.get("pareto_front_min", [])
-        if rf_pts:
-            rf_arr = np.array([[float(p[0]), float(p[1])] for p in rf_pts], dtype=np.float64)
-            igd_plus_val = compute_igd_plus(front_min, rf_arr)
+    igd_plus_val: Optional[float] = None
+    if ref_front_json:
+        if os.path.exists(ref_front_json):
+            with open(ref_front_json) as rf_f:
+                rf_data = json.load(rf_f)
+            rf_pts = rf_data if isinstance(rf_data, list) else rf_data.get("pareto_front_min", [])
+            if rf_pts:
+                rf_arr = np.array([[float(p[0]), float(p[1])] for p in rf_pts], dtype=np.float64)
+                igd_plus_val = compute_igd_plus(front_min, rf_arr)
+        else:
+            print(f"[WARN] --ref-front-json not found: {ref_front_json}; IGD+ left as None", flush=True)
 
     if len(pts) == 0:
         ref = (
@@ -122,10 +141,18 @@ def _compute_hv(
         "spread": float(spread),
         "hv_min": float(hv_min),
         "r2": float(r2_val),
-        "igd_plus": float(igd_plus_val),
+        "igd_plus": float(igd_plus_val) if igd_plus_val is not None else None,
+        "ref_front_used": bool(igd_plus_val is not None),
+        "empty_front": len(front_pts) == 0,
+        "objective_definition": {
+            "acc_ratio": "maximize",
+            "deploy_cost": "minimize",
+            "normalized_space": ["1 - acc_ratio (minimize)", "(deploy_cost - c_min)/(c_max - c_min) (minimize)"],
+        },
         "c_min": float(c_min),
         "c_max": float(c_max),
         "ref_point_min": [1.1, 1.1],
+        "out_of_bounds_points_count": int(np.sum((min_pts[:, 0] >= 1.1) | (min_pts[:, 1] >= 1.1))) if len(min_pts) else 0,
         "reference_point": {
             "acc_ratio": float(ref[0]),
             "neg_deploy_cost": float(ref[1]),
@@ -172,20 +199,45 @@ def _compute_hv(
         f"ref={ref.tolist()}  front_size={len(front_pts)}  saved→{out}"
     )
 
+
 def _load_checkpoint(checkpoint: str, cfg: Config, device: torch.device):
     ckpt = torch.load(checkpoint, map_location=device)
+    arch = ckpt.get("arch_cfg")
+    if arch:
+        mismatches = [
+            f"{k}: ckpt={arch[k]} != cfg={v}"
+            for k, v in [("d_in", cfg.vgae.d_in), ("d_latent", cfg.vgae.d_latent),
+                         ("d_sfc", cfg.qnet.d_sfc), ("d_vnf", cfg.qnet.d_vnf),
+                         ("d_hl_input", cfg.d_hl_input), ("d_ll_input", cfg.d_ll_input)]
+            if k in arch and arch[k] != v
+        ]
+        if mismatches:
+            raise ValueError(f"Incompatible checkpoint {checkpoint}: {', '.join(mismatches)}")
     vgae = MNVGAE(cfg).to(device)
-    vgae.load_state_dict(ckpt["vgae"])
+    vgae_state = ckpt["vgae"]
+    if not cfg.vgae.temporal:
+        vgae_state = {k: v for k, v in vgae_state.items() if not k.startswith("temporal_cell.")}
+    try:
+        vgae.load_state_dict(vgae_state)
+        hl_q_state, ll_q_state = ckpt["hl_q"], ckpt["ll_q"]
+    except RuntimeError as e:
+        raise ValueError(f"Incompatible legacy checkpoint {checkpoint} for current model architecture: {e}") from e
     vgae.eval()
 
     hl_agent = HLAgent(cfg, device)
-    hl_agent.q_net.load_state_dict(ckpt["hl_q"])
-    hl_agent.target_net.load_state_dict(ckpt["hl_q"])
+    try:
+        hl_agent.q_net.load_state_dict(hl_q_state)
+        hl_agent.target_net.load_state_dict(hl_q_state)
+    except RuntimeError as e:
+        raise ValueError(f"Incompatible HL checkpoint {checkpoint}: {e}") from e
     hl_agent.epsilon = 0.0
 
     ll_agent = LLAgent(cfg, device)
-    ll_agent.q_net.load_state_dict(ckpt["ll_q"])
-    ll_agent.target_net.load_state_dict(ckpt["ll_q"])
+    try:
+        ll_agent.q_net.load_state_dict(ll_q_state)
+        ll_agent.target_net.load_state_dict(ll_q_state)
+    except RuntimeError as e:
+        raise ValueError(f"Incompatible LL checkpoint {checkpoint}: {e}") from e
     ll_agent.epsilon = 0.0
 
     scalarizer = ParetoScalarizer(cfg)
@@ -195,15 +247,13 @@ def _load_checkpoint(checkpoint: str, cfg: Config, device: torch.device):
 
 
 def _eval_ar_cost(args):
-    """
-    Evaluate AR + deploy_cost only, using weights loaded from the checkpoint.
-    No Pareto weight grid — one run per episode with (w_accept, w_cost) from ckpt.
-    """
     from train import run_episode
 
     cfg = Config()
     cfg.train.ablation_mode = args.ablation
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.seed is not None:
+        cfg.train.seed = int(args.seed)
+    device = _resolve_device(args.device)
     vgae, hl_agent, ll_agent, scalarizer = _load_checkpoint(
         args.checkpoint, cfg, device
     )
@@ -222,10 +272,12 @@ def _eval_ar_cost(args):
     results = []
     with torch.no_grad():
         for path in paths:
+            random.seed(cfg.train.seed)
+            hl_agent._tie_rng = random.Random(cfg.train.seed)
+            ll_agent._tie_rng = random.Random(cfg.train.seed + 1)
             G, reqs, _, topo_id = parse_episode(path)
             env = NFVEnvironment(cfg)
             env.reset(G, reqs, topology_id=topo_id)
-            # fixed_weight=None + train=False → run_episode uses scalarizer.w_*
             stats = run_episode(
                 env,
                 vgae,
@@ -238,14 +290,21 @@ def _eval_ar_cost(args):
                 train=False,
                 fixed_weight=None,
             )
+            accepted = int(stats.get("accepted", 0))
+            rejected = int(stats.get("rejected", 0))
+            deploy_cost = float(stats["total_deploy_cost"])
+            avg_cost_per_accepted = deploy_cost / accepted if accepted > 0 else 0.0
             entry = {
                 "w_accept": w_acc,
                 "w_cost": w_cost,
                 "acc_ratio": float(stats["acceptance_ratio"]),
-                "deploy_cost": float(stats["total_deploy_cost"]),
-                "accepted": int(stats.get("accepted", 0)),
-                "rejected": int(stats.get("rejected", 0)),
+                "deploy_cost": deploy_cost,
+                "avg_cost_per_accepted": avg_cost_per_accepted,
+                "accepted": accepted,
+                "rejected": rejected,
                 "path": path,
+                "ablation": cfg.train.ablation_mode,
+                "seed": int(cfg.train.seed),
             }
             results.append(entry)
             print(
@@ -277,7 +336,9 @@ def _scan_pareto(args):
 
     cfg = Config()
     cfg.train.ablation_mode = args.ablation
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.seed is not None:
+        cfg.train.seed = int(args.seed)
+    device = _resolve_device(args.device)
     vgae, hl_agent, ll_agent, scalarizer = _load_checkpoint(
         args.checkpoint, cfg, device
     )
@@ -288,12 +349,16 @@ def _scan_pareto(args):
 
     weights = [k / max(1, args.pareto_points - 1) for k in range(args.pareto_points)]
     results = []
+    parsed_cache = {p: parse_episode(p) for p in paths} if len(paths) <= 50 else {}
 
     with torch.no_grad():
         for w_acc in weights:
             w_cost = 1.0 - w_acc
             for path in paths:
-                G, reqs, _, topo_id = parse_episode(path)
+                random.seed(cfg.train.seed)
+                hl_agent._tie_rng = random.Random(cfg.train.seed)
+                ll_agent._tie_rng = random.Random(cfg.train.seed + 1)
+                G, reqs, _, topo_id = parsed_cache[path] if path in parsed_cache else parse_episode(path)
                 env = NFVEnvironment(cfg)
                 env.reset(G, reqs, topology_id=topo_id)
                 stats = run_episode(
@@ -322,6 +387,9 @@ def _scan_pareto(args):
                         "accepted": accepted,
                         "rejected": rejected,
                         "path": path,
+                        "ablation": cfg.train.ablation_mode,
+                        "seed": int(cfg.train.seed),
+                        "checkpoint": args.checkpoint,
                     }
                 )
 
@@ -354,6 +422,7 @@ def _scan_pareto(args):
             c_max_override=args.c_max,
         )
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--scan-json", type=str, default="pareto_front.json")
@@ -372,6 +441,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, default="vgae_hrl_ql_checkpoint.pt")
     parser.add_argument("--data-dir", type=str, default="data/dataset_01/test")
     parser.add_argument("--single-episode", type=str, default="")
+    parser.add_argument("--episodes", type=str, nargs="+", default=None)
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--pareto-points", type=int, default=11)
     parser.add_argument("--max-episodes", type=int, default=10)
@@ -391,6 +461,8 @@ def main():
     parser.add_argument("--c-max", type=float, default=None)
     parser.add_argument("--ref-front-json", type=str, default="")
     parser.add_argument("--ablation", type=str, default="HRL-VGAE", choices=["DefaultBaseline", "Random-Fit", "GreedyFIFO", "GreedyLowLevel", "HRL-VGAE", "HRL-noVGAE"])
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
 
     ref_pt = None
@@ -402,7 +474,16 @@ def main():
     elif args.pareto_scan:
         _scan_pareto(args)
     else:
-        _compute_hv(args.scan_json, args.out, args.eps, ref_point=ref_pt)
+        _compute_hv(
+            args.scan_json,
+            args.out,
+            args.eps,
+            ref_point=ref_pt,
+            ref_front_json=args.ref_front_json,
+            c_min_override=args.c_min,
+            c_max_override=args.c_max,
+        )
+
 
 if __name__ == "__main__":
     main()

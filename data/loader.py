@@ -13,7 +13,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.graph_generator import SFCRequest, VNF
 
+
 def _query_sparse(times: list[float], values: list[float], t: float) -> float:
+    if len(times) == 1 or t >= times[-1]:
+        return values[-1]
     idx = bisect.bisect_right(times, t) - 1
     if idx < 0:
         idx = 0
@@ -37,6 +40,7 @@ def compute_topology_id(V_raw: dict, E_raw: list) -> str:
     edge_sig = sorted((_node_id(e["u"]), _node_id(e["v"])) for e in E_raw)
     payload = json.dumps({"n": node_sig, "e": edge_sig}, sort_keys=True)
     return hashlib.md5(payload.encode()).hexdigest()[:16]
+
 
 def parse_episode(path: str) -> Tuple[nx.Graph, List[SFCRequest], List[Dict], str]:
     with open(path, "r") as f:
@@ -117,7 +121,8 @@ def parse_episode(path: str) -> Tuple[nx.Graph, List[SFCRequest], List[Dict], st
     requests.sort(key=lambda r: r.arrival_time)
     return G, requests, F_raw, topology_id
 
-def get_node_features_from_graph(G: nx.Graph, d_in: int = 16, t: float = 0.0) -> np.ndarray:
+
+def get_node_features_from_graph(G: nx.Graph, d_in: int = 8, t: float = 0.0) -> np.ndarray:
     nodes = sorted(G.nodes())
     n = len(nodes)
     node_idx = {u: i for i, u in enumerate(nodes)}
@@ -160,8 +165,15 @@ def get_node_features_from_graph(G: nx.Graph, d_in: int = 16, t: float = 0.0) ->
         avg_bw_util[i] += util
         avg_bw_util[j] += util
     avg_bw_util = np.where(degrees > 0, avg_bw_util / degrees, 0.0)
-    proc_delay_norm = proc_delays / 5.0
-    cost_cpu_norm = cost_cpus / 2.0
+    fn_mask = is_fn > 0.5
+    proc_max = float(proc_delays[fn_mask].max()) if np.any(fn_mask) else 0.0
+    cost_max = float(cost_cpus[fn_mask].max()) if np.any(fn_mask) else 0.0
+    proc_delay_norm = (
+        np.where(fn_mask & (proc_max > 1e-12), proc_delays / max(proc_max, 1e-12), 0.0)
+    ).astype(np.float32)
+    cost_cpu_norm = (
+        np.where(fn_mask & (cost_max > 1e-12), cost_cpus / max(cost_max, 1e-12), 0.0)
+    ).astype(np.float32)
     feats = np.stack(
         [
             cpu_util,
@@ -180,6 +192,7 @@ def get_node_features_from_graph(G: nx.Graph, d_in: int = 16, t: float = 0.0) ->
         feats = np.concatenate([feats, pad], axis=1)
     return feats[:, :d_in]
 
+
 def discover_episodes(data_dir: str) -> List[str]:
     return sorted(glob.glob(os.path.join(data_dir, "episode_*.json")))
 
@@ -190,10 +203,6 @@ def train_test_split(
     n_train = max(1, int(len(paths) * train_ratio))
     return paths[:n_train], paths[n_train:]
 
-
-# ---------------------------------------------------------------------------
-# Topology-only helpers
-# ---------------------------------------------------------------------------
 
 def parse_topology(path: str) -> Tuple[nx.Graph, List[Dict], str]:
     with open(path, "r") as f:
@@ -241,8 +250,8 @@ def parse_topology(path: str) -> Tuple[nx.Graph, List[Dict], str]:
 
     return G, F_raw, topology_id
 
+
 def save_topology(path: str, G: nx.Graph, F_raw: List[Dict]):
-    """Save topology {V, E, F} to JSON without any requests."""
     nodes = sorted(G.nodes())
     V = {}
     for u in nodes:

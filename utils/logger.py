@@ -18,6 +18,9 @@ class TrainingLogger:
         use_tb: bool = True,
     ):
         os.makedirs(log_dir, exist_ok=True)
+        csv_dir = os.path.dirname(os.path.abspath(csv_path))
+        if csv_dir:
+            os.makedirs(csv_dir, exist_ok=True)
         self.csv_path = csv_path
         self.tb_writer = None
         if use_tb and _TB_AVAILABLE:

@@ -273,9 +273,11 @@ class ParetoScalarizer:
         self.nadir_cost = min(self.nadir_cost, r_cost)
 
     def scalarize(self, r_accept: float, r_cost: float, w_accept: float, w_cost: float) -> float:
-        da = w_accept * (self.utopia_accept - r_accept) / max(1e-6, self.utopia_accept - self.nadir_accept)
-        dc = w_cost * (self.utopia_cost - r_cost) / max(1e-6, self.utopia_cost - self.nadir_cost)
-        return -(max(da, dc) + self._rho * (da + dc))
+        return float(w_accept * r_accept + w_cost * r_cost)
+
+    @staticmethod
+    def scalarize_q(q_vecs: np.ndarray, pareto_w: np.ndarray) -> np.ndarray:
+        return q_vecs[:, 0] * float(pareto_w[0]) + q_vecs[:, 1] * float(pareto_w[1])
 
     def adapt_weights(self, recent_accept_ratio: float, recent_cost_norm: float, target_accept: float = 0.9):
         rate = self.cfg.pareto.weight_adapt_rate * (1.0 + 5.0 * abs(recent_accept_ratio - target_accept))

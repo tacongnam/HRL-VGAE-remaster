@@ -8,6 +8,8 @@ from config import Config
 
 
 def _query_sparse(times: list[float], values: list[float], t: float) -> float:
+    if len(times) == 1 or t >= times[-1]:
+        return values[-1]
     idx = bisect.bisect_right(times, t) - 1
     if idx < 0:
         idx = 0
@@ -54,19 +56,27 @@ class SFCRequest:
     def is_expired(self, t: int) -> bool:
         return self.deadline <= t
 
-    def to_feature_vector(self, t: int) -> np.ndarray:
+    def to_feature_vector(
+        self,
+        t: float,
+        bw_scale: float = 100.0,
+        fk_scale: float = 8.0,
+        dl_scale: float = 100.0,
+        cpu_scale: float = 4000.0,
+        hop_dist_norm: float = 0.0,
+    ) -> np.ndarray:
         return np.array(
             [
-                self.source,
-                self.dest,
-                self.bandwidth,
-                self.F_k,
-                self.deadline - t,
-                self.urgency(t),
-                self.total_cpu_req(),
+                float(np.clip(self.bandwidth / max(1e-6, bw_scale), 0.0, 1.0)),
+                float(np.clip(self.F_k / max(1.0, fk_scale), 0.0, 1.0)),
+                float(np.clip((self.deadline - t) / max(1.0, dl_scale), 0.0, 1.0)),
+                float(self.urgency(t)),
+                float(np.clip(self.total_cpu_req() / max(1e-6, cpu_scale), 0.0, 1.0)),
+                float(np.clip(hop_dist_norm, 0.0, 1.0)),
             ],
             dtype=np.float32,
         )
+
 
 def build_substrate_network(cfg: Config, rng: random.Random = None) -> nx.Graph:
     if rng is None:
@@ -95,6 +105,7 @@ def build_substrate_network(cfg: Config, rng: random.Random = None) -> nx.Graph:
         G[u][v]["_bw_values"] = [bw]
         G[u][v]["delay"] = delay
     return G
+
 
 def generate_sfc_requests(
     cfg: Config, current_t: int, next_id_start: int, G: nx.Graph, rng: random.Random = None
@@ -136,30 +147,39 @@ def generate_sfc_requests(
         )
     return requests
 
+
 def get_node_features(G: nx.Graph, cfg: Config, t: float = 0.0) -> np.ndarray:
     nc = cfg.network
+    adj = G._adj
+    nodes = sorted(G.nodes())
+    n_nodes = max(1, len(nodes) - 1)
+    server_nodes = [u for u in nodes if G.nodes[u].get("is_function_node", False)]
+    cpu_totals = [float(G.nodes[u].get("cpu_total", 0.0)) for u in nodes]
+    cpu_max = max(cpu_totals) if cpu_totals else 0.0
+    proc_max = max((float(G.nodes[u].get("proc_delay", 0.0)) for u in server_nodes), default=0.0)
+    cost_max = max((float(G.nodes[u].get("cost_cpu", 0.0)) for u in server_nodes), default=0.0)
     feats = []
-    for u in sorted(G.nodes()):
+    for u in nodes:
         nd = G.nodes[u]
         cpu_total = float(nd.get("cpu_total", 0.0))
         cpu_free = _query_sparse(nd.get("_cpu_times", [0.0]), nd.get("_cpu_values", [cpu_total]), float(t))
         cpu_util = 1.0 - cpu_free / cpu_total if cpu_total > 0 else 0.0
         is_fn = float(nd.get("is_function_node", False))
-        neighbors = list(G.neighbors(u))
+        nbrs = adj[u]
         avg_bw_util = 0.0
-        if neighbors:
-            utils = []
-            for v in neighbors:
-                e = G[u][v]
+        if nbrs:
+            util_sum = 0.0
+            for e in nbrs.values():
                 bw_total = float(e.get("bw_total", 0.0))
                 bw_free = _query_sparse(e.get("_bw_times", [0.0]), e.get("_bw_values", [bw_total]), float(t))
-                utils.append(1.0 - bw_free / bw_total if bw_total > 0 else 0.0)
-            avg_bw_util = float(np.mean(utils))
-        degree_norm = G.degree(u) / max(1, nc.num_nodes - 1)
-        cpu_free_norm = cpu_free / nc.cpu_capacity_mips if nc.cpu_capacity_mips > 0 else 0.0
-        cpu_total_norm = cpu_total / nc.cpu_capacity_mips if nc.cpu_capacity_mips > 0 else 0.0
-        proc_delay_norm = nd.get("proc_delay", 0.0) / 5.0
-        cost_cpu_norm = nd.get("cost_cpu", 1.0) / 2.0
+                if bw_total > 0:
+                    util_sum += 1.0 - bw_free / bw_total
+            avg_bw_util = util_sum / len(nbrs)
+        degree_norm = G.degree(u) / n_nodes
+        cpu_free_norm = cpu_free / cpu_max if cpu_max > 1e-12 else 0.0
+        cpu_total_norm = cpu_total / cpu_max if cpu_max > 1e-12 else 0.0
+        proc_delay_norm = (float(nd.get("proc_delay", 0.0)) / proc_max) if (is_fn > 0.5 and proc_max > 1e-12) else 0.0
+        cost_cpu_norm = (float(nd.get("cost_cpu", 0.0)) / cost_max) if (is_fn > 0.5 and cost_max > 1e-12) else 0.0
         feat = [
             cpu_util,
             cpu_free_norm,
@@ -174,4 +194,4 @@ def get_node_features(G: nx.Graph, cfg: Config, t: float = 0.0) -> np.ndarray:
         if pad > 0:
             feat.extend([0.0] * pad)
         feats.append(feat[: cfg.vgae.d_in])
-    return np.array(feats, dtype=np.float32)
+        return np.array(feats, dtype=np.float32)

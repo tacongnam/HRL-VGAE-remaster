@@ -22,6 +22,13 @@ from .pareto import (
     spread_metric,
     normalize_objectives,
 )
+from .pareto_indicator import (
+    build_pareto_set_from_scan,
+    normalize_pareto_objectives,
+    compute_hv_normalized,
+    compute_r2,
+    build_empirical_reference_front,
+)
 from .metrics import EpisodeMetrics, MetricsTracker
 from .logger import TrainingLogger
 
@@ -45,6 +52,11 @@ __all__ = [
     "ParetoArchive",
     "ParetoScalarizer",
     "pareto_front",
+    "build_pareto_set_from_scan",
+    "normalize_pareto_objectives",
+    "compute_hv_normalized",
+    "compute_r2",
+    "build_empirical_reference_front",
     "EpisodeMetrics",
     "MetricsTracker",
     "TrainingLogger",

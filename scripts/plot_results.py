@@ -1,41 +1,5 @@
 """
-Plot training curves, AR/cost screening, and Pareto front for HRL-VGAE.
-
-Fits the independent-experiment pipeline:
-  results/{experiment}/
-    screen_ar_cost.json   # all tests, checkpoint weights
-    pareto_front.json     # full weight scan on best-AR episode
-    hv_result.json        # hypervolume / spacing / spread
-    summary.json          # ranking + selected episode + metrics
-
-Usage
------
-# Training curves only
-python scripts/plot_results.py --csv logs/nsf_centers_hard.csv --out plots/nsf_centers_hard
-
-# Pareto + HV (best-AR episode)
-python scripts/plot_results.py \
-    --pareto-json results/nsf_centers_hard/pareto_front.json \
-    --hv-json results/nsf_centers_hard/hv_result.json \
-    --out plots/nsf_centers_hard
-
-# Screening (all 10 tests AR/cost) + optional summary
-python scripts/plot_results.py \
-    --screen-json results/nsf_centers_hard/screen_ar_cost.json \
-    --summary-json results/nsf_centers_hard/summary.json \
-    --out plots/nsf_centers_hard
-
-# Everything for one experiment
-python scripts/plot_results.py \
-    --csv logs/nsf_centers_hard.csv \
-    --screen-json results/nsf_centers_hard/screen_ar_cost.json \
-    --pareto-json results/nsf_centers_hard/pareto_front.json \
-    --hv-json results/nsf_centers_hard/hv_result.json \
-    --summary-json results/nsf_centers_hard/summary.json \
-    --out plots/nsf_centers_hard
-
-# Whole results/ tree (one subfolder per experiment)
-python scripts/plot_results.py --results-root results --out plots
+Plot training curves, AR/cost screening, Pareto front, and comparative analyses for HRL-VGAE.
 """
 
 from __future__ import annotations
@@ -56,10 +20,6 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def load_csv(path: str) -> List[Dict[str, float]]:
     rows = []
@@ -102,10 +62,6 @@ def _safe_get(rows: List[dict], key: str) -> Optional[List[float]]:
             return None
     return out
 
-
-# ---------------------------------------------------------------------------
-# Training curves
-# ---------------------------------------------------------------------------
 
 def save_fig(x, y_raw, ylabel, title, out_path, window, color="steelblue"):
     fig, ax = plt.subplots(figsize=(10, 4))
@@ -157,7 +113,6 @@ def plot_training(rows: List[dict], out_dir: str, window: int = 20):
         save_fig(episodes, y, ylabel, title, out / f"{fname}.png", window, color)
         plotted.append(key)
 
-    # Overview grid (only keys that exist)
     overview_keys = [
         ("acceptance_ratio", "Acceptance Ratio", "seagreen"),
         ("total_revenue", "Revenue", "darkorange"),
@@ -198,19 +153,11 @@ def plot_training(rows: List[dict], out_dir: str, window: int = 20):
     print(f"Training plots saved to: {out.resolve()}  ({len(plotted)} series)")
 
 
-# ---------------------------------------------------------------------------
-# Screening: AR + cost for all test episodes
-# ---------------------------------------------------------------------------
-
 def plot_screening(
     screen_json: str,
     out_dir: str,
     summary_json: str = "",
 ):
-    """
-    Bar charts for AR and deploy_cost across all screened test episodes.
-    Highlights the episode selected for Pareto (highest AR), from summary or by recompute.
-    """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -219,7 +166,6 @@ def plot_screening(
         print(f"[screen] empty: {screen_json}")
         return
 
-    # One row per path (keep best AR if duplicates)
     by_path: Dict[str, dict] = {}
     for row in data:
         path = row.get("path", "")
@@ -249,7 +195,8 @@ def plot_screening(
     selected_name = None
     if summary_json and os.path.exists(summary_json):
         summary = load_json(summary_json)
-        sel = summary.get("selected_for_pareto") or {}
+        ep_tests = summary.get("episode_tests") or {}
+        sel = summary.get("selected_for_pareto") or ep_tests.get("selected_for_pareto") or {}
         if sel.get("path"):
             selected_name = Path(sel["path"]).name
     if selected_name is None and ranked:
@@ -259,7 +206,6 @@ def plot_screening(
         "crimson" if n == selected_name else "steelblue" for n in names
     ]
 
-    # --- AR bar chart ---
     fig, ax = plt.subplots(figsize=(max(8, len(names) * 0.7), 5))
     bars = ax.bar(range(len(names)), ars, color=colors, edgecolor="black", linewidth=0.6)
     ax.set_xticks(range(len(names)))
@@ -275,7 +221,7 @@ def plot_screening(
         ax.legend(
             [plt.Rectangle((0, 0), 1, 1, fc="crimson"),
              plt.Rectangle((0, 0), 1, 1, fc="steelblue")],
-            ["Selected for Pareto (best AR)", "Other tests"],
+            ["Selected for Pareto", "Other tests"],
             loc="best",
         )
     for i, (bar, v) in enumerate(zip(bars, ars)):
@@ -291,7 +237,6 @@ def plot_screening(
     fig.savefig(out / "screen_ar.png", dpi=150)
     plt.close(fig)
 
-    # --- Cost bar chart ---
     cost_colors = [
         "crimson" if n == selected_name else "darkorange" for n in names
     ]
@@ -318,7 +263,6 @@ def plot_screening(
     fig.savefig(out / "screen_cost.png", dpi=150)
     plt.close(fig)
 
-    # --- Combined AR vs Cost scatter (screening) ---
     fig, ax = plt.subplots(figsize=(7, 5))
     for r in ranked:
         is_sel = r["name"] == selected_name
@@ -353,10 +297,6 @@ def plot_screening(
         f"(n={len(ranked)}, selected={selected_name})"
     )
 
-
-# ---------------------------------------------------------------------------
-# Pareto front (best-AR episode weight scan)
-# ---------------------------------------------------------------------------
 
 def plot_pareto_front(pareto_json: str, out_dir: str, hv_json: str = ""):
     out = Path(out_dir)
@@ -422,7 +362,6 @@ def plot_pareto_front(pareto_json: str, out_dir: str, hv_json: str = ""):
                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.7),
             )
     else:
-        # Fallback front from scan points (maximize AR, minimize cost)
         order = np.argsort(cost)
         acc_s, cost_s = acc[order], cost[order]
         is_front = np.zeros(len(acc_s), dtype=bool)
@@ -441,7 +380,6 @@ def plot_pareto_front(pareto_json: str, out_dir: str, hv_json: str = ""):
             label="Pareto Front",
         )
 
-    # Episode path hint (usually one episode in new pipeline)
     paths = sorted({r.get("path", "") for r in scan if r.get("path")})
     subtitle = ""
     if len(paths) == 1:
@@ -461,10 +399,6 @@ def plot_pareto_front(pareto_json: str, out_dir: str, hv_json: str = ""):
     print(f"Pareto front plot saved to: {out_path.resolve()}")
 
 
-# ---------------------------------------------------------------------------
-# Metrics summary card (from hv_result / summary)
-# ---------------------------------------------------------------------------
-
 def plot_metrics_card(hv_json: str = "", summary_json: str = "", out_dir: str = "plots"):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -480,6 +414,14 @@ def plot_metrics_card(hv_json: str = "", summary_json: str = "", out_dir: str = 
             "Spread (Δ)": hv.get("spread", hv.get("delta")),
             "Front size": len(hv.get("pareto_front") or []),
         }
+        if hv.get("hv_min") is not None:
+            metrics["HV (norm)"] = hv.get("hv_min")
+        if hv.get("r2") is not None:
+            metrics["R2"] = hv.get("r2")
+        if hv.get("igd_plus") is not None and hv.get("ref_front_used", True):
+            metrics["IGD+"] = hv.get("igd_plus")
+        else:
+            metrics["IGD+"] = "N/A"
         if "coverage_ab" in hv:
             metrics["Coverage C(A,B)"] = hv.get("coverage_ab")
             metrics["Coverage C(B,A)"] = hv.get("coverage_ba")
@@ -488,20 +430,25 @@ def plot_metrics_card(hv_json: str = "", summary_json: str = "", out_dir: str = 
     if summary_json and os.path.exists(summary_json):
         summary = load_json(summary_json)
         title = f"Metrics — {summary.get('experiment', '')}".strip(" —")
-        sel = summary.get("selected_for_pareto") or {}
+        ep_tests = summary.get("episode_tests") or {}
+        sel = summary.get("selected_for_pareto") or ep_tests.get("selected_for_pareto") or {}
         if sel:
             selected = (
-                f"Best AR episode: {Path(sel.get('path', '')).name}\n"
+                f"Pareto episode: {Path(sel.get('path', '')).name}\n"
                 f"AR={sel.get('acc_ratio', 0):.4f}  cost={sel.get('deploy_cost', 0):.2f}"
             )
-        m = summary.get("metrics") or {}
+        m = summary.get("metrics") or ep_tests.get("metrics") or {}
         if m and not metrics:
             metrics = {
                 "Hypervolume": m.get("hypervolume"),
                 "Spacing": m.get("spacing"),
                 "Spread (Δ)": m.get("spread", m.get("delta")),
                 "Front size": m.get("front_size"),
+                "HV (norm)": m.get("hv_normalized"),
+                "R2": m.get("r2"),
+                "IGD+": m.get("igd_plus") if m.get("igd_plus") is not None else "N/A",
             }
+            metrics = {k: v for k, v in metrics.items() if v is not None}
 
     if not metrics:
         return
@@ -529,10 +476,6 @@ def plot_metrics_card(hv_json: str = "", summary_json: str = "", out_dir: str = 
     plt.close(fig)
     print(f"Metrics card saved to: {(out / 'metrics_card.png').resolve()}")
 
-
-# ---------------------------------------------------------------------------
-# Batch: plot every experiment under results/
-# ---------------------------------------------------------------------------
 
 def plot_results_tree(results_root: str, out_root: str, logs_root: str = ""):
     root = Path(results_root)
@@ -582,9 +525,186 @@ def plot_results_tree(results_root: str, out_root: str, logs_root: str = ""):
                 plot_training(rows, str(out_dir))
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+METHOD_COLORS = {
+    "HRL-VGAE": "#d62728",
+    "HRL-noVGAE": "#1f77b4",
+    "GreedyLowLevel": "#2ca02c",
+    "GreedyFIFO": "#ff7f0e",
+    "Random-Fit": "#9467bd",
+    "DefaultBaseline": "#7f7f7f",
+}
+METHOD_MARKERS = {
+    "HRL-VGAE": "o",
+    "HRL-noVGAE": "s",
+    "GreedyLowLevel": "^",
+    "GreedyFIFO": "D",
+    "Random-Fit": "v",
+    "DefaultBaseline": "X",
+}
+
+
+def _save_fig_formats(fig, out_base: Path, formats: List[str]):
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    for fmt in formats:
+        fig.savefig(out_base.with_suffix(f".{fmt.lstrip('.')}"), dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _nd_mask_max_ar_min_cost(ars: np.ndarray, costs: np.ndarray) -> np.ndarray:
+    n = len(ars)
+    keep = np.ones(n, dtype=bool)
+    for i in range(n):
+        for j in range(n):
+            if i != j and ars[j] >= ars[i] and costs[j] <= costs[i] and (ars[j] > ars[i] or costs[j] < costs[i]):
+                keep[i] = False
+                break
+    return keep
+
+
+def plot_comparative_pareto(
+    base_instance: str,
+    instance_records: List[Dict[str, Any]],
+    out_dir: str,
+    x_mode: str = "cost",
+    mo_json_path: str = "",
+    formats: Optional[List[str]] = None,
+):
+    formats = formats or ["png"]
+    fig, ax = plt.subplots(figsize=(7.5, 5.5))
+    by_abl: Dict[str, List[Dict[str, Any]]] = {}
+    for r in instance_records:
+        if r.get("status") == "completed" and r.get("pareto_front_path"):
+            by_abl.setdefault(r["ablation"], []).append(r)
+    if not by_abl:
+        plt.close(fig)
+        return
+
+    for abl, runs in by_abl.items():
+        all_pts = []
+        for run in runs:
+            scan = load_json(run["pareto_front_path"])
+            for pt in scan:
+                if x_mode == "cost_per_acc" and int(pt.get("accepted") or 0) <= 0:
+                    continue
+                x_val = float(pt["avg_cost_per_accepted"]) if x_mode == "cost_per_acc" else float(pt["deploy_cost"])
+                all_pts.append((x_val, float(pt["acc_ratio"])))
+        if not all_pts:
+            continue
+        arr = np.unique(np.array(all_pts, dtype=np.float64), axis=0)
+        nd = _nd_mask_max_ar_min_cost(arr[:, 1], arr[:, 0])
+        color = METHOD_COLORS.get(abl, "black")
+        marker = METHOD_MARKERS.get(abl, "o")
+        if np.any(~nd):
+            ax.scatter(arr[~nd, 0], arr[~nd, 1], color=color, marker=marker, alpha=0.25, s=35)
+        nd_pts = arr[nd]
+        order = np.argsort(nd_pts[:, 0])
+        nd_pts = nd_pts[order]
+        ax.plot(nd_pts[:, 0], nd_pts[:, 1], color=color, marker=marker, markersize=7, linewidth=1.8, label=abl, zorder=3)
+
+    if x_mode == "cost" and mo_json_path and os.path.isfile(mo_json_path):
+        mo = load_json(mo_json_path)
+        rp = mo.get("raw_ref_point")
+        if rp and len(rp) == 2:
+            ax.scatter([-float(rp[1])], [float(rp[0])], marker="*", s=140, c="black", zorder=4, label="Reference point")
+
+    ax.set_xlabel("Avg Cost per Accepted SFC (↓)" if x_mode == "cost_per_acc" else "Total Deployment Cost (↓)")
+    ax.set_ylabel("Acceptance Ratio (↑)")
+    ax.set_title(f"Pareto Front Comparison — {base_instance}")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", frameon=True, fontsize=8)
+    fig.tight_layout()
+    _save_fig_formats(fig, Path(out_dir) / "pareto_comparison", formats)
+
+
+def plot_metric_comparison(
+    comparative: Dict[str, Any],
+    metric_key: str,
+    ylabel: str,
+    out_dir: str,
+    formats: Optional[List[str]] = None,
+):
+    formats = formats or ["png"]
+    by_abl = comparative.get("across_testcases_by_ablation") or {}
+    methods = [m for m in (comparative.get("methods") or []) if m in by_abl]
+    if not methods:
+        return
+    means, errs, labels = [], [], []
+    for m in methods:
+        st = (by_abl[m]["overall"].get(metric_key) or {})
+        means.append(st.get("mean"))
+        errs.append(st.get("std") or 0.0)
+        labels.append(m)
+    if all(v is None for v in means):
+        return
+    fig, ax = plt.subplots(figsize=(max(6.5, len(methods) * 1.1), 4.5))
+    x = np.arange(len(methods))
+    plot_vals = [v if v is not None else 0.0 for v in means]
+    colors = [METHOD_COLORS.get(m, "steelblue") for m in methods]
+    bars = ax.bar(x, plot_vals, yerr=[e if v is not None else 0.0 for v, e in zip(means, errs)], capsize=4, color=colors, edgecolor="black", alpha=0.88)
+    for idx, (bar, v) in enumerate(zip(bars, means)):
+        txt = "N/A" if v is None else f"{v:.3f}"
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), txt, ha="center", va="bottom", fontsize=8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=9)
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{ylabel} across Methods")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    _save_fig_formats(fig, Path(out_dir) / f"metric_{metric_key}", formats)
+
+
+def plot_training_convergence(
+    base_instance: str,
+    instance_records: List[Dict[str, Any]],
+    out_dir: str,
+    window: int = 5,
+    formats: Optional[List[str]] = None,
+):
+    formats = formats or ["png"]
+    by_abl: Dict[str, List[List[dict]]] = {}
+    for r in instance_records:
+        if r.get("log_csv_path") and os.path.isfile(r["log_csv_path"]):
+            by_abl.setdefault(r["ablation"], []).append(load_csv(r["log_csv_path"]))
+    if not by_abl:
+        return
+    panels = [
+        ("acceptance_ratio", "Acceptance Ratio"),
+        ("hl_loss", "HL DQN Loss"),
+        ("ll_loss", "LL DQN Loss"),
+        ("vgae_loss", "VGAE Loss"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+    for ax, (key, title) in zip(axes.ravel(), panels):
+        has_data = False
+        for abl, seed_runs in by_abl.items():
+            series = []
+            min_len = None
+            for rows in seed_runs:
+                y = _safe_get(rows, key)
+                if y:
+                    y_s = smooth(np.array(y, dtype=np.float64), min(window, len(y)))
+                    series.append(y_s)
+                    min_len = len(y_s) if min_len is None else min(min_len, len(y_s))
+            if not series or not min_len:
+                continue
+            has_data = True
+            mat = np.stack([s[:min_len] for s in series], axis=0)
+            mean_y = np.mean(mat, axis=0)
+            std_y = np.std(mat, axis=0) if mat.shape[0] > 1 else np.zeros_like(mean_y)
+            xs = np.arange(1, min_len + 1)
+            c = METHOD_COLORS.get(abl, "black")
+            ax.plot(xs, mean_y, label=abl, color=c, linewidth=1.6)
+            if mat.shape[0] > 1:
+                ax.fill_between(xs, mean_y - std_y, mean_y + std_y, color=c, alpha=0.15)
+        ax.set_title(title)
+        ax.set_xlabel("Episode")
+        ax.grid(True, alpha=0.3)
+        if has_data:
+            ax.legend(fontsize=7)
+    fig.suptitle(f"Training Convergence — {base_instance}", fontsize=13)
+    fig.tight_layout()
+    _save_fig_formats(fig, Path(out_dir) / "convergence_comparison", formats)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
